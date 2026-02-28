@@ -2786,11 +2786,7 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
     Ok(())
 }
 
-fn git(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn git(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     use helix_vcs::DiffProviderRegistry;
 
     if event != PromptEvent::Validate {
@@ -2822,7 +2818,8 @@ fn git(
             let registry = DiffProviderRegistry::default();
             if let Some(result) = registry.unstage_file(&path) {
                 result?;
-                cx.editor.set_status(format!("Unstaged: {}", path.display()));
+                cx.editor
+                    .set_status(format!("Unstaged: {}", path.display()));
             } else {
                 bail!("failed to unstage file: no diff provider available");
             }

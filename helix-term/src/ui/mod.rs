@@ -1,4 +1,5 @@
 mod completion;
+pub(crate) mod diff_view;
 mod document;
 pub(crate) mod editor;
 mod info;
@@ -19,6 +20,7 @@ use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
 pub use completion::Completion;
+pub use diff_view::DiffView;
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;

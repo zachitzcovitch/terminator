@@ -461,6 +461,7 @@ impl MappableCommand {
         goto_last_change, "Goto last change",
         goto_next_hunk, "Goto next hunk",
         goto_prev_hunk, "Goto previous hunk",
+        diff_view, "Show diff view",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -3466,13 +3467,16 @@ fn hunk_picker(cx: &mut Context) {
         PickerColumn::new("hunk", |(num, _, _): &(u32, usize, usize), _: &()| {
             format!("{}", num).into()
         }),
-        PickerColumn::new("location", |(_, start, end): &(u32, usize, usize), _: &()| {
-            if *start + 1 == *end {
-                format!("line {}", start + 1).into()
-            } else {
-                format!("lines {}-{}", start + 1, end).into()
-            }
-        }),
+        PickerColumn::new(
+            "location",
+            |(_, start, end): &(u32, usize, usize), _: &()| {
+                if *start + 1 == *end {
+                    format!("line {}", start + 1).into()
+                } else {
+                    format!("lines {}-{}", start + 1, end).into()
+                }
+            },
+        ),
     ];
 
     let picker = Picker::new(
@@ -4134,11 +4138,8 @@ fn goto_next_hunk(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     if let Some(handle) = doc.diff_handle() {
         let doc_text = doc.text().slice(..);
-        let cursor_line = doc
-            .selection(view.id)
-            .primary()
-            .cursor_line(doc_text) as u32;
-        
+        let cursor_line = doc.selection(view.id).primary().cursor_line(doc_text) as u32;
+
         let diff = handle.load();
         if let Some(hunk_idx) = diff.next_hunk(cursor_line) {
             let hunk = diff.nth_hunk(hunk_idx);
@@ -4156,11 +4157,8 @@ fn goto_prev_hunk(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     if let Some(handle) = doc.diff_handle() {
         let doc_text = doc.text().slice(..);
-        let cursor_line = doc
-            .selection(view.id)
-            .primary()
-            .cursor_line(doc_text) as u32;
-        
+        let cursor_line = doc.selection(view.id).primary().cursor_line(doc_text) as u32;
+
         let diff = handle.load();
         if let Some(hunk_idx) = diff.prev_hunk(cursor_line) {
             let hunk = diff.nth_hunk(hunk_idx);
@@ -4172,6 +4170,53 @@ fn goto_prev_hunk(cx: &mut Context) {
             }
         }
     }
+}
+
+fn diff_view(cx: &mut Context) {
+    // Get diff data first to avoid borrow issues
+    let (diff_base, doc_text, hunks, file_name) = {
+        let (_view, doc) = current!(cx.editor);
+
+        let diff_handle = match doc.diff_handle() {
+            Some(handle) => handle,
+            None => {
+                cx.editor.set_error("No diff available for current buffer");
+                return;
+            }
+        };
+
+        let diff = diff_handle.load();
+
+        // Check if there are any hunks
+        if diff.is_empty() {
+            drop(diff);
+            cx.editor.set_status("No changes in current buffer");
+            return;
+        }
+
+        // Get the diff base and document
+        let diff_base = diff.diff_base().clone();
+        let doc_text = diff.doc().clone();
+
+        // Get hunks
+        let hunks: Vec<Hunk> = (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+
+        // Get file name
+        let file_name = doc
+            .path()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_else(|| "untitled".to_string());
+
+        (diff_base, doc_text, hunks, file_name)
+    }; // diff is dropped here
+
+    let diff_view = ui::DiffView::new(diff_base, doc_text, hunks, file_name);
+
+    cx.push_layer(Box::new(overlaid(diff_view)));
 }
 
 fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
