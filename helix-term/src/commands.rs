@@ -413,6 +413,7 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -458,6 +459,8 @@ impl MappableCommand {
         goto_prev_change, "Goto previous change",
         goto_first_change, "Goto first change",
         goto_last_change, "Goto last change",
+        goto_next_hunk, "Goto next hunk",
+        goto_prev_hunk, "Goto previous hunk",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -3423,6 +3426,86 @@ fn changed_file_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
+// Helper function to extract hunk data to avoid borrow issues with cx.editor
+fn get_hunk_data(cx: &mut Context) -> Option<(Vec<(u32, usize, usize)>, DocumentId)> {
+    let doc = doc_mut!(cx.editor);
+
+    let diff_handle = doc.diff_handle()?;
+    let diff = diff_handle.load();
+    if diff.is_empty() {
+        return None;
+    }
+
+    let num_hunks = diff.len();
+    let doc_id = doc.id();
+
+    // Collect hunk data - store just the line numbers (Copy types)
+    let hunks: Vec<_> = (0..num_hunks)
+        .map(|i| {
+            let hunk = diff.nth_hunk(i);
+            let line_start = hunk.after.start as usize;
+            let line_end = hunk.after.end as usize;
+            (i + 1, line_start, line_end)
+        })
+        .collect();
+
+    Some((hunks, doc_id))
+}
+
+fn hunk_picker(cx: &mut Context) {
+    // Get all hunk data - use a helper to avoid borrow issues
+    let (hunks, doc_id) = match get_hunk_data(cx) {
+        Some(result) => result,
+        None => {
+            cx.editor.set_error("No hunks in current buffer");
+            return;
+        }
+    };
+
+    let columns = [
+        PickerColumn::new("hunk", |(num, _, _): &(u32, usize, usize), _: &()| {
+            format!("{}", num).into()
+        }),
+        PickerColumn::new("location", |(_, start, end): &(u32, usize, usize), _: &()| {
+            if *start + 1 == *end {
+                format!("line {}", start + 1).into()
+            } else {
+                format!("lines {}-{}", start + 1, end).into()
+            }
+        }),
+    ];
+
+    let picker = Picker::new(
+        columns,
+        1, // location
+        hunks,
+        (),
+        move |cx, (_, start, end), action| {
+            let config = cx.editor.config();
+            let (view, doc) = current!(cx.editor);
+            let doc_text = doc.text().slice(..);
+            let anchor = doc_text.line_to_char(*start);
+            let head = if *start + 1 == *end {
+                anchor + 1
+            } else {
+                doc_text.line_to_char(*end)
+            };
+            let range = Range::new(anchor, head);
+            push_jump(view, doc);
+            doc.set_selection(view.id, Selection::single(range.anchor, range.head));
+            if action.align_view(view, doc.id()) {
+                view.ensure_cursor_in_view_center(doc, config.scrolloff);
+            }
+        },
+    )
+    .with_preview(move |editor, (_, start, _)| {
+        let _doc = editor.document(doc_id)?;
+        Some((doc_id.into(), Some((*start, *start))))
+    });
+
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
     let count = cx.count;
@@ -4045,6 +4128,50 @@ fn goto_first_change(cx: &mut Context) {
 
 fn goto_last_change(cx: &mut Context) {
     goto_first_change_impl(cx, true);
+}
+
+fn goto_next_hunk(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    if let Some(handle) = doc.diff_handle() {
+        let doc_text = doc.text().slice(..);
+        let cursor_line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc_text) as u32;
+        
+        let diff = handle.load();
+        if let Some(hunk_idx) = diff.next_hunk(cursor_line) {
+            let hunk = diff.nth_hunk(hunk_idx);
+            if hunk != Hunk::NONE {
+                let range = hunk_range(hunk, doc_text);
+                drop(diff);
+                push_jump(view, doc);
+                doc.set_selection(view.id, Selection::single(range.anchor, range.head));
+            }
+        }
+    }
+}
+
+fn goto_prev_hunk(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    if let Some(handle) = doc.diff_handle() {
+        let doc_text = doc.text().slice(..);
+        let cursor_line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc_text) as u32;
+        
+        let diff = handle.load();
+        if let Some(hunk_idx) = diff.prev_hunk(cursor_line) {
+            let hunk = diff.nth_hunk(hunk_idx);
+            if hunk != Hunk::NONE {
+                let range = hunk_range(hunk, doc_text);
+                drop(diff);
+                push_jump(view, doc);
+                doc.set_selection(view.id, Selection::single(range.anchor, range.head));
+            }
+        }
+    }
 }
 
 fn goto_first_change_impl(cx: &mut Context, reverse: bool) {

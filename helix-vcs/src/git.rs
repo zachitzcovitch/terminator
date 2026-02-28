@@ -3,6 +3,7 @@ use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -25,6 +26,49 @@ mod test;
 #[inline]
 fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
+}
+
+/// Stage a file in the git index (equivalent to `git add <path>`).
+pub fn stage_file(file: &Path) -> Result<()> {
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    // Use git add to stage the file
+    let output = Command::new("git")
+        .arg("add")
+        .arg(file.as_path())
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to execute git add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git add failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Unstage a file from the git index (equivalent to `git reset HEAD <path>`).
+pub fn unstage_file(file: &Path) -> Result<()> {
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    // Use git reset to unstage the file
+    let output = Command::new("git")
+        .arg("reset")
+        .arg("HEAD")
+        .arg(file.as_path())
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to execute git reset")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git reset failed: {}", stderr);
+    }
+
+    Ok(())
 }
 
 pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {

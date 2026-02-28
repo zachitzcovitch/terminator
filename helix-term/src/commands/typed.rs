@@ -2786,6 +2786,53 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
     Ok(())
 }
 
+fn git(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    use helix_vcs::DiffProviderRegistry;
+
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let subcommand = args.first().context("git subcommand required")?;
+
+    let editor = &mut cx.editor;
+    let (view, doc) = current!(editor);
+
+    let Some(path) = doc.path() else {
+        bail!("buffer has no file path")
+    };
+
+    let path = path.clone();
+
+    match subcommand.as_ref() {
+        "stage" => {
+            let registry = DiffProviderRegistry::default();
+            if let Some(result) = registry.stage_file(&path) {
+                result?;
+                cx.editor.set_status(format!("Staged: {}", path.display()));
+            } else {
+                bail!("failed to stage file: no diff provider available");
+            }
+        }
+        "unstage" => {
+            let registry = DiffProviderRegistry::default();
+            if let Some(result) = registry.unstage_file(&path) {
+                result?;
+                cx.editor.set_status(format!("Unstaged: {}", path.display()));
+            } else {
+                bail!("failed to unstage file: no diff provider available");
+            }
+        }
+        _ => bail!("unknown git subcommand: {}", subcommand),
+    }
+
+    Ok(())
+}
+
 /// This command accepts a single boolean --skip-visible flag and no positionals.
 const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
     positionals: (0, Some(0)),
@@ -3856,6 +3903,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git",
+        aliases: &[],
+        doc: "Git staging commands: stage, unstage",
+        fun: git,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git",
+        aliases: &[],
+        doc: "Git staging commands: stage, unstage",
+        fun: git,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
             ..Signature::DEFAULT
         },
     },

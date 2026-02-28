@@ -75,6 +75,34 @@ impl DiffProviderRegistry {
             }
         });
     }
+
+    /// Stage a file in the git index (equivalent to `git add <path>`).
+    pub fn stage_file(&self, file: &Path) -> Option<Result<()>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.stage_file(file) {
+                Ok(res) => Some(Ok(res)),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to stage file {}", file.display());
+                    None
+                }
+            })
+    }
+
+    /// Unstage a file from the git index (equivalent to `git reset HEAD <path>`).
+    pub fn unstage_file(&self, file: &Path) -> Option<Result<()>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.unstage_file(file) {
+                Ok(res) => Some(Ok(res)),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to unstage file {}", file.display());
+                    None
+                }
+            })
+    }
 }
 
 impl Default for DiffProviderRegistry {
@@ -126,6 +154,24 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::for_each_changed_file(cwd, f),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    /// Stage a file in the git index (equivalent to `git add <path>`).
+    fn stage_file(&self, file: &Path) -> Result<()> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::stage_file(file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    /// Unstage a file from the git index (equivalent to `git reset HEAD <path>`).
+    fn unstage_file(&self, file: &Path) -> Result<()> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::unstage_file(file),
             Self::None => bail!("No diff support compiled in"),
         }
     }
