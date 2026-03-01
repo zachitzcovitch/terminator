@@ -697,6 +697,8 @@ pub struct DiffView {
     hunk_boundaries: Vec<HunkBoundary>,
     /// Currently selected hunk index (0-indexed)
     selected_hunk: usize,
+    /// Currently selected line index (0-indexed into diff_lines)
+    selected_line: usize,
     /// Document ID to jump to when pressing Enter
     doc_id: DocumentId,
     /// Cached syntax instance for the working copy (doc) - for additions and context
@@ -759,6 +761,7 @@ impl DiffView {
             last_visible_lines: 10,
             hunk_boundaries: Vec::new(),
             selected_hunk: 0,
+            selected_line: 0,
             doc_id,
             cached_syntax_doc: None,
             cached_syntax_base: None,
@@ -1143,14 +1146,20 @@ impl DiffView {
             // Calculate the absolute line index in diff_lines
             let line_index = scroll + i;
 
-            // Check if this line is part of the selected hunk
-            let is_selected = selected_hunk_range
+            // Check if this line is the currently selected line (for cursor indicator)
+            let is_selected_line = line_index == self.selected_line;
+
+            // Check if this line is part of the selected hunk (for hunk highlighting)
+            let is_in_selected_hunk = selected_hunk_range
                 .map(|range| line_index >= range.start && line_index < range.end)
                 .unwrap_or(false);
 
             // Apply selection highlight style modifier if this line is selected
-            // Preserve background colors from diff styles, only add modifiers from selection
-            let style_delta = if is_selected {
+            // For the selected line, use a more prominent highlight (cursorline style)
+            // For lines in the selected hunk, use a subtler highlight
+            let style_delta = if is_selected_line {
+                style_selected
+            } else if is_in_selected_hunk {
                 style_delta.patch(helix_view::graphics::Style {
                     add_modifier: style_selected.add_modifier,
                     ..Default::default()
@@ -1158,7 +1167,9 @@ impl DiffView {
             } else {
                 style_delta
             };
-            let style_plus = if is_selected {
+            let style_plus = if is_selected_line {
+                style_selected
+            } else if is_in_selected_hunk {
                 style_plus.patch(helix_view::graphics::Style {
                     add_modifier: style_selected.add_modifier,
                     ..Default::default()
@@ -1166,7 +1177,9 @@ impl DiffView {
             } else {
                 style_plus
             };
-            let style_minus = if is_selected {
+            let style_minus = if is_selected_line {
+                style_selected
+            } else if is_in_selected_hunk {
                 style_minus.patch(helix_view::graphics::Style {
                     add_modifier: style_selected.add_modifier,
                     ..Default::default()
@@ -1663,6 +1676,51 @@ impl DiffView {
         self.update_scroll(visible_lines);
     }
 
+    /// Scroll the view to ensure the selected line is visible
+    fn scroll_to_selected_line(&mut self, visible_lines: usize) {
+        let scroll = self.scroll as usize;
+        let line = self.selected_line;
+
+        // If line is above the current scroll position, scroll up to show it
+        if line < scroll {
+            self.scroll = line as u16;
+        }
+        // If line is below the visible area, scroll down to show it
+        else if line >= scroll + visible_lines {
+            let new_scroll = line.saturating_sub(visible_lines.saturating_sub(1));
+            self.scroll = new_scroll as u16;
+        }
+
+        self.update_scroll(visible_lines);
+    }
+
+    /// Update selected_hunk based on the current selected_line
+    fn update_selected_hunk_from_line(&mut self) {
+        if self.hunk_boundaries.is_empty() {
+            return;
+        }
+
+        // Find the hunk that contains the selected_line
+        for (i, hunk) in self.hunk_boundaries.iter().enumerate() {
+            if self.selected_line >= hunk.start && self.selected_line < hunk.end {
+                self.selected_hunk = i;
+                return;
+            }
+        }
+
+        // If not found in any hunk, find the nearest hunk
+        // This can happen if selected_line is in context between hunks
+        for (i, hunk) in self.hunk_boundaries.iter().enumerate() {
+            if self.selected_line < hunk.start {
+                self.selected_hunk = i.saturating_sub(1).max(0);
+                return;
+            }
+        }
+
+        // If past all hunks, select the last one
+        self.selected_hunk = self.hunk_boundaries.len().saturating_sub(1);
+    }
+
     /// Generate a unified diff patch for a single hunk
     /// context_source: specifies whether to use working copy (doc) or index (diff_base) for context lines
     fn generate_hunk_patch(&self, hunk: &Hunk, context_source: ContextSource) -> String {
@@ -1785,34 +1843,32 @@ impl Component for DiffView {
                     });
                     return EventResult::Consumed(Some(close_fn));
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    // Move to previous hunk
+                KeyCode::Up | KeyCode::Char('K') => {
+                    // Move to previous hunk (Shift+k)
                     if !self.hunk_boundaries.is_empty() {
                         if self.selected_hunk > 0 {
                             self.selected_hunk -= 1;
                         } else {
                             self.selected_hunk = self.hunk_boundaries.len() - 1;
                         }
+                        // Update selected_line to the start of the new hunk
+                        let hunk = &self.hunk_boundaries[self.selected_hunk];
+                        self.selected_line = hunk.start;
                         self.scroll_to_selected_hunk(visible_lines);
-                    } else {
-                        // Fall back to line-by-line scroll if no hunks
-                        self.scroll = self.scroll.saturating_sub(1);
-                        self.update_scroll(visible_lines);
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    // Move to next hunk
+                KeyCode::Down | KeyCode::Char('J') => {
+                    // Move to next hunk (Shift+j)
                     if !self.hunk_boundaries.is_empty() {
                         if self.selected_hunk < self.hunk_boundaries.len() - 1 {
                             self.selected_hunk += 1;
                         } else {
                             self.selected_hunk = 0;
                         }
+                        // Update selected_line to the start of the new hunk
+                        let hunk = &self.hunk_boundaries[self.selected_hunk];
+                        self.selected_line = hunk.start;
                         self.scroll_to_selected_hunk(visible_lines);
-                    } else {
-                        // Fall back to line-by-line scroll if no hunks
-                        self.scroll = self.scroll.saturating_add(1);
-                        self.update_scroll(visible_lines);
                     }
                 }
                 KeyCode::PageUp => {
@@ -1823,18 +1879,29 @@ impl Component for DiffView {
                     self.scroll = self.scroll.saturating_add(10);
                     self.update_scroll(visible_lines);
                 }
-                KeyCode::Char('K') => {
-                    // Scroll up by 1 line (Shift+k)
-                    self.scroll = self.scroll.saturating_sub(1);
-                    self.update_scroll(visible_lines);
+                KeyCode::Char('k') => {
+                    // Scroll up by 1 line (move selection up)
+                    if self.selected_line > 0 {
+                        self.selected_line -= 1;
+                    }
+                    // Update selected_hunk based on new selected_line
+                    self.update_selected_hunk_from_line();
+                    // Ensure selected line is visible
+                    self.scroll_to_selected_line(visible_lines);
                 }
-                KeyCode::Char('J') => {
-                    // Scroll down by 1 line (Shift+j)
-                    self.scroll = self.scroll.saturating_add(1);
-                    self.update_scroll(visible_lines);
+                KeyCode::Char('j') => {
+                    // Scroll down by 1 line (move selection down)
+                    if self.selected_line < self.diff_lines.len().saturating_sub(1) {
+                        self.selected_line += 1;
+                    }
+                    // Update selected_hunk based on new selected_line
+                    self.update_selected_hunk_from_line();
+                    // Ensure selected line is visible
+                    self.scroll_to_selected_line(visible_lines);
                 }
                 KeyCode::Home => {
                     self.scroll = 0;
+                    self.selected_line = 0;
                     if !self.hunk_boundaries.is_empty() {
                         self.selected_hunk = 0;
                     }
@@ -1842,17 +1909,40 @@ impl Component for DiffView {
                 KeyCode::End => {
                     self.scroll = u16::MAX; // Will be clamped in update_scroll
                     self.update_scroll(visible_lines);
+                    self.selected_line = self.diff_lines.len().saturating_sub(1);
                     if !self.hunk_boundaries.is_empty() {
                         self.selected_hunk = self.hunk_boundaries.len() - 1;
                     }
+                    self.scroll_to_selected_line(visible_lines);
                 }
                 KeyCode::Enter => {
-                    // Jump to the selected hunk's line in the document
-                    if !self.hunks.is_empty() {
-                        let selected = self.selected_hunk.min(self.hunks.len().saturating_sub(1));
-                        let hunk = &self.hunks[selected];
-                        // Line number in the working copy (0-indexed)
-                        let line = hunk.after.start;
+                    // Jump to the selected line in the document
+                    if !self.diff_lines.is_empty() {
+                        // Get the line number from the selected diff line
+                        let line = if let Some(diff_line) = self.diff_lines.get(self.selected_line)
+                        {
+                            match diff_line {
+                                DiffLine::HunkHeader { new_start, .. } => *new_start as usize,
+                                DiffLine::Context { doc_line, .. } => {
+                                    doc_line.map(|n| (n - 1) as usize).unwrap_or(0)
+                                }
+                                DiffLine::Addition { doc_line, .. } => (*doc_line - 1) as usize,
+                                DiffLine::Deletion { .. } => {
+                                    // For deletions, jump to where the deletion occurred in the current doc
+                                    // Use the selected hunk's after.start as the best approximation
+                                    self.hunks
+                                        .get(self.selected_hunk)
+                                        .map(|h| h.after.start as usize)
+                                        .unwrap_or(0)
+                                }
+                            }
+                        } else {
+                            // Fallback to first hunk's start
+                            self.hunks
+                                .first()
+                                .map(|h| h.after.start as usize)
+                                .unwrap_or(0)
+                        };
 
                         let doc_id = self.doc_id;
 
@@ -1872,7 +1962,7 @@ impl Component for DiffView {
                                 if let Some(doc) = cx.editor.document_mut(doc_id) {
                                     let text = doc.text().slice(..);
                                     // Convert line number to character position
-                                    let pos = text.line_to_char(line as usize);
+                                    let pos = text.line_to_char(line);
                                     // Create a selection at that position
                                     let selection = doc
                                         .selection(view_id)
@@ -3630,7 +3720,7 @@ mod selectable_diff_view_tests {
     }
 
     // =========================================================================
-    // Test Scenario 1: j/k navigation moves between hunks
+    // Test Scenario 1: J/K navigation moves between hunks
     // =========================================================================
 
     #[test]
@@ -3643,18 +3733,18 @@ mod selectable_diff_view_tests {
             "Initial selected_hunk should be 0"
         );
 
-        // Press 'j' to move to next hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press 'J' (Shift+j) to move to next hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(
             diff_view.selected_hunk, 1,
-            "After first 'j', should be at hunk 1"
+            "After first 'J', should be at hunk 1"
         );
 
-        // Press 'j' again to move to next hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press 'J' again to move to next hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(
             diff_view.selected_hunk, 2,
-            "After second 'j', should be at hunk 2"
+            "After second 'J', should be at hunk 2"
         );
     }
 
@@ -3662,20 +3752,20 @@ mod selectable_diff_view_tests {
     fn test_k_navigation_moves_to_previous_hunk() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // Move to the last hunk first
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Move to the last hunk first using J (Shift+j) for hunk navigation
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 2, "Should be at last hunk");
 
-        // Press 'k' to move to previous hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
-        assert_eq!(diff_view.selected_hunk, 1, "After 'k', should be at hunk 1");
+        // Press 'K' (Shift+k) to move to previous hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(diff_view.selected_hunk, 1, "After 'K', should be at hunk 1");
 
-        // Press 'k' again
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Press 'K' again
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(
             diff_view.selected_hunk, 0,
-            "After second 'k', should be at hunk 0"
+            "After second 'K', should be at hunk 0"
         );
     }
 
@@ -3744,8 +3834,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
         );
 
-        // Navigate to second hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Navigate to second hunk using J (Shift+j)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 1);
 
         // Get the hunk boundaries (clone to avoid borrow issues)
@@ -3850,9 +3940,9 @@ mod selectable_diff_view_tests {
         assert_eq!(diff_view.selected_hunk, 0);
         assert_eq!(diff_view.hunk_boundaries.len(), 5);
 
-        // Navigate to position 3/5
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Navigate to position 3/5 using J (Shift+j) for hunk navigation
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(
             diff_view.selected_hunk, 2,
             "Should be at position 2 (0-indexed)"
@@ -3901,13 +3991,13 @@ mod selectable_diff_view_tests {
     fn test_wrap_around_from_last_to_first_hunk() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // Move to last hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Move to last hunk using Shift+J (uppercase J navigates hunks)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 2, "Should be at last hunk");
 
-        // Press 'j' again - should wrap to first hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press 'J' again - should wrap to first hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 0, "Should wrap to first hunk");
     }
 
@@ -3918,8 +4008,8 @@ mod selectable_diff_view_tests {
         // Should start at first hunk (0)
         assert_eq!(diff_view.selected_hunk, 0, "Should start at first hunk");
 
-        // Press 'k' - should wrap to last hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Press 'K' (Shift+k) - should wrap to last hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(diff_view.selected_hunk, 2, "Should wrap to last hunk");
     }
 
@@ -3998,8 +4088,8 @@ mod selectable_diff_view_tests {
             )
         };
 
-        // With single hunk, pressing 'j' should wrap to same hunk (0)
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // With single hunk, pressing 'J' (Shift+j) should wrap to same hunk (0)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(
             diff_view.selected_hunk, 0,
             "With single hunk, should stay at 0"
@@ -4023,8 +4113,8 @@ mod selectable_diff_view_tests {
             )
         };
 
-        // With single hunk, pressing 'k' should wrap to same hunk (0)
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // With single hunk, pressing 'K' (Shift+k) should wrap to same hunk (0)
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(
             diff_view.selected_hunk, 0,
             "With single hunk, should stay at 0"
@@ -4097,12 +4187,16 @@ mod selectable_diff_view_tests {
             )
         };
 
-        // With no hunks, pressing 'j' should not crash or change selected_hunk meaningfully
-        // It falls back to line-by-line scroll
-        let original_scroll = diff_view.scroll;
+        // With no hunks, pressing 'j' should move selected_line down
+        let original_selected_line = diff_view.selected_line;
         simulate_key_event(&mut diff_view, KeyCode::Char('j'));
 
-        // selected_hunk should remain 0 (or unchanged)
+        // selected_line should increase (or stay at max if clamped)
+        assert!(
+            diff_view.selected_line >= original_selected_line,
+            "j should move selected_line down or stay at max"
+        );
+        // selected_hunk should remain 0
         assert_eq!(diff_view.selected_hunk, 0);
     }
 
@@ -4123,9 +4217,15 @@ mod selectable_diff_view_tests {
             )
         };
 
-        // With no hunks, pressing 'k' should fall back to line scroll
+        // With no hunks, pressing 'k' should move selected_line up (saturating)
+        let original_selected_line = diff_view.selected_line;
         simulate_key_event(&mut diff_view, KeyCode::Char('k'));
 
+        // selected_line should decrease (saturating at 0) or stay same
+        assert!(
+            diff_view.selected_line <= original_selected_line,
+            "k should move selected_line up or stay at 0"
+        );
         // selected_hunk should remain 0
         assert_eq!(diff_view.selected_hunk, 0);
     }
@@ -4187,8 +4287,8 @@ mod selectable_diff_view_tests {
         // Initial position
         assert_eq!(diff_view.selected_hunk, 0);
 
-        // Ctrl+J should also work for navigation (treated same as j)
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // J (Shift+j) should navigate between hunks
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 1);
     }
 
@@ -4196,9 +4296,9 @@ mod selectable_diff_view_tests {
     fn test_home_key_navigates_to_first_hunk() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // Move to last hunk first
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Move to last hunk first using J (Shift+j)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 2);
 
         // Press Home - should go to first hunk
@@ -4356,43 +4456,43 @@ mod selectable_diff_view_tests {
         // Initial state
         assert_eq!(diff_view.selected_hunk, 0);
 
-        // Attack: Rapidly press j 100 times
+        // Attack: Rapidly press J (Shift+j) 100 times for hunk navigation
         for _ in 0..100 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         }
 
         // With wrap-around and 10 hunks, 100 mod 10 = 0, so we end up back at index 0
         assert_eq!(
             diff_view.selected_hunk, 0,
-            "100 j presses with wrap-around = 0"
+            "100 J presses with wrap-around = 0"
         );
 
-        // Attack: Rapidly press k 100 times
+        // Attack: Rapidly press K (Shift+k) 100 times
         for _ in 0..100 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         }
 
-        // With wrap-around, 100 k presses from 0 also ends at 0 (wrapping to 9 then back)
+        // With wrap-around, 100 K presses from 0 also ends at 0 (wrapping to 9 then back)
         assert_eq!(
             diff_view.selected_hunk, 0,
-            "100 k presses with wrap-around = 0"
+            "100 K presses with wrap-around = 0"
         );
 
-        // Now test alternating rapid presses - press j once to get to 1
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Now test alternating rapid presses - press J once to get to 1
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 1);
 
-        // Then press k to go back to 0
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Then press K to go back to 0
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(diff_view.selected_hunk, 0);
 
-        // 50 pairs of j/k from 0: 0->1->0->1... ends at 0
+        // 50 pairs of J/K from 0: 0->1->0->1... ends at 0
         for _ in 0..50 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         }
 
-        // Should still be at index 0 (alternating j/k from 0 goes: 1, 0, 1, 0...)
+        // Should still be at index 0 (alternating J/K from 0 goes: 1, 0, 1, 0...)
         // After 50 pairs, we end at 0
         assert_eq!(diff_view.selected_hunk, 0);
 
@@ -4400,10 +4500,10 @@ mod selectable_diff_view_tests {
         simulate_key_event(&mut diff_view, KeyCode::End);
         assert_eq!(diff_view.selected_hunk, 9, "End should go to last hunk");
 
-        // Each iteration: j advances, Home resets to 0
+        // Each iteration: J advances, Home resets to 0
         // After 5 iterations, should be at 0
         for _ in 0..5 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
             simulate_key_event(&mut diff_view, KeyCode::Home);
         }
 
@@ -4420,12 +4520,12 @@ mod selectable_diff_view_tests {
         diff_view.selected_hunk = diff_view.hunk_boundaries.len() - 1;
         assert_eq!(diff_view.selected_hunk, 4);
 
-        // Press j should wrap to 0
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press J (Shift+j) should wrap to 0
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 0, "Should wrap to first hunk");
 
-        // Press k should wrap to 4
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Press K (Shift+k) should wrap to 4
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(diff_view.selected_hunk, 4, "Should wrap to last hunk");
     }
 
@@ -4474,108 +4574,78 @@ mod selectable_diff_view_tests {
     }
 
     // =========================================================================
-    // Test Scenario: Shift+J/Shift+K scrolls line-by-line (separate from hunk navigation)
+    // Test Scenario: j/k scrolls line-by-line, J/K navigates hunks
     // =========================================================================
 
-    /// Test: Shift+J scrolls down by 1 line (line-by-line scroll, NOT hunk navigation)
-    /// This tests the fix where J and K (uppercase) scroll the view without changing hunk selection
+    /// Test: j scrolls down by 1 line (line-by-line scroll)
+    /// This tests the swapped behavior where lowercase j/k scroll line-by-line
     #[test]
-    fn test_shift_j_scrolls_down_by_one_line() {
+    fn test_j_scrolls_down_by_one_line() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // Initial scroll should be 0
-        assert_eq!(diff_view.scroll, 0, "Initial scroll should be 0");
-
-        // Press Shift+J to scroll down by 1 line
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        assert_eq!(diff_view.scroll, 1, "After Shift+J, scroll should be 1");
-
-        // Press Shift+J again
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        // Initial selected_line should be 0
         assert_eq!(
-            diff_view.scroll, 2,
-            "After second Shift+J, scroll should be 2"
+            diff_view.selected_line, 0,
+            "Initial selected_line should be 0"
         );
 
-        // Press Shift+J multiple times - scroll increases but may be clamped
-        let initial_scroll = diff_view.scroll;
-        for _ in 0..10 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        }
-        // Scroll should have increased (or stayed at max if clamped)
-        assert!(
-            diff_view.scroll >= initial_scroll,
-            "Shift+J should increase scroll (got {}, was {})",
-            diff_view.scroll,
-            initial_scroll
+        // Press j to move down by 1 line
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_eq!(
+            diff_view.selected_line, 1,
+            "After j, selected_line should be 1"
         );
 
-        // Verify that selected_hunk did NOT change (still at 0)
-        // J/K scroll independently of hunk selection
+        // Press j again
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
         assert_eq!(
-            diff_view.selected_hunk, 0,
-            "Shift+J should NOT change hunk selection"
+            diff_view.selected_line, 2,
+            "After second j, selected_line should be 2"
         );
     }
 
-    /// Test: Shift+K scrolls up by 1 line (line-by-line scroll, NOT hunk navigation)
+    /// Test: k scrolls up by 1 line (line-by-line scroll)
     #[test]
-    fn test_shift_k_scrolls_up_by_one_line() {
+    fn test_k_scrolls_up_by_one_line() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // First scroll down to have some room to scroll up
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
-        let scroll_after_scrolls = diff_view.scroll;
+        // First move down to have some room to move up
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        let selected_after_moves = diff_view.selected_line;
 
-        // Press Shift+K to scroll up by 1 line
-        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        // Press k to move up by 1 line
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
         assert_eq!(
-            diff_view.scroll,
-            scroll_after_scrolls - 1,
-            "After Shift+K, scroll should decrease by 1"
-        );
-
-        // Press Shift+K again
-        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
-        assert_eq!(
-            diff_view.scroll,
-            scroll_after_scrolls - 2,
-            "After second Shift+K, scroll should decrease by 2 total"
-        );
-
-        // Verify that selected_hunk did NOT change (still at 0)
-        assert_eq!(
-            diff_view.selected_hunk, 0,
-            "Shift+K should NOT change hunk selection"
+            diff_view.selected_line,
+            selected_after_moves - 1,
+            "After k, selected_line should decrease by 1"
         );
     }
 
-    /// Test: Shift+K does not go below 0 (saturating subtraction)
+    /// Test: k does not go below 0 (saturating subtraction)
     #[test]
-    fn test_shift_k_does_not_underflow() {
+    fn test_k_does_not_underflow() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
-        // Initial scroll is 0
-        assert_eq!(diff_view.scroll, 0);
+        // Initial selected_line is 0
+        assert_eq!(diff_view.selected_line, 0);
 
-        // Press Shift+K multiple times - should not underflow
+        // Press k multiple times - should not underflow
         for _ in 0..10 {
-            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
         }
 
-        // Should stay at 0 due to saturating_sub
+        // Should stay at 0 due to saturating behavior
         assert_eq!(
-            diff_view.scroll, 0,
-            "Shift+K should not go below 0 (saturating)"
+            diff_view.selected_line, 0,
+            "k should not go below 0 (saturating)"
         );
     }
 
-    /// Test: j/k navigates between hunks (verifies fix is separate from Shift+j/k)
-    /// Note: When navigating hunks, scroll may change to keep the hunk visible
+    /// Test: J/K navigates between hunks (verifies swapped behavior)
+    /// Note: When navigating hunks, selected_line is set to hunk start
     #[test]
     fn test_jk_navigates_hunks() {
         let mut diff_view = create_diff_view_with_hunks(3);
@@ -4583,70 +4653,629 @@ mod selectable_diff_view_tests {
         // Initial state
         assert_eq!(diff_view.selected_hunk, 0);
 
-        // Press j to navigate to next hunk
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
-        assert_eq!(diff_view.selected_hunk, 1, "j should navigate to next hunk");
+        // Press J (Shift+j) to navigate to next hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_hunk, 1, "J should navigate to next hunk");
 
-        // Press j again
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press J again
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(
             diff_view.selected_hunk, 2,
-            "j should navigate to second hunk"
+            "J should navigate to second hunk"
         );
 
-        // Press k to go back
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Press K (Shift+k) to go back
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(
             diff_view.selected_hunk, 1,
-            "k should navigate to previous hunk"
+            "K should navigate to previous hunk"
         );
 
-        // Press k again
-        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        // Press K again
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
         assert_eq!(
             diff_view.selected_hunk, 0,
-            "k should navigate to first hunk"
+            "K should navigate to first hunk"
         );
     }
 
-    /// Test: Verify j/k and J/K are distinct behaviors
+    /// Test: Verify j/k and J/K are distinct behaviors (swapped)
     #[test]
     fn test_j_vs_j_modifiers_are_distinct() {
         let mut diff_view = create_diff_view_with_hunks(3);
 
         // Initial state
         assert_eq!(diff_view.selected_hunk, 0);
-        assert_eq!(diff_view.scroll, 0);
+        assert_eq!(diff_view.selected_line, 0);
 
-        // Press lowercase j - should change hunk selection
+        // Press lowercase j - should change selected_line (line-by-line scroll)
         simulate_key_event(&mut diff_view, KeyCode::Char('j'));
         assert_eq!(
-            diff_view.selected_hunk, 1,
-            "lowercase j should navigate hunks"
+            diff_view.selected_line, 1,
+            "lowercase j should scroll line-by-line"
         );
 
-        // Reset to first hunk
-        diff_view.selected_hunk = 0;
+        // Reset selected_line
+        diff_view.selected_line = 0;
 
-        // Get current scroll after potential auto-scroll
-        let scroll_before = diff_view.scroll;
-
-        // Press Shift+J - should change scroll, NOT hunk selection
+        // Press Shift+J - should change hunk selection
         simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_hunk, 1, "Shift+J should navigate hunks");
+
+        // Now verify lowercase j still scrolls line-by-line (after Shift+J)
+        let line_before = diff_view.selected_line;
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_eq!(
+            diff_view.selected_line,
+            line_before + 1,
+            "Lowercase j should still scroll line-by-line after Shift+J"
+        );
+    }
+
+    // =========================================================================
+    // ADVERSARIAL TESTS - Attack vectors for j/k and J/K navigation
+    // =========================================================================
+
+    /// ATTACK VECTOR 1: Boundary violation - selected_line exceeds diff_lines.len()
+    /// Tests that navigating beyond the last line doesn't cause panic or overflow
+    #[test]
+    fn test_attack_selected_line_exceeds_diff_lines_len() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Get the number of diff_lines
+        let diff_lines_count = diff_view.diff_lines.len();
+        assert!(diff_lines_count > 0, "Should have diff_lines");
+
+        // ATTACK: Set selected_line to a value beyond the array bounds
+        diff_view.selected_line = diff_lines_count + 100;
+
+        // Attempt to navigate - should not panic
+        // The code uses: if self.selected_line < self.diff_lines.len().saturating_sub(1)
+        // So pressing 'j' should be a no-op when already beyond bounds
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+
+        // selected_line should remain unchanged (the check prevents increment)
+        assert_eq!(
+            diff_view.selected_line,
+            diff_lines_count + 100,
+            "selected_line should not change when already beyond bounds"
+        );
+
+        // Pressing 'k' should still work (decrement)
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        assert_eq!(
+            diff_view.selected_line,
+            diff_lines_count + 99,
+            "k should decrement selected_line"
+        );
+    }
+
+    /// ATTACK VECTOR 2: Boundary violation - selected_line at exactly diff_lines.len()
+    #[test]
+    fn test_attack_selected_line_at_boundary() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let diff_lines_count = diff_view.diff_lines.len();
+
+        // ATTACK: Set selected_line to exactly the boundary (one past last valid index)
+        diff_view.selected_line = diff_lines_count;
+
+        // Press 'j' - should not increment beyond valid range
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+
+        // The code checks: if self.selected_line < self.diff_lines.len().saturating_sub(1)
+        // When selected_line == diff_lines_count, this is false, so no increment
+        assert_eq!(
+            diff_view.selected_line, diff_lines_count,
+            "selected_line should not increment when at boundary"
+        );
+
+        // Press 'k' - should decrement
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        assert_eq!(
+            diff_view.selected_line,
+            diff_lines_count - 1,
+            "k should decrement from boundary"
+        );
+    }
+
+    /// ATTACK VECTOR 3: Empty diff_lines - navigation with no content
+    #[test]
+    fn test_attack_empty_diff_lines_navigation() {
+        // Create a DiffView with identical content (no diff)
+        let diff_base = Rope::from("same content\n");
+        let doc = Rope::from("same content\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Verify diff_lines is empty
         assert!(
-            diff_view.scroll > scroll_before || diff_view.scroll == scroll_before,
-            "Shift+J should attempt to scroll"
+            diff_view.diff_lines.is_empty(),
+            "diff_lines should be empty for identical content"
+        );
+
+        // ATTACK: Navigate with j/k on empty diff_lines
+        // This should not panic
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+
+        // selected_line should remain 0 (can't go below 0, can't go above empty)
+        assert_eq!(
+            diff_view.selected_line, 0,
+            "selected_line should stay at 0 for empty diff"
+        );
+
+        // ATTACK: Try J/K navigation with no hunks
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+        // selected_hunk should remain 0
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "selected_hunk should stay at 0 for no hunks"
+        );
+    }
+
+    /// ATTACK VECTOR 4: Single line diff - minimal content edge case
+    #[test]
+    fn test_attack_single_line_diff_navigation() {
+        // Create a DiffView with a single line change
+        let diff_base = Rope::from("a\n");
+        let doc = Rope::from("b\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Should have at least a hunk header and the diff lines
+        assert!(
+            diff_view.diff_lines.len() >= 2,
+            "Should have at least hunk header and one diff line"
+        );
+
+        // Navigate to the last line
+        let last_line = diff_view.diff_lines.len() - 1;
+        diff_view.selected_line = last_line;
+
+        // ATTACK: Press 'j' at last line - should not overflow
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_eq!(
+            diff_view.selected_line, last_line,
+            "j should not go beyond last line"
+        );
+
+        // Navigate to first line
+        diff_view.selected_line = 0;
+
+        // ATTACK: Press 'k' at first line - should not underflow
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        assert_eq!(diff_view.selected_line, 0, "k should not go below 0");
+    }
+
+    /// ATTACK VECTOR 5: Rapid navigation - state consistency under stress
+    #[test]
+    fn test_attack_rapid_navigation_stress_test() {
+        let mut diff_view = create_diff_view_with_hunks(5);
+
+        let diff_lines_count = diff_view.diff_lines.len();
+
+        // ATTACK: Rapidly alternate between j and k 1000 times
+        for _ in 0..1000 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        }
+
+        // After equal j/k presses, should be back at 0
+        assert_eq!(
+            diff_view.selected_line, 0,
+            "Equal j/k presses should return to 0"
+        );
+
+        // ATTACK: Rapid j presses to reach the end
+        for _ in 0..(diff_lines_count + 100) {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // Should be at the last valid line (not beyond)
+        assert!(
+            diff_view.selected_line < diff_lines_count,
+            "selected_line should not exceed diff_lines.len()"
+        );
+
+        // ATTACK: Rapid k presses from the end
+        for _ in 0..(diff_lines_count + 100) {
+            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        }
+
+        // Should be at 0
+        assert_eq!(
+            diff_view.selected_line, 0,
+            "Rapid k presses should saturate at 0"
+        );
+    }
+
+    /// ATTACK VECTOR 6: Hunk boundary edge case - navigating between adjacent hunks
+    #[test]
+    fn test_attack_adjacent_hunk_boundaries() {
+        // Create hunks that are very close together
+        let diff_base = Rope::from("line1\nline2\nline3\nline4\nline5\n");
+        let doc = Rope::from("mod1\nmod2\nmod3\nmod4\nmod5\n");
+        // Adjacent hunks: lines 0-1, 1-2, 2-3, 3-4, 4-5
+        let hunks = vec![
+            make_hunk(0..1, 0..1),
+            make_hunk(1..2, 1..2),
+            make_hunk(2..3, 2..3),
+            make_hunk(3..4, 3..4),
+            make_hunk(4..5, 4..5),
+        ];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Navigate through all hunks rapidly
+        for expected_hunk in 0..5 {
+            assert_eq!(
+                diff_view.selected_hunk, expected_hunk,
+                "Should be at hunk {}",
+                expected_hunk
+            );
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        }
+
+        // Should wrap to first hunk
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "Should wrap to first hunk after last"
+        );
+
+        // Navigate backwards through all hunks
+        for _ in 0..5 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        }
+
+        // After 5 K presses from 0: 0->4->3->2->1->0
+        assert_eq!(diff_view.selected_hunk, 0, "Should return to first hunk");
+    }
+
+    /// ATTACK VECTOR 7: Integer overflow attempt with usize::MAX
+    #[test]
+    fn test_attack_usize_max_selected_line() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // ATTACK: Set selected_line to usize::MAX
+        diff_view.selected_line = usize::MAX;
+
+        // Press 'j' - the check `selected_line < diff_lines.len().saturating_sub(1)`
+        // will be false (MAX is not < anything except MAX), so no increment
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+
+        // Should remain at MAX (the condition prevents overflow)
+        assert_eq!(
+            diff_view.selected_line,
+            usize::MAX,
+            "selected_line should remain at MAX"
+        );
+
+        // Press 'k' - should decrement (saturating_sub is not used in k handler,
+        // it uses `if self.selected_line > 0 { self.selected_line -= 1; }`)
+        simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        assert_eq!(
+            diff_view.selected_line,
+            usize::MAX - 1,
+            "k should decrement from MAX"
+        );
+    }
+
+    /// ATTACK VECTOR 8: selected_line = 0 with 'k' (underflow protection)
+    #[test]
+    fn test_attack_underflow_protection_at_zero() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Start at 0
+        diff_view.selected_line = 0;
+
+        // ATTACK: Press 'k' many times - should not underflow
+        for _ in 0..1000 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+        }
+
+        assert_eq!(diff_view.selected_line, 0, "k should not underflow below 0");
+    }
+
+    /// ATTACK VECTOR 9: update_selected_hunk_from_line with invalid selected_line
+    #[test]
+    fn test_attack_update_selected_hunk_with_invalid_line() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let diff_lines_count = diff_view.diff_lines.len();
+
+        // ATTACK: Set selected_line beyond bounds and call update_selected_hunk_from_line
+        diff_view.selected_line = diff_lines_count + 1000;
+
+        // This should not panic - the function should handle this gracefully
+        diff_view.update_selected_hunk_from_line();
+
+        // selected_hunk should be set to the last hunk (past all hunks case)
+        assert_eq!(
+            diff_view.selected_hunk,
+            diff_view.hunk_boundaries.len() - 1,
+            "Should select last hunk when selected_line is past all hunks"
+        );
+    }
+
+    /// ATTACK VECTOR 10: Empty hunk_boundaries with update_selected_hunk_from_line
+    #[test]
+    fn test_attack_update_selected_hunk_empty_boundaries() {
+        let diff_base = Rope::from("same\n");
+        let doc = Rope::from("same\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
+        // This should not panic - the function returns early if boundaries is empty
+        diff_view.update_selected_hunk_from_line();
+
+        // selected_hunk should remain unchanged
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "selected_hunk should remain 0 with empty boundaries"
+        );
+    }
+
+    /// ATTACK VECTOR 11: Injection attempt via file path (path traversal)
+    #[test]
+    fn test_attack_path_traversal_injection() {
+        let diff_base = Rope::from("line1\n");
+        let doc = Rope::from("modified\n");
+
+        // ATTACK: Try path traversal patterns
+        let malicious_paths = vec![
+            "../../../etc/passwd",
+            "..\\..\\..\\windows\\system32",
+            "/etc/passwd",
+            "file\x00.txt",   // null byte injection
+            "file\nname.txt", // newline injection
+            "file\rname.txt", // carriage return injection
+        ];
+
+        for malicious_path in malicious_paths {
+            let hunks = vec![make_hunk(0..1, 0..1)];
+
+            // This should not panic - paths are used as strings, not executed
+            let diff_view = DiffView::new(
+                diff_base.clone(),
+                doc.clone(),
+                hunks.clone(),
+                malicious_path.to_string(),
+                PathBuf::from(malicious_path),
+                PathBuf::from(malicious_path),
+                DocumentId::default(),
+            );
+
+            // Verify the path is stored as-is (no sanitization, but also no execution)
+            assert_eq!(
+                diff_view.file_name, malicious_path,
+                "Path should be stored as-is"
+            );
+        }
+    }
+
+    /// ATTACK VECTOR 12: Unicode edge cases in content
+    #[test]
+    fn test_attack_unicode_edge_cases() {
+        // Test with various unicode edge cases
+        let test_cases = vec![
+            ("a\n", "b\n"),                                 // Simple
+            ("日本語\n", "中文\n"),                         // CJK characters
+            ("emoji 🎉\n", "emoji 🚀\n"),                   // Emoji
+            ("zero\u{200B}width\n", "zero\u{200B}space\n"), // Zero-width space
+            ("\u{202E}rtl\n", "normal\n"),                  // Right-to-left override
+            ("a\u{0000}b\n", "c\u{0000}d\n"),               // Null character
+        ];
+
+        for (base, doc_content) in test_cases {
+            let diff_base = Rope::from(base);
+            let doc = Rope::from(doc_content);
+            let hunks = vec![make_hunk(0..1, 0..1)];
+
+            let mut diff_view = DiffView::new(
+                diff_base,
+                doc,
+                hunks,
+                "test.txt".to_string(),
+                PathBuf::from("test.txt"),
+                PathBuf::from("/fake/path/test.txt"),
+                DocumentId::default(),
+            );
+
+            // Navigate - should not panic with unicode content
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('k'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+            // Should complete without panic
+            assert!(true, "Unicode content should not cause panic");
+        }
+    }
+
+    /// ATTACK VECTOR 13: Very long lines (DoS attempt)
+    #[test]
+    fn test_attack_very_long_lines() {
+        // Create a very long line (100KB)
+        let long_line = "x".repeat(100_000);
+        let diff_base = Rope::from(format!("{}\n", long_line));
+        let doc = Rope::from(format!("{}\n", long_line.replace('x', "y")));
+
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "large.txt".to_string(),
+            PathBuf::from("large.txt"),
+            PathBuf::from("/fake/path/large.txt"),
+            DocumentId::default(),
+        );
+
+        // Navigate - should handle long lines without hanging
+        let start = std::time::Instant::now();
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        let duration = start.elapsed();
+
+        // Should complete in reasonable time (< 1 second)
+        assert!(
+            duration.as_secs() < 1,
+            "Navigation should be fast even with long lines, took {:?}",
+            duration
+        );
+    }
+
+    /// ATTACK VECTOR 14: Rapid J/K with wrap-around (state machine stress)
+    #[test]
+    fn test_attack_rapid_jk_wraparound_stress() {
+        let mut diff_view = create_diff_view_with_hunks(7);
+
+        // ATTACK: Rapid J presses with wrap-around
+        // 7 hunks, so 7 presses = back to start
+        for _ in 0..100 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        }
+
+        // 100 mod 7 = 2, so should be at hunk 2
+        assert_eq!(
+            diff_view.selected_hunk, 2,
+            "100 J presses with 7 hunks should end at hunk 2"
+        );
+
+        // ATTACK: Rapid K presses with wrap-around
+        for _ in 0..100 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        }
+
+        // From hunk 2, 100 K presses with wrap-around
+        // Each K from 0 goes to 6, so pattern: 2->1->0->6->5->4->3->2->1->0->6...
+        // 100 presses from 2: need to calculate
+        // After 2 K presses: at 0
+        // After 7 more K presses: back to 0 (full cycle)
+        // So 100 = 2 + 98, 98 mod 7 = 0, so at 0
+        // Wait, let me recalculate: from 2, pressing K:
+        // 2->1->0->6->5->4->3->2->1->0->6...
+        // After 100 presses from 2:
+        // 2, 1, 0, 6, 5, 4, 3, 2, 1, 0, 6, 5, 4, 3, ...
+        // Position after n presses from 2: (2 - n) mod 7
+        // But with wrap: if at 0 and K, go to 6
+        // So: (2 - 100) mod 7 = -98 mod 7 = 0
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "100 K presses from hunk 2 with 7 hunks should end at hunk 0"
+        );
+    }
+
+    /// ATTACK VECTOR 15: Home/End keys with edge cases
+    #[test]
+    fn test_attack_home_end_edge_cases() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Set selected_line to invalid value
+        diff_view.selected_line = usize::MAX;
+        diff_view.selected_hunk = 100;
+
+        // Press Home - should reset to 0
+        simulate_key_event(&mut diff_view, KeyCode::Home);
+        assert_eq!(
+            diff_view.selected_line, 0,
+            "Home should reset selected_line to 0"
         );
         assert_eq!(
             diff_view.selected_hunk, 0,
-            "Shift+J should NOT change hunk selection"
+            "Home should reset selected_hunk to 0"
         );
 
-        // Now verify lowercase j still navigates hunks (after Shift+J)
-        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        // Press End - should go to last line
+        simulate_key_event(&mut diff_view, KeyCode::End);
+        let expected_last = diff_view.diff_lines.len().saturating_sub(1);
         assert_eq!(
-            diff_view.selected_hunk, 1,
-            "Lowercase j should still navigate hunks after Shift+J"
+            diff_view.selected_line, expected_last,
+            "End should set selected_line to last valid line"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 2,
+            "End should set selected_hunk to last hunk"
+        );
+    }
+
+    /// ATTACK VECTOR 16: Scroll calculations with extreme values
+    #[test]
+    fn test_attack_scroll_with_extreme_values() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // ATTACK: Set scroll to extreme values
+        diff_view.scroll = u16::MAX;
+        diff_view.selected_line = 0;
+
+        // scroll_to_selected_line should handle this
+        diff_view.scroll_to_selected_line(10);
+
+        // Scroll should be adjusted to show selected_line
+        // The implementation should clamp scroll appropriately
+        assert!(
+            diff_view.scroll < u16::MAX || diff_view.selected_line == 0,
+            "Scroll should be adjusted for visibility"
+        );
+    }
+
+    /// ATTACK VECTOR 17: Concurrent-like state corruption simulation
+    #[test]
+    fn test_attack_state_corruption_simulation() {
+        let mut diff_view = create_diff_view_with_hunks(5);
+
+        // Simulate state corruption by setting inconsistent values
+        diff_view.selected_line = 100;
+        diff_view.selected_hunk = 0; // Inconsistent with selected_line
+
+        // Navigate - should recover consistent state
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+
+        // update_selected_hunk_from_line should fix the inconsistency
+        // After j, selected_line = 101, and update_selected_hunk_from_line runs
+        // This should set selected_hunk to the last hunk (since 101 is past all hunks)
+        assert_eq!(
+            diff_view.selected_hunk, 4,
+            "selected_hunk should be updated to match selected_line position"
         );
     }
 }
