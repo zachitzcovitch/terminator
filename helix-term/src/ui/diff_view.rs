@@ -3,6 +3,318 @@ use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
 use helix_vcs::git;
 
+// =============================================================================
+// Word-Level Diff Highlighting (Delta-style minus-emph/plus-emph)
+// =============================================================================
+
+/// Operation type for word-level diff alignment
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordOp {
+    /// Word is unchanged between old and new
+    NoOp,
+    /// Word was deleted from the old line
+    Deletion,
+    /// Word was inserted in the new line
+    Insertion,
+}
+
+/// Cell in the Needleman-Wunsch alignment table
+#[derive(Clone, Debug)]
+struct AlignCell {
+    parent: usize,
+    operation: WordOp,
+    cost: usize,
+}
+
+/// Alignment result for word-level diff
+struct WordAlignment {
+    tokens_x: Vec<String>,
+    tokens_y: Vec<String>,
+    table: Vec<AlignCell>,
+    dim: [usize; 2],
+}
+
+impl WordAlignment {
+    const DELETION_COST: usize = 2;
+    const INSERTION_COST: usize = 2;
+    const INITIAL_MISMATCH_PENALTY: usize = 1;
+
+    /// Create a new alignment between two token sequences
+    fn new(x: Vec<String>, y: Vec<String>) -> Self {
+        let dim = [y.len() + 1, x.len() + 1];
+        let table = vec![
+            AlignCell {
+                parent: 0,
+                operation: WordOp::NoOp,
+                cost: 0,
+            };
+            dim[0] * dim[1]
+        ];
+        let mut alignment = Self {
+            tokens_x: x,
+            tokens_y: y,
+            table,
+            dim,
+        };
+        alignment.fill();
+        alignment
+    }
+
+    /// Fill the alignment table using Needleman-Wunsch algorithm
+    fn fill(&mut self) {
+        // Initialize first row (all deletions)
+        for i in 1..self.dim[1] {
+            self.table[i] = AlignCell {
+                parent: 0,
+                operation: WordOp::Deletion,
+                cost: i * Self::DELETION_COST + Self::INITIAL_MISMATCH_PENALTY,
+            };
+        }
+        // Initialize first column (all insertions)
+        for j in 1..self.dim[0] {
+            self.table[j * self.dim[1]] = AlignCell {
+                parent: 0,
+                operation: WordOp::Insertion,
+                cost: j * Self::INSERTION_COST + Self::INITIAL_MISMATCH_PENALTY,
+            };
+        }
+
+        // Fill the rest of the table
+        for (i, x_i) in self.tokens_x.iter().enumerate() {
+            for (j, y_j) in self.tokens_y.iter().enumerate() {
+                let (left, diag, up) =
+                    (self.index(i, j + 1), self.index(i, j), self.index(i + 1, j));
+
+                let candidates = [
+                    AlignCell {
+                        parent: up,
+                        operation: WordOp::Insertion,
+                        cost: self.mismatch_cost(up, Self::INSERTION_COST),
+                    },
+                    AlignCell {
+                        parent: left,
+                        operation: WordOp::Deletion,
+                        cost: self.mismatch_cost(left, Self::DELETION_COST),
+                    },
+                    AlignCell {
+                        parent: diag,
+                        operation: WordOp::NoOp,
+                        cost: if x_i == y_j {
+                            self.table[diag].cost
+                        } else {
+                            usize::MAX
+                        },
+                    },
+                ];
+
+                let index = self.index(i + 1, j + 1);
+                self.table[index] = candidates
+                    .iter()
+                    .min_by_key(|cell| cell.cost)
+                    .unwrap()
+                    .clone();
+            }
+        }
+    }
+
+    fn mismatch_cost(&self, parent: usize, basic_cost: usize) -> usize {
+        self.table[parent].cost
+            + basic_cost
+            + if self.table[parent].operation == WordOp::NoOp {
+                Self::INITIAL_MISMATCH_PENALTY
+            } else {
+                0
+            }
+    }
+
+    /// Get the list of operations from the alignment
+    fn operations(&self) -> Vec<WordOp> {
+        use std::collections::VecDeque;
+        let mut ops = VecDeque::with_capacity(self.tokens_x.len().max(self.tokens_y.len()));
+        let mut cell = &self.table[self.index(self.tokens_x.len(), self.tokens_y.len())];
+        loop {
+            ops.push_front(cell.operation);
+            if cell.parent == 0 {
+                break;
+            }
+            cell = &self.table[cell.parent];
+        }
+        Vec::from(ops)
+    }
+
+    /// Row-major index into the table
+    fn index(&self, i: usize, j: usize) -> usize {
+        j * self.dim[1] + i
+    }
+}
+
+/// Tokenize a line into words and non-word characters
+/// Returns a vector of tokens where words are identified by \w+ pattern
+fn tokenize_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current_word = String::new();
+    let mut in_word = false;
+
+    for ch in line.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            // Part of a word
+            current_word.push(ch);
+            in_word = true;
+        } else {
+            // Non-word character
+            if in_word && !current_word.is_empty() {
+                tokens.push(std::mem::take(&mut current_word));
+            }
+            in_word = false;
+            // Add non-word character as its own token
+            tokens.push(ch.to_string());
+        }
+    }
+
+    // Don't forget the last word if line ends with a word
+    if !current_word.is_empty() {
+        tokens.push(current_word);
+    }
+
+    tokens
+}
+
+/// A segment of a line with its word-level diff operation
+#[derive(Debug, Clone)]
+struct WordSegment {
+    /// The text content of this segment
+    text: String,
+    /// Whether this segment was changed (deleted or inserted)
+    is_emph: bool,
+}
+
+/// Compute word-level diff between two lines
+/// Returns (old_segments, new_segments) where each segment is marked as emphasized or not
+fn compute_word_diff(old_line: &str, new_line: &str) -> (Vec<WordSegment>, Vec<WordSegment>) {
+    // Handle edge cases
+    if old_line.is_empty() && new_line.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if old_line.is_empty() {
+        // All of new_line is an insertion
+        return (
+            Vec::new(),
+            vec![WordSegment {
+                text: new_line.to_string(),
+                is_emph: true,
+            }],
+        );
+    }
+    if new_line.is_empty() {
+        // All of old_line is a deletion
+        return (
+            vec![WordSegment {
+                text: old_line.to_string(),
+                is_emph: true,
+            }],
+            Vec::new(),
+        );
+    }
+
+    // Tokenize both lines
+    let old_tokens = tokenize_line(old_line);
+    let new_tokens = tokenize_line(new_line);
+
+    // If lines are identical, no emphasis needed
+    if old_tokens == new_tokens {
+        return (
+            vec![WordSegment {
+                text: old_line.to_string(),
+                is_emph: false,
+            }],
+            vec![WordSegment {
+                text: new_line.to_string(),
+                is_emph: false,
+            }],
+        );
+    }
+
+    // Compute alignment
+    let alignment = WordAlignment::new(old_tokens.clone(), new_tokens.clone());
+    let operations = alignment.operations();
+
+    // Build segments from operations
+    let mut old_segments: Vec<WordSegment> = Vec::new();
+    let mut new_segments: Vec<WordSegment> = Vec::new();
+
+    let mut old_idx: usize = 0;
+    let mut new_idx: usize = 0;
+
+    // Process all operations (including the first one for the initial empty token)
+    for op in operations.iter() {
+        match op {
+            WordOp::NoOp => {
+                // Token is unchanged - consume from both sequences
+                if old_idx < old_tokens.len() && new_idx < new_tokens.len() {
+                    old_segments.push(WordSegment {
+                        text: old_tokens[old_idx].clone(),
+                        is_emph: false,
+                    });
+                    new_segments.push(WordSegment {
+                        text: new_tokens[new_idx].clone(),
+                        is_emph: false,
+                    });
+                    old_idx += 1;
+                    new_idx += 1;
+                }
+            }
+            WordOp::Deletion => {
+                // Token was deleted from old - only consume from old
+                if old_idx < old_tokens.len() {
+                    old_segments.push(WordSegment {
+                        text: old_tokens[old_idx].clone(),
+                        is_emph: true,
+                    });
+                    old_idx += 1;
+                }
+            }
+            WordOp::Insertion => {
+                // Token was inserted in new - only consume from new
+                if new_idx < new_tokens.len() {
+                    new_segments.push(WordSegment {
+                        text: new_tokens[new_idx].clone(),
+                        is_emph: true,
+                    });
+                    new_idx += 1;
+                }
+            }
+        }
+    }
+
+    // Coalesce adjacent segments with the same emphasis state
+    (
+        coalesce_segments(old_segments),
+        coalesce_segments(new_segments),
+    )
+}
+
+/// Coalesce adjacent segments with the same emphasis state
+fn coalesce_segments(segments: Vec<WordSegment>) -> Vec<WordSegment> {
+    if segments.is_empty() {
+        return segments;
+    }
+
+    let mut result = Vec::new();
+    let mut current = segments[0].clone();
+
+    for segment in segments.into_iter().skip(1) {
+        if segment.is_emph == current.is_emph {
+            current.text.push_str(&segment.text);
+        } else {
+            result.push(current);
+            current = segment;
+        }
+    }
+    result.push(current);
+
+    result
+}
+
 /// Specifies the source of context lines in a hunk patch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextSource {
@@ -332,11 +644,89 @@ impl DiffView {
     }
 
     fn render_unified_diff(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        use helix_view::graphics::Modifier;
+        use std::collections::HashMap;
+
         let style_plus = cx.editor.theme.get("diff.plus");
         let style_minus = cx.editor.theme.get("diff.minus");
+
+        // If theme doesn't provide background colors, add them for better visibility
+        // This gives the characteristic red/green backgrounds for diff lines
+        let style_plus = if style_plus.bg.is_none() {
+            style_plus.patch(helix_view::graphics::Style {
+                bg: Some(helix_view::graphics::Color::Rgb(40, 80, 40)), // Dark green background
+                ..Default::default()
+            })
+        } else {
+            style_plus
+        };
+
+        let style_minus = if style_minus.bg.is_none() {
+            style_minus.patch(helix_view::graphics::Style {
+                bg: Some(helix_view::graphics::Color::Rgb(80, 40, 40)), // Dark red background
+                ..Default::default()
+            })
+        } else {
+            style_minus
+        };
+
         let style_delta = cx.editor.theme.get("diff.delta");
         let style_header = cx.editor.theme.get("ui.popup.info");
         let style_selected = cx.editor.theme.get("ui.cursorline");
+
+        // Create emphasis styles for changed words (delta-style minus-emph/plus-emph)
+        // Try theme-specific emphasis colors first, then fall back to more visible styling
+        // Note: try_get may return a style from a broader scope (e.g., diff.minus) that has no
+        // background, so we check for missing background and apply our fallback in that case.
+        let style_minus_emph = cx
+            .editor
+            .theme
+            .try_get("diff.minus.emph")
+            .map(|s| {
+                // If theme style has no background, add our darker background
+                if s.bg.is_none() {
+                    s.patch(helix_view::graphics::Style {
+                        bg: Some(helix_view::graphics::Color::Rgb(60, 30, 30)),
+                        add_modifier: Modifier::BOLD,
+                        ..Default::default()
+                    })
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback: create more visible style with darker background and bold
+                // This makes changed words stand out clearly against the normal diff background
+                style_minus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(60, 30, 30)), // Darker red for emphasis
+                    add_modifier: Modifier::BOLD,
+                    ..Default::default()
+                })
+            });
+        let style_plus_emph = cx
+            .editor
+            .theme
+            .try_get("diff.plus.emph")
+            .map(|s| {
+                // If theme style has no background, add our darker background
+                if s.bg.is_none() {
+                    s.patch(helix_view::graphics::Style {
+                        bg: Some(helix_view::graphics::Color::Rgb(30, 60, 30)),
+                        add_modifier: Modifier::BOLD,
+                        ..Default::default()
+                    })
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback: create more visible style with darker background and bold
+                style_plus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(30, 60, 30)), // Darker green for emphasis
+                    add_modifier: Modifier::BOLD,
+                    ..Default::default()
+                })
+            });
 
         // Get syntax highlighting loader and theme
         let loader = cx.editor.syn_loader.load();
@@ -371,6 +761,37 @@ impl DiffView {
             self.hunk_boundaries
                 .get(self.selected_hunk.min(self.hunk_boundaries.len() - 1))
         };
+
+        // Pre-compute word-level diffs for paired deletion/addition lines
+        // This allows us to highlight changed words within modified lines
+        // Key: line index, Value: (segments for this line, is_deletion)
+        let mut word_diff_cache: HashMap<usize, Vec<WordSegment>> = HashMap::new();
+
+        // Scan through diff_lines to find paired deletion/addition lines
+        let mut i = 0;
+        while i < self.diff_lines.len() {
+            // Look for a deletion line
+            if let Some(DiffLine::Deletion {
+                content: old_content,
+                ..
+            }) = self.diff_lines.get(i)
+            {
+                // Look ahead for a paired addition line
+                if let Some(DiffLine::Addition {
+                    content: new_content,
+                    ..
+                }) = self.diff_lines.get(i + 1)
+                {
+                    // Found a paired deletion/addition - compute word-level diff
+                    let (old_segments, new_segments) = compute_word_diff(old_content, new_content);
+                    word_diff_cache.insert(i, old_segments);
+                    word_diff_cache.insert(i + 1, new_segments);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
 
         // Clear the area
         surface.clear_with(area, style_delta);
@@ -434,18 +855,28 @@ impl DiffView {
                 .unwrap_or(false);
 
             // Apply selection highlight style modifier if this line is selected
+            // Preserve background colors from diff styles, only add modifiers from selection
             let style_delta = if is_selected {
-                style_delta.patch(style_selected)
+                style_delta.patch(helix_view::graphics::Style {
+                    add_modifier: style_selected.add_modifier,
+                    ..Default::default()
+                })
             } else {
                 style_delta
             };
             let style_plus = if is_selected {
-                style_plus.patch(style_selected)
+                style_plus.patch(helix_view::graphics::Style {
+                    add_modifier: style_selected.add_modifier,
+                    ..Default::default()
+                })
             } else {
                 style_plus
             };
             let style_minus = if is_selected {
-                style_minus.patch(style_selected)
+                style_minus.patch(helix_view::graphics::Style {
+                    add_modifier: style_selected.add_modifier,
+                    ..Default::default()
+                })
             } else {
                 style_minus
             };
@@ -506,7 +937,10 @@ impl DiffView {
                             if end > start {
                                 let segment = &content_str[start..end];
                                 if !segment.is_empty() {
-                                    let patched_style = style_delta.patch(*segment_style);
+                                    let mut patched_style = style_delta.patch(*segment_style);
+                                    if style_delta.bg.is_some() {
+                                        patched_style.bg = style_delta.bg;
+                                    }
                                     content_spans.push(Span::styled(segment, patched_style));
                                 }
                             }
@@ -538,10 +972,74 @@ impl DiffView {
                     let line_num_str = format!("{:>4}", base_line);
                     let content_str = content.as_str();
 
-                    // Build content spans with syntax highlighting
+                    // Build content spans with syntax highlighting and word-level diff emphasis
                     let mut content_spans = Vec::new();
 
-                    if line_highlights.is_empty() {
+                    // Check if we have word-level diff info for this line
+                    if let Some(word_segments) = word_diff_cache.get(&line_index) {
+                        // Apply word-level diff highlighting with emphasis for changed words
+                        let mut byte_offset = 0;
+                        for segment in word_segments {
+                            let segment_text = &segment.text;
+                            let segment_len = segment_text.len();
+
+                            // Determine the base style for this segment
+                            let base_style = if segment.is_emph {
+                                style_minus_emph
+                            } else {
+                                style_minus
+                            };
+
+                            // Apply syntax highlighting within this segment if available
+                            if line_highlights.is_empty() {
+                                content_spans.push(Span::styled(segment_text.clone(), base_style));
+                            } else {
+                                // Find syntax highlights that overlap with this segment
+                                let seg_start = byte_offset;
+                                let seg_end = byte_offset + segment_len;
+
+                                let mut last_pos = 0;
+                                for (hl_start, hl_end, hl_style) in &line_highlights {
+                                    // Clamp to segment bounds
+                                    let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                    let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+
+                                    if start > last_pos && start < segment_len {
+                                        let gap = &segment_text[last_pos..start];
+                                        if !gap.is_empty() {
+                                            content_spans
+                                                .push(Span::styled(gap.to_string(), base_style));
+                                        }
+                                    }
+
+                                    if end > start && start < segment_len {
+                                        let text = &segment_text[start..end.min(segment_len)];
+                                        if !text.is_empty() {
+                                            // Apply syntax highlighting but preserve diff background
+                                            let mut patched = base_style.patch(*hl_style);
+                                            if base_style.bg.is_some() {
+                                                patched.bg = base_style.bg;
+                                            }
+                                            content_spans
+                                                .push(Span::styled(text.to_string(), patched));
+                                        }
+                                    }
+
+                                    last_pos = end.min(segment_len);
+                                }
+
+                                if last_pos < segment_len {
+                                    let trailing = &segment_text[last_pos..];
+                                    if !trailing.is_empty() {
+                                        content_spans
+                                            .push(Span::styled(trailing.to_string(), base_style));
+                                    }
+                                }
+                            }
+
+                            byte_offset += segment_len;
+                        }
+                    } else if line_highlights.is_empty() {
                         content_spans.push(Span::styled(content_str, style_minus));
                     } else {
                         let mut last_end = 0;
@@ -561,7 +1059,11 @@ impl DiffView {
                             if end > start {
                                 let segment = &content_str[start..end];
                                 if !segment.is_empty() {
-                                    let patched_style = style_minus.patch(*segment_style);
+                                    // Apply syntax highlighting but preserve diff background
+                                    let mut patched_style = style_minus.patch(*segment_style);
+                                    if style_minus.bg.is_some() {
+                                        patched_style.bg = style_minus.bg;
+                                    }
                                     content_spans.push(Span::styled(segment, patched_style));
                                 }
                             }
@@ -594,10 +1096,74 @@ impl DiffView {
                     let line_num_str = format!("{:>4}", doc_line);
                     let content_str = content.as_str();
 
-                    // Build content spans with syntax highlighting
+                    // Build content spans with syntax highlighting and word-level diff emphasis
                     let mut content_spans = Vec::new();
 
-                    if line_highlights.is_empty() {
+                    // Check if we have word-level diff info for this line
+                    if let Some(word_segments) = word_diff_cache.get(&line_index) {
+                        // Apply word-level diff highlighting with emphasis for changed words
+                        let mut byte_offset = 0;
+                        for segment in word_segments {
+                            let segment_text = &segment.text;
+                            let segment_len = segment_text.len();
+
+                            // Determine the base style for this segment
+                            let base_style = if segment.is_emph {
+                                style_plus_emph
+                            } else {
+                                style_plus
+                            };
+
+                            // Apply syntax highlighting within this segment if available
+                            if line_highlights.is_empty() {
+                                content_spans.push(Span::styled(segment_text.clone(), base_style));
+                            } else {
+                                // Find syntax highlights that overlap with this segment
+                                let seg_start = byte_offset;
+                                let seg_end = byte_offset + segment_len;
+
+                                let mut last_pos = 0;
+                                for (hl_start, hl_end, hl_style) in &line_highlights {
+                                    // Clamp to segment bounds
+                                    let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                    let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+
+                                    if start > last_pos && start < segment_len {
+                                        let gap = &segment_text[last_pos..start];
+                                        if !gap.is_empty() {
+                                            content_spans
+                                                .push(Span::styled(gap.to_string(), base_style));
+                                        }
+                                    }
+
+                                    if end > start && start < segment_len {
+                                        let text = &segment_text[start..end.min(segment_len)];
+                                        if !text.is_empty() {
+                                            // Apply syntax highlighting but preserve diff background
+                                            let mut patched = base_style.patch(*hl_style);
+                                            if base_style.bg.is_some() {
+                                                patched.bg = base_style.bg;
+                                            }
+                                            content_spans
+                                                .push(Span::styled(text.to_string(), patched));
+                                        }
+                                    }
+
+                                    last_pos = end.min(segment_len);
+                                }
+
+                                if last_pos < segment_len {
+                                    let trailing = &segment_text[last_pos..];
+                                    if !trailing.is_empty() {
+                                        content_spans
+                                            .push(Span::styled(trailing.to_string(), base_style));
+                                    }
+                                }
+                            }
+
+                            byte_offset += segment_len;
+                        }
+                    } else if line_highlights.is_empty() {
                         content_spans.push(Span::styled(content_str, style_plus));
                     } else {
                         let mut last_end = 0;
@@ -617,7 +1183,11 @@ impl DiffView {
                             if end > start {
                                 let segment = &content_str[start..end];
                                 if !segment.is_empty() {
-                                    let patched_style = style_plus.patch(*segment_style);
+                                    // Apply syntax highlighting but preserve diff background
+                                    let mut patched_style = style_plus.patch(*segment_style);
+                                    if style_plus.bg.is_some() {
+                                        patched_style.bg = style_plus.bg;
+                                    }
                                     content_spans.push(Span::styled(segment, patched_style));
                                 }
                             }
@@ -4594,6 +5164,863 @@ mod syntax_highlighting_tests {
         assert!(
             view.cached_syntax_base.is_none(),
             "Base syntax should not be cached initially"
+        );
+    }
+
+    // =========================================================================
+    // Word-Level Diff Highlighting Tests
+    // Tests for delta-style minus-emph/plus-emph functionality
+    // =========================================================================
+
+    /// Test: Tokenize a simple line
+    #[test]
+    fn test_tokenize_simple() {
+        let tokens = tokenize_line("hello world");
+        assert_eq!(tokens, vec!["hello", " ", "world"]);
+    }
+
+    /// Test: Tokenize with punctuation
+    #[test]
+    fn test_tokenize_punctuation() {
+        let tokens = tokenize_line("fn main() {");
+        assert_eq!(tokens, vec!["fn", " ", "main", "(", ")", " ", "{"]);
+    }
+
+    /// Test: Tokenize empty line
+    #[test]
+    fn test_tokenize_empty() {
+        let tokens = tokenize_line("");
+        assert!(tokens.is_empty(), "Empty line should produce empty tokens");
+    }
+
+    /// Test: Tokenize with underscores
+    #[test]
+    fn test_tokenize_underscores() {
+        let tokens = tokenize_line("my_variable_name");
+        assert_eq!(tokens, vec!["my_variable_name"]);
+    }
+
+    /// Test: Tokenize with numbers
+    #[test]
+    fn test_tokenize_numbers() {
+        let tokens = tokenize_line("count123 + 456");
+        assert_eq!(tokens, vec!["count123", " ", "+", " ", "456"]);
+    }
+
+    /// Test: Word diff - identical lines
+    #[test]
+    fn test_word_diff_identical() {
+        let (old_segs, new_segs) = compute_word_diff("hello world", "hello world");
+
+        // Both should have one segment, not emphasized
+        assert_eq!(old_segs.len(), 1);
+        assert_eq!(new_segs.len(), 1);
+        assert!(!old_segs[0].is_emph);
+        assert!(!new_segs[0].is_emph);
+        assert_eq!(old_segs[0].text, "hello world");
+        assert_eq!(new_segs[0].text, "hello world");
+    }
+
+    /// Test: Word diff - single word change
+    #[test]
+    fn test_word_diff_single_change() {
+        let (old_segs, new_segs) = compute_word_diff("hello world", "hello there");
+
+        // Old line should have "hello " (not emph) + "world" (emph)
+        assert!(old_segs.len() >= 2, "Old should have at least 2 segments");
+        assert!(old_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("world")));
+
+        // New line should have "hello " (not emph) + "there" (emph)
+        assert!(new_segs.len() >= 2, "New should have at least 2 segments");
+        assert!(new_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("there")));
+    }
+
+    /// Test: Word diff - empty old line
+    #[test]
+    fn test_word_diff_empty_old() {
+        let (old_segs, new_segs) = compute_word_diff("", "new content");
+
+        assert!(old_segs.is_empty(), "Old segments should be empty");
+        assert_eq!(new_segs.len(), 1);
+        assert!(new_segs[0].is_emph, "New content should be emphasized");
+        assert_eq!(new_segs[0].text, "new content");
+    }
+
+    /// Test: Word diff - empty new line
+    #[test]
+    fn test_word_diff_empty_new() {
+        let (old_segs, new_segs) = compute_word_diff("old content", "");
+
+        assert_eq!(old_segs.len(), 1);
+        assert!(old_segs[0].is_emph, "Old content should be emphasized");
+        assert_eq!(old_segs[0].text, "old content");
+        assert!(new_segs.is_empty(), "New segments should be empty");
+    }
+
+    /// Test: Word diff - both empty
+    #[test]
+    fn test_word_diff_both_empty() {
+        let (old_segs, new_segs) = compute_word_diff("", "");
+
+        assert!(old_segs.is_empty());
+        assert!(new_segs.is_empty());
+    }
+
+    /// Test: Word diff - insertion in middle
+    #[test]
+    fn test_word_diff_insertion() {
+        let (old_segs, new_segs) = compute_word_diff("hello world", "hello beautiful world");
+
+        // The word "beautiful" should be emphasized in new
+        assert!(new_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("beautiful")));
+    }
+
+    /// Test: Word diff - deletion in middle
+    #[test]
+    fn test_word_diff_deletion() {
+        let (old_segs, new_segs) = compute_word_diff("hello beautiful world", "hello world");
+
+        // The word "beautiful" should be emphasized in old
+        assert!(old_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("beautiful")));
+    }
+
+    /// Test: Word diff - code example
+    #[test]
+    fn test_word_diff_code() {
+        let (old_segs, new_segs) = compute_word_diff("fn old_function() {", "fn new_function() {");
+
+        // "old_function" should be emphasized in old
+        assert!(old_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("old_function")));
+
+        // "new_function" should be emphasized in new
+        assert!(new_segs
+            .iter()
+            .any(|s| s.is_emph && s.text.contains("new_function")));
+    }
+
+    /// Test: Word diff - preserves unchanged parts
+    #[test]
+    fn test_word_diff_preserves_unchanged() {
+        let (old_segs, new_segs) = compute_word_diff("let x = 5;", "let x = 10;");
+
+        // "let x = " should not be emphasized in either
+        assert!(old_segs
+            .iter()
+            .any(|s| !s.is_emph && s.text.contains("let x =")));
+        assert!(new_segs
+            .iter()
+            .any(|s| !s.is_emph && s.text.contains("let x =")));
+
+        // "5" should be emphasized in old, "10" in new
+        assert!(old_segs.iter().any(|s| s.is_emph && s.text.contains("5")));
+        assert!(new_segs.iter().any(|s| s.is_emph && s.text.contains("10")));
+    }
+
+    /// Test: Coalesce segments combines adjacent same-emphasis segments
+    #[test]
+    fn test_coalesce_segments() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: false,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: false,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "!".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_segments(segments);
+
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello ");
+        assert!(!coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, "world!");
+        assert!(coalesced[1].is_emph);
+    }
+
+    /// Test: Coalesce segments with all same emphasis
+    #[test]
+    fn test_coalesce_all_same() {
+        let segments = vec![
+            WordSegment {
+                text: "a".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "b".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "c".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_segments(segments);
+
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].text, "abc");
+        assert!(coalesced[0].is_emph);
+    }
+}
+
+#[cfg(test)]
+mod background_preservation_tests {
+    //! Tests for background preservation in diff highlighting
+    //!
+    //! Test scenarios:
+    //! 1. Syntax highlighting does not override diff backgrounds for Context lines
+    //! 2. Syntax highlighting does not override diff backgrounds for Deletion lines
+    //! 3. Syntax highlighting does not override diff backgrounds for Addition lines
+    //! 4. Emphasis styles (darker backgrounds) are preserved for changed words
+    //! 5. Edge case: style with no background (should not crash)
+
+    use helix_view::graphics::{Color, Modifier, Style};
+
+    /// Helper to simulate the background preservation logic used in render
+    fn apply_syntax_with_background_preservation(base_style: Style, syntax_style: Style) -> Style {
+        let mut patched = base_style.patch(syntax_style);
+        if base_style.bg.is_some() {
+            patched.bg = base_style.bg;
+        }
+        patched
+    }
+
+    /// Test 1: Syntax highlighting does not override diff backgrounds for Context lines
+    /// Context lines use style_delta which has a background color
+    #[test]
+    fn test_context_line_background_preserved() {
+        // style_delta typically has a subtle background for context lines
+        let style_delta = Style::default()
+            .bg(Color::Rgb(40, 40, 40)) // Dark gray background for context
+            .fg(Color::Gray);
+
+        // Syntax highlight style with a different background (should be ignored)
+        let syntax_style = Style::default()
+            .fg(Color::Yellow) // Keyword color
+            .bg(Color::Rgb(100, 100, 100)); // Different background - should be ignored
+
+        let result = apply_syntax_with_background_preservation(style_delta, syntax_style);
+
+        // Background should be preserved from style_delta
+        assert_eq!(
+            result.bg, style_delta.bg,
+            "Context line background should be preserved from style_delta"
+        );
+        // Foreground should come from syntax highlighting
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test 2: Syntax highlighting does not override diff backgrounds for Deletion lines
+    /// Deletion lines use style_minus which has a red-tinted background
+    #[test]
+    fn test_deletion_line_background_preserved() {
+        // style_minus has a red-tinted background for deletions
+        let style_minus = Style::default()
+            .bg(Color::Rgb(80, 40, 40)) // Red-tinted background
+            .fg(Color::Red);
+
+        // Syntax highlight style with a different background
+        let syntax_style = Style::default()
+            .fg(Color::Blue) // String color
+            .bg(Color::Rgb(50, 50, 80)); // Blue background - should be ignored
+
+        let result = apply_syntax_with_background_preservation(style_minus, syntax_style);
+
+        // Background should be preserved from style_minus
+        assert_eq!(
+            result.bg, style_minus.bg,
+            "Deletion line background should be preserved from style_minus"
+        );
+        // Foreground should come from syntax highlighting
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test 3: Syntax highlighting does not override diff backgrounds for Addition lines
+    /// Addition lines use style_plus which has a green-tinted background
+    #[test]
+    fn test_addition_line_background_preserved() {
+        // style_plus has a green-tinted background for additions
+        let style_plus = Style::default()
+            .bg(Color::Rgb(40, 80, 40)) // Green-tinted background
+            .fg(Color::Green);
+
+        // Syntax highlight style with a different background
+        let syntax_style = Style::default()
+            .fg(Color::Cyan) // Function name color
+            .bg(Color::Rgb(80, 50, 80)); // Purple background - should be ignored
+
+        let result = apply_syntax_with_background_preservation(style_plus, syntax_style);
+
+        // Background should be preserved from style_plus
+        assert_eq!(
+            result.bg, style_plus.bg,
+            "Addition line background should be preserved from style_plus"
+        );
+        // Foreground should come from syntax highlighting
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test 4: Emphasis styles (darker backgrounds) are preserved for changed words
+    /// Changed words use style_minus_emph or style_plus_emph with darker backgrounds
+    #[test]
+    fn test_emphasis_background_preserved_for_changed_words() {
+        // style_minus_emph has a darker red background for emphasized deletions
+        let style_minus_emph = Style::default()
+            .bg(Color::Rgb(60, 30, 30)) // Darker red for emphasis
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD);
+
+        // Syntax highlight style
+        let syntax_style = Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::Rgb(200, 200, 200)); // Light background - should be ignored
+
+        let result = apply_syntax_with_background_preservation(style_minus_emph, syntax_style);
+
+        // Emphasis background should be preserved
+        assert_eq!(
+            result.bg, style_minus_emph.bg,
+            "Emphasis background should be preserved for changed words"
+        );
+        // Bold modifier should be preserved
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "Bold modifier should be preserved for emphasis"
+        );
+        // Foreground should come from syntax highlighting
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test 4b: Emphasis styles for addition lines (style_plus_emph)
+    #[test]
+    fn test_emphasis_background_preserved_for_additions() {
+        // style_plus_emph has a darker green background for emphasized additions
+        let style_plus_emph = Style::default()
+            .bg(Color::Rgb(30, 60, 30)) // Darker green for emphasis
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD);
+
+        // Syntax highlight style
+        let syntax_style = Style::default()
+            .fg(Color::Magenta)
+            .bg(Color::Rgb(255, 255, 255)); // White background - should be ignored
+
+        let result = apply_syntax_with_background_preservation(style_plus_emph, syntax_style);
+
+        // Emphasis background should be preserved
+        assert_eq!(
+            result.bg, style_plus_emph.bg,
+            "Emphasis background should be preserved for addition changed words"
+        );
+        // Bold modifier should be preserved
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "Bold modifier should be preserved for emphasis"
+        );
+    }
+
+    /// Test 5: Edge case - style with no background (should not crash)
+    /// When base style has no background, syntax style background should be used
+    #[test]
+    fn test_no_background_does_not_crash() {
+        // Base style with no background (None)
+        let base_style = Style::default().fg(Color::White); // No background set
+
+        // Syntax style with a background
+        let syntax_style = Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::Rgb(50, 50, 50));
+
+        // Should not panic
+        let result = apply_syntax_with_background_preservation(base_style, syntax_style);
+
+        // When base has no background, syntax background should be used
+        assert_eq!(
+            result.bg, syntax_style.bg,
+            "When base has no background, syntax background should be used"
+        );
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test 5b: Both styles have no background
+    #[test]
+    fn test_both_no_background() {
+        let base_style = Style::default().fg(Color::White);
+        let syntax_style = Style::default().fg(Color::Yellow);
+
+        let result = apply_syntax_with_background_preservation(base_style, syntax_style);
+
+        // Both backgrounds should be None
+        assert_eq!(
+            result.bg, None,
+            "Background should be None when both have no background"
+        );
+        assert_eq!(
+            result.fg, syntax_style.fg,
+            "Foreground should come from syntax highlighting"
+        );
+    }
+
+    /// Test: Modifiers are properly combined
+    #[test]
+    fn test_modifiers_combined() {
+        let base_style = Style::default()
+            .bg(Color::Rgb(80, 40, 40))
+            .add_modifier(Modifier::BOLD);
+
+        let syntax_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::ITALIC);
+
+        let result = apply_syntax_with_background_preservation(base_style, syntax_style);
+
+        // Background preserved
+        assert_eq!(result.bg, base_style.bg);
+        // Both modifiers should be present
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be preserved from base"
+        );
+        assert!(
+            result.add_modifier.contains(Modifier::ITALIC),
+            "ITALIC modifier should be added from syntax"
+        );
+    }
+
+    /// Test: Underline style is preserved from syntax highlighting
+    #[test]
+    fn test_underline_from_syntax() {
+        use helix_view::graphics::UnderlineStyle;
+
+        let base_style = Style::default().bg(Color::Rgb(80, 40, 40));
+
+        let syntax_style = Style::default()
+            .fg(Color::Yellow)
+            .underline_style(UnderlineStyle::Line);
+
+        let result = apply_syntax_with_background_preservation(base_style, syntax_style);
+
+        // Background preserved
+        assert_eq!(result.bg, base_style.bg);
+        // Underline from syntax
+        assert_eq!(
+            result.underline_style,
+            Some(UnderlineStyle::Line),
+            "Underline style should come from syntax highlighting"
+        );
+    }
+
+    /// Test: Real-world scenario with keyword highlighting in deletion
+    #[test]
+    fn test_keyword_in_deletion_line() {
+        // Simulate "fn" keyword in a deleted line
+        let style_minus = Style::default()
+            .bg(Color::Rgb(80, 40, 40)) // Red deletion background
+            .fg(Color::Red);
+
+        // Keyword syntax style (typically yellow/bold)
+        // Note: syntax styles often don't set an explicit background
+        let keyword_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let result = apply_syntax_with_background_preservation(style_minus, keyword_style);
+
+        // Deletion background must be preserved
+        assert_eq!(
+            result.bg, style_minus.bg,
+            "Deletion background must be preserved for keyword"
+        );
+        // Keyword color and bold from syntax
+        assert_eq!(result.fg, keyword_style.fg, "Keyword color from syntax");
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "Keyword bold from syntax"
+        );
+    }
+
+    /// Test: Real-world scenario with string highlighting in addition
+    #[test]
+    fn test_string_in_addition_line() {
+        // Simulate a string in an added line
+        let style_plus = Style::default()
+            .bg(Color::Rgb(40, 80, 40)) // Green addition background
+            .fg(Color::Green);
+
+        // String syntax style (typically green)
+        // Note: syntax styles often don't set an explicit background
+        let string_style = Style::default().fg(Color::LightGreen);
+
+        let result = apply_syntax_with_background_preservation(style_plus, string_style);
+
+        // Addition background must be preserved
+        assert_eq!(
+            result.bg, style_plus.bg,
+            "Addition background must be preserved for string"
+        );
+        // String color from syntax
+        assert_eq!(result.fg, string_style.fg, "String color from syntax");
+    }
+}
+
+#[cfg(test)]
+mod emphasis_style_fallback_tests {
+    //! Tests for emphasis style fallback logic in diff highlighting
+    //!
+    //! Test scenarios:
+    //! 1. When theme returns style without background, fallback is applied
+    //! 2. When theme returns style with background, it's used as-is
+    //! 3. When theme doesn't have emphasis style, base style is used with darker background
+    //! 4. Emphasis styles always have a background after the fix
+
+    use helix_view::graphics::{Color, Modifier, Style};
+
+    /// Expected fallback background colors for emphasis styles
+    const MINUS_EMPH_FALLBACK_BG: Color = Color::Rgb(60, 30, 30); // Darker red
+    const PLUS_EMPH_FALLBACK_BG: Color = Color::Rgb(30, 60, 30); // Darker green
+
+    /// Helper to simulate the emphasis style fallback logic for minus.emph
+    /// This mirrors the logic in the render function (lines 681-705)
+    fn create_style_minus_emph(theme_style: Option<Style>, style_minus: Style) -> Style {
+        theme_style
+            .map(|s| {
+                // If theme style has no background, add our darker background
+                if s.bg.is_none() {
+                    s.patch(Style {
+                        bg: Some(MINUS_EMPH_FALLBACK_BG),
+                        add_modifier: Modifier::BOLD,
+                        ..Default::default()
+                    })
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback: create more visible style with darker background and bold
+                style_minus.patch(Style {
+                    bg: Some(MINUS_EMPH_FALLBACK_BG),
+                    add_modifier: Modifier::BOLD,
+                    ..Default::default()
+                })
+            })
+    }
+
+    /// Helper to simulate the emphasis style fallback logic for plus.emph
+    /// This mirrors the logic in the render function (lines 706-729)
+    fn create_style_plus_emph(theme_style: Option<Style>, style_plus: Style) -> Style {
+        theme_style
+            .map(|s| {
+                // If theme style has no background, add our darker background
+                if s.bg.is_none() {
+                    s.patch(Style {
+                        bg: Some(PLUS_EMPH_FALLBACK_BG),
+                        add_modifier: Modifier::BOLD,
+                        ..Default::default()
+                    })
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback: create more visible style with darker background and bold
+                style_plus.patch(Style {
+                    bg: Some(PLUS_EMPH_FALLBACK_BG),
+                    add_modifier: Modifier::BOLD,
+                    ..Default::default()
+                })
+            })
+    }
+
+    /// Test 1: When theme returns style without background, fallback is applied
+    /// This simulates the case where try_get("diff.minus.emph") returns a style
+    /// from a broader scope (e.g., diff.minus) that has no background set.
+    #[test]
+    fn test_theme_style_without_background_applies_fallback() {
+        // Theme returns a style without background (e.g., inherited from diff.minus)
+        let theme_style = Some(Style::default().fg(Color::Red));
+
+        // Base style_minus has its own background
+        let style_minus = Style::default().bg(Color::Rgb(80, 40, 40)).fg(Color::Red);
+
+        let result = create_style_minus_emph(theme_style, style_minus);
+
+        // Should have the fallback background applied
+        assert_eq!(
+            result.bg,
+            Some(MINUS_EMPH_FALLBACK_BG),
+            "Fallback background should be applied when theme style has no background"
+        );
+        // Should have BOLD modifier added
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be added when fallback is applied"
+        );
+        // Original foreground should be preserved
+        assert_eq!(
+            result.fg,
+            Some(Color::Red),
+            "Original foreground should be preserved"
+        );
+    }
+
+    /// Test 1b: Same test for plus.emph
+    #[test]
+    fn test_theme_plus_style_without_background_applies_fallback() {
+        let theme_style = Some(Style::default().fg(Color::Green));
+        let style_plus = Style::default().bg(Color::Rgb(40, 80, 40)).fg(Color::Green);
+
+        let result = create_style_plus_emph(theme_style, style_plus);
+
+        assert_eq!(
+            result.bg,
+            Some(PLUS_EMPH_FALLBACK_BG),
+            "Fallback background should be applied for plus.emph when theme style has no background"
+        );
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be added for plus.emph fallback"
+        );
+    }
+
+    /// Test 2: When theme returns style with background, it's used as-is
+    /// This simulates the case where the theme properly defines diff.minus.emph
+    /// with its own background color.
+    #[test]
+    fn test_theme_style_with_background_used_as_is() {
+        // Theme returns a style with its own background
+        let theme_style = Some(
+            Style::default()
+                .fg(Color::LightRed)
+                .bg(Color::Rgb(100, 50, 50)) // Custom background from theme
+                .add_modifier(Modifier::BOLD),
+        );
+
+        let style_minus = Style::default().bg(Color::Rgb(80, 40, 40)).fg(Color::Red);
+
+        let result = create_style_minus_emph(theme_style, style_minus);
+
+        // Should use the theme's background, not the fallback
+        assert_eq!(
+            result.bg,
+            Some(Color::Rgb(100, 50, 50)),
+            "Theme background should be used when present"
+        );
+        // Should have the theme's foreground
+        assert_eq!(
+            result.fg,
+            Some(Color::LightRed),
+            "Theme foreground should be used"
+        );
+        // Should have BOLD from theme
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "Theme BOLD modifier should be preserved"
+        );
+    }
+
+    /// Test 2b: Same test for plus.emph
+    #[test]
+    fn test_theme_plus_style_with_background_used_as_is() {
+        let theme_style = Some(
+            Style::default()
+                .fg(Color::LightGreen)
+                .bg(Color::Rgb(50, 100, 50))
+                .add_modifier(Modifier::ITALIC),
+        );
+
+        let style_plus = Style::default().bg(Color::Rgb(40, 80, 40)).fg(Color::Green);
+
+        let result = create_style_plus_emph(theme_style, style_plus);
+
+        assert_eq!(
+            result.bg,
+            Some(Color::Rgb(50, 100, 50)),
+            "Theme background should be used for plus.emph when present"
+        );
+        assert!(
+            result.add_modifier.contains(Modifier::ITALIC),
+            "Theme ITALIC modifier should be preserved"
+        );
+    }
+
+    /// Test 3: When theme doesn't have emphasis style, base style is used with darker background
+    /// This simulates the case where try_get("diff.minus.emph") returns None.
+    #[test]
+    fn test_no_theme_style_uses_base_with_darker_background() {
+        // Theme doesn't have the emphasis style
+        let theme_style: Option<Style> = None;
+
+        // Base style_minus
+        let style_minus = Style::default().bg(Color::Rgb(80, 40, 40)).fg(Color::Red);
+
+        let result = create_style_minus_emph(theme_style, style_minus);
+
+        // Should have the fallback background
+        assert_eq!(
+            result.bg,
+            Some(MINUS_EMPH_FALLBACK_BG),
+            "Fallback background should be applied when theme has no emphasis style"
+        );
+        // Should have BOLD modifier
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be added in fallback case"
+        );
+        // Foreground should come from style_minus
+        assert_eq!(
+            result.fg,
+            Some(Color::Red),
+            "Foreground should come from base style_minus"
+        );
+    }
+
+    /// Test 3b: Same test for plus.emph
+    #[test]
+    fn test_no_theme_plus_style_uses_base_with_darker_background() {
+        let theme_style: Option<Style> = None;
+        let style_plus = Style::default().bg(Color::Rgb(40, 80, 40)).fg(Color::Green);
+
+        let result = create_style_plus_emph(theme_style, style_plus);
+
+        assert_eq!(
+            result.bg,
+            Some(PLUS_EMPH_FALLBACK_BG),
+            "Fallback background should be applied for plus.emph when theme has no emphasis style"
+        );
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be added for plus.emph fallback"
+        );
+    }
+
+    /// Test 4: Emphasis styles always have a background after the fix
+    /// This is the key invariant - regardless of what the theme returns,
+    /// the emphasis style should always have a background.
+    #[test]
+    fn test_emphasis_styles_always_have_background() {
+        let style_minus = Style::default().bg(Color::Rgb(80, 40, 40)).fg(Color::Red);
+        let style_plus = Style::default().bg(Color::Rgb(40, 80, 40)).fg(Color::Green);
+
+        // Test all scenarios for minus.emph
+        let scenarios_minus: Vec<Option<Style>> = vec![
+            None,                                              // No theme style
+            Some(Style::default()),                            // Empty style
+            Some(Style::default().fg(Color::Red)),             // No background
+            Some(Style::default().bg(Color::Rgb(50, 25, 25))), // Has background
+        ];
+
+        for theme_style in scenarios_minus {
+            let result = create_style_minus_emph(theme_style, style_minus);
+            assert!(
+                result.bg.is_some(),
+                "minus.emph style should always have a background (theme_style: {:?})",
+                theme_style
+            );
+        }
+
+        // Test all scenarios for plus.emph
+        let scenarios_plus: Vec<Option<Style>> = vec![
+            None,                                              // No theme style
+            Some(Style::default()),                            // Empty style
+            Some(Style::default().fg(Color::Green)),           // No background
+            Some(Style::default().bg(Color::Rgb(25, 50, 25))), // Has background
+        ];
+
+        for theme_style in scenarios_plus {
+            let result = create_style_plus_emph(theme_style, style_plus);
+            assert!(
+                result.bg.is_some(),
+                "plus.emph style should always have a background (theme_style: {:?})",
+                theme_style
+            );
+        }
+    }
+
+    /// Test: Verify fallback backgrounds are darker than base diff backgrounds
+    /// This ensures the emphasis styles create proper contrast for changed words.
+    #[test]
+    fn test_fallback_backgrounds_are_darker() {
+        // Base diff backgrounds
+        let minus_bg = Color::Rgb(80, 40, 40);
+        let plus_bg = Color::Rgb(40, 80, 40);
+
+        // Fallback emphasis backgrounds should be darker
+        // For minus: (60, 30, 30) vs (80, 40, 40) - each channel is lower
+        // For plus: (30, 60, 30) vs (40, 80, 40) - each channel is lower
+
+        if let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (MINUS_EMPH_FALLBACK_BG, minus_bg)
+        {
+            assert!(r1 < r2, "Minus emphasis red channel should be darker");
+            assert!(g1 < g2, "Minus emphasis green channel should be darker");
+            assert!(b1 < b2, "Minus emphasis blue channel should be darker");
+        }
+
+        if let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (PLUS_EMPH_FALLBACK_BG, plus_bg) {
+            assert!(r1 < r2, "Plus emphasis red channel should be darker");
+            assert!(g1 < g2, "Plus emphasis green channel should be darker");
+            assert!(b1 < b2, "Plus emphasis blue channel should be darker");
+        }
+    }
+
+    /// Test: Theme style with only modifiers (no colors) gets fallback background
+    #[test]
+    fn test_theme_style_with_only_modifiers_gets_fallback() {
+        // Theme returns a style with only modifiers, no colors
+        let theme_style = Some(Style::default().add_modifier(Modifier::ITALIC));
+
+        let style_minus = Style::default().bg(Color::Rgb(80, 40, 40)).fg(Color::Red);
+
+        let result = create_style_minus_emph(theme_style, style_minus);
+
+        // Should have fallback background
+        assert_eq!(
+            result.bg,
+            Some(MINUS_EMPH_FALLBACK_BG),
+            "Fallback background should be applied when theme style has no background"
+        );
+        // Should have both ITALIC (from theme) and BOLD (from fallback)
+        assert!(
+            result.add_modifier.contains(Modifier::ITALIC),
+            "Theme ITALIC modifier should be preserved"
+        );
+        assert!(
+            result.add_modifier.contains(Modifier::BOLD),
+            "BOLD modifier should be added from fallback"
         );
     }
 }
