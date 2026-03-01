@@ -105,7 +105,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
                         doc,
                     );
                     doc.replace_diagnostics(diagnostics, &[], None);
-                    doc.syntax = Some(syntax);
+                    doc.syntax = Some(Arc::new(syntax));
                 });
             });
         });

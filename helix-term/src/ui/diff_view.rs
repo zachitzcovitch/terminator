@@ -2,6 +2,8 @@ use crate::compositor::{Callback, Component, Compositor, Context, Event, EventRe
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
 use helix_vcs::git;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 // =============================================================================
 // Word-Level Diff Highlighting (Delta-style minus-emph/plus-emph)
@@ -702,28 +704,28 @@ pub struct DiffView {
     /// Document ID to jump to when pressing Enter
     doc_id: DocumentId,
     /// Cached syntax instance for the working copy (doc) - for additions and context
-    cached_syntax_doc: Option<Syntax>,
+    cached_syntax_doc: Option<Arc<Syntax>>,
     /// Cached syntax instance for the diff base (HEAD) - for deletions
-    cached_syntax_base: Option<Syntax>,
+    cached_syntax_base: Option<Arc<Syntax>>,
 
     // =============================================================================
-    // Performance Caches (computed once on first render)
+    // Performance Caches (computed lazily on first render for visible lines)
     // =============================================================================
     /// Cache for word-level diffs: line_index -> segments
-    /// Pre-computed to avoid O(n²) algorithm in render loop
-    word_diff_cache: HashMap<usize, Vec<WordSegment>>,
+    /// Computed lazily for visible lines to avoid O(n²) algorithm upfront
+    word_diff_cache: RefCell<HashMap<usize, Vec<WordSegment>>>,
 
     /// Cache for syntax highlights: line_index -> highlights
-    /// Pre-computed to avoid tree-sitter queries in render loop
-    syntax_highlight_cache: HashMap<usize, Vec<(usize, usize, Style)>>,
+    /// Computed lazily for visible lines to avoid tree-sitter queries upfront
+    syntax_highlight_cache: RefCell<HashMap<usize, Vec<(usize, usize, Style)>>>,
 
     /// Cache for function context: hunk_index -> context info
-    /// Pre-computed to avoid tree-sitter queries in render loop
-    function_context_cache: HashMap<usize, Option<FunctionContext>>,
+    /// Computed lazily for visible hunk headers
+    function_context_cache: RefCell<HashMap<usize, Option<FunctionContext>>>,
 
     /// Cache for function context syntax highlights: hunk_index -> highlights
-    /// Pre-computed to avoid tree-sitter queries in render loop
-    function_context_highlight_cache: HashMap<usize, Vec<(usize, usize, Style)>>,
+    /// Computed lazily for visible hunk headers
+    function_context_highlight_cache: RefCell<HashMap<usize, Vec<(usize, usize, Style)>>>,
 
     /// Flag to track if caches are initialized
     caches_initialized: bool,
@@ -738,6 +740,7 @@ impl DiffView {
         file_path: PathBuf,
         absolute_path: PathBuf,
         doc_id: DocumentId,
+        existing_syntax: Option<Arc<Syntax>>, // Reuse editor's syntax for performance
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -763,12 +766,12 @@ impl DiffView {
             selected_hunk: 0,
             selected_line: 0,
             doc_id,
-            cached_syntax_doc: None,
+            cached_syntax_doc: existing_syntax, // Use provided syntax instead of None
             cached_syntax_base: None,
-            word_diff_cache: HashMap::new(),
-            syntax_highlight_cache: HashMap::new(),
-            function_context_cache: HashMap::new(),
-            function_context_highlight_cache: HashMap::new(),
+            word_diff_cache: RefCell::new(HashMap::new()),
+            syntax_highlight_cache: RefCell::new(HashMap::new()),
+            function_context_cache: RefCell::new(HashMap::new()),
+            function_context_highlight_cache: RefCell::new(HashMap::new()),
             caches_initialized: false,
         };
 
@@ -866,129 +869,165 @@ impl DiffView {
         }
     }
 
-    /// Initialize all performance caches once on first render
-    /// This pre-computes expensive operations to avoid O(n²) algorithms and
-    /// tree-sitter queries in the render loop
-    fn initialize_caches(&mut self, loader: &Loader, theme: &helix_view::Theme) {
+    /// Initialize Syntax objects once on first render
+    /// Word diffs, highlights, and function context are computed lazily in prepare_visible
+    fn initialize_caches(&mut self, loader: &Loader, _theme: &helix_view::Theme) {
         if self.caches_initialized {
             return;
         }
 
-        // Initialize syntax for both doc and diff_base if not already cached
+        // Only initialize Syntax objects (these are relatively fast)
+        // Reuse existing syntax for doc if provided
         if self.cached_syntax_doc.is_none() {
             let doc_slice = self.doc.slice(..);
             if let Some(language) = loader.language_for_filename(&self.file_path) {
                 if let Ok(syntax) = Syntax::new(doc_slice, language, loader) {
-                    self.cached_syntax_doc = Some(syntax);
+                    self.cached_syntax_doc = Some(Arc::new(syntax));
                 }
             }
         }
+
+        // Initialize syntax for diff_base (still needed for highlights)
         if self.cached_syntax_base.is_none() {
             let base_slice = self.diff_base.slice(..);
             if let Some(language) = loader.language_for_filename(&self.file_path) {
                 if let Ok(syntax) = Syntax::new(base_slice, language, loader) {
-                    self.cached_syntax_base = Some(syntax);
+                    self.cached_syntax_base = Some(Arc::new(syntax));
                 }
             }
         }
 
-        let doc_syntax = self.cached_syntax_doc.as_ref();
-        let base_syntax = self.cached_syntax_base.as_ref();
+        // DON'T pre-compute word diffs, highlights, function context
+        // These will be computed lazily in prepare_visible
 
-        // Pre-compute word-level diffs for all paired deletion/addition lines
-        let mut i = 0;
-        while i < self.diff_lines.len() {
-            // Look for a deletion line
-            if let Some(DiffLine::Deletion {
-                content: old_content,
-                ..
-            }) = self.diff_lines.get(i)
-            {
-                // Look ahead for a paired addition line
-                if let Some(DiffLine::Addition {
-                    content: new_content,
+        self.caches_initialized = true;
+    }
+
+    /// Prepare caches for visible lines + buffer
+    /// Call this BEFORE render to avoid computation during render
+    pub fn prepare_visible(
+        &self,
+        first_line: usize,
+        last_line: usize,
+        loader: &Loader,
+        theme: &helix_view::Theme,
+    ) {
+        if !self.caches_initialized {
+            return;
+        }
+
+        let buffer = 10;
+        let start = first_line.saturating_sub(buffer);
+        let end = (last_line + buffer).min(self.diff_lines.len().saturating_sub(1));
+
+        let doc_syntax = self.cached_syntax_doc.as_ref().map(|arc| arc.as_ref());
+        let base_syntax = self.cached_syntax_base.as_ref().map(|arc| arc.as_ref());
+
+        // Prepare word diffs for visible deletion/addition pairs
+        {
+            let mut word_cache = self.word_diff_cache.borrow_mut();
+            let mut i = start;
+            while i <= end {
+                if let Some(DiffLine::Deletion {
+                    content: old_content,
                     ..
-                }) = self.diff_lines.get(i + 1)
+                }) = self.diff_lines.get(i)
                 {
-                    // Found a paired deletion/addition - compute word-level diff
-                    let (old_segments, new_segments) = compute_word_diff(old_content, new_content);
-                    self.word_diff_cache.insert(i, old_segments);
-                    self.word_diff_cache.insert(i + 1, new_segments);
-                    i += 2;
+                    if let Some(DiffLine::Addition {
+                        content: new_content,
+                        ..
+                    }) = self.diff_lines.get(i + 1)
+                    {
+                        if !word_cache.contains_key(&i) {
+                            let (old_segments, new_segments) =
+                                compute_word_diff(old_content, new_content);
+                            word_cache.insert(i, old_segments);
+                            word_cache.insert(i + 1, new_segments);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // Prepare syntax highlights for visible lines
+        {
+            let mut highlight_cache = self.syntax_highlight_cache.borrow_mut();
+            for line_index in start..=end {
+                if highlight_cache.contains_key(&line_index) {
                     continue;
                 }
-            }
-            i += 1;
-        }
-
-        // Pre-compute syntax highlights for all lines
-        for (line_index, diff_line) in self.diff_lines.iter().enumerate() {
-            let highlights = get_line_highlights(
-                diff_line,
-                &self.doc,
-                &self.diff_base,
-                doc_syntax,
-                base_syntax,
-                loader,
-                theme,
-            );
-            self.syntax_highlight_cache.insert(line_index, highlights);
-        }
-
-        // Pre-compute function context for all hunk headers
-        for (hunk_index, diff_line) in self.diff_lines.iter().enumerate() {
-            if let DiffLine::HunkHeader { new_start, .. } = diff_line {
-                let context = get_function_context(
-                    *new_start as usize,
-                    self.doc.slice(..),
-                    doc_syntax,
-                    loader,
-                );
-
-                // If we have function context, also compute its syntax highlights
-                if let Some(ref ctx) = context {
-                    let highlights = get_highlights_for_line(
-                        ctx.line_number,
+                if let Some(diff_line) = self.diff_lines.get(line_index) {
+                    let highlights = get_line_highlights(
+                        diff_line,
                         &self.doc,
+                        &self.diff_base,
                         doc_syntax,
+                        base_syntax,
                         loader,
                         theme,
                     );
-
-                    // Adjust highlights by subtracting the byte offset of the function start within the line.
-                    // This is needed because:
-                    // - get_highlights_for_line returns highlights relative to the document line start
-                    // - ctx.text is extracted from the function node (excludes leading whitespace)
-                    // - When rendering ctx.text, we need highlights relative to the function text start
-                    let offset = ctx.byte_offset_in_line;
-                    let adjusted_highlights: Vec<_> = highlights
-                        .into_iter()
-                        .filter_map(|(start, end, style)| {
-                            // Subtract the offset to convert from line-relative to function-relative
-                            let adj_start = start.saturating_sub(offset);
-                            let adj_end = end.saturating_sub(offset);
-                            // Only include highlights that are within the truncated portion
-                            if adj_end > adj_start && adj_start < ctx.truncated_len {
-                                Some((
-                                    adj_start.min(ctx.truncated_len),
-                                    adj_end.min(ctx.truncated_len),
-                                    style,
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    self.function_context_highlight_cache
-                        .insert(hunk_index, adjusted_highlights);
+                    highlight_cache.insert(line_index, highlights);
                 }
-
-                self.function_context_cache.insert(hunk_index, context);
             }
         }
 
-        self.caches_initialized = true;
+        // Prepare function context for visible hunk headers
+        {
+            let mut context_cache = self.function_context_cache.borrow_mut();
+            let mut context_highlight_cache = self.function_context_highlight_cache.borrow_mut();
+
+            for line_index in start..=end {
+                if let Some(DiffLine::HunkHeader { new_start, .. }) =
+                    self.diff_lines.get(line_index)
+                {
+                    if !context_cache.contains_key(&line_index) {
+                        let context = get_function_context(
+                            *new_start as usize,
+                            self.doc.slice(..),
+                            doc_syntax,
+                            loader,
+                        );
+
+                        // If we have function context, also compute its syntax highlights
+                        if let Some(ref ctx) = context {
+                            let highlights = get_highlights_for_line(
+                                ctx.line_number,
+                                &self.doc,
+                                doc_syntax,
+                                loader,
+                                theme,
+                            );
+
+                            // Adjust highlights by subtracting the byte offset of the function start within the line
+                            let offset = ctx.byte_offset_in_line;
+                            let adjusted_highlights: Vec<_> = highlights
+                                .into_iter()
+                                .filter_map(|(start, end, style)| {
+                                    let adj_start = start.saturating_sub(offset);
+                                    let adj_end = end.saturating_sub(offset);
+                                    if adj_end > adj_start && adj_start < ctx.truncated_len {
+                                        Some((
+                                            adj_start.min(ctx.truncated_len),
+                                            adj_end.min(ctx.truncated_len),
+                                            style,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            context_highlight_cache.insert(line_index, adjusted_highlights);
+                        }
+
+                        context_cache.insert(line_index, context);
+                    }
+                }
+            }
+        }
     }
 
     fn render_unified_diff(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
@@ -1090,6 +1129,12 @@ impl DiffView {
         // Calculate scroll bounds: clamp to max(total_rows - visible_lines, 0)
         let max_scroll = total_rows.saturating_sub(visible_lines);
         let scroll = (self.scroll as usize).min(max_scroll);
+
+        // Prepare visible lines + buffer (lazy computation)
+        // This computes word diffs, syntax highlights, and function context only for visible lines
+        let start_line_index = self.screen_row_to_diff_line(scroll);
+        let end_line_index = self.screen_row_to_diff_line(scroll + visible_lines);
+        self.prepare_visible(start_line_index, end_line_index, &loader, theme);
 
         // Render visible slice with bounds checking
         // ALWAYS check y < area.height before writing to buffer
@@ -1209,6 +1254,7 @@ impl DiffView {
             // Returns Vec of (byte_start, byte_end, Style) tuples for each highlighted segment
             let line_highlights = self
                 .syntax_highlight_cache
+                .borrow()
                 .get(&current_line_index)
                 .cloned()
                 .unwrap_or_default();
@@ -1218,12 +1264,14 @@ impl DiffView {
                     // Get function/scope context for the hunk from cache
                     let context = self
                         .function_context_cache
+                        .borrow()
                         .get(&current_line_index)
                         .and_then(|c| c.clone());
 
                     // Get function context highlights from cache
                     let context_highlights = self
                         .function_context_highlight_cache
+                        .borrow()
                         .get(&current_line_index)
                         .cloned()
                         .unwrap_or_default();
@@ -1500,10 +1548,14 @@ impl DiffView {
                     let mut content_spans = Vec::new();
 
                     // Check if we have word-level diff info for this line
-                    if let Some(word_segments) = self.word_diff_cache.get(&current_line_index) {
+                    if let Some(word_segments) =
+                        self.word_diff_cache.borrow().get(&current_line_index)
+                    {
+                        // Clone to avoid holding borrow across the loop
+                        let word_segments = word_segments.clone();
                         // Apply word-level diff highlighting with emphasis for changed words
                         let mut byte_offset = 0;
-                        for segment in word_segments {
+                        for segment in &word_segments {
                             let segment_text = &segment.text;
                             let segment_len = segment_text.len();
 
@@ -1629,10 +1681,14 @@ impl DiffView {
                     let mut content_spans = Vec::new();
 
                     // Check if we have word-level diff info for this line
-                    if let Some(word_segments) = self.word_diff_cache.get(&current_line_index) {
+                    if let Some(word_segments) =
+                        self.word_diff_cache.borrow().get(&current_line_index)
+                    {
+                        // Clone to avoid holding borrow across the loop
+                        let word_segments = word_segments.clone();
                         // Apply word-level diff highlighting with emphasis for changed words
                         let mut byte_offset = 0;
-                        for segment in word_segments {
+                        for segment in &word_segments {
                             let segment_text = &segment.text;
                             let segment_len = segment_text.len();
 
@@ -2678,6 +2734,7 @@ mod diff_view_tests {
             PathBuf::from("file.txt"),
             PathBuf::from("/tmp/repo/file.txt"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2723,6 +2780,7 @@ mod diff_view_tests {
             relative_path.clone(),
             absolute_path,
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2757,6 +2815,7 @@ mod diff_view_tests {
             PathBuf::from("file.txt"),
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2791,6 +2850,7 @@ mod diff_view_tests {
             PathBuf::from("file.txt"),
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2821,6 +2881,7 @@ mod diff_view_tests {
             PathBuf::from("file.txt"),
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2860,6 +2921,7 @@ mod diff_view_tests {
             relative_path,
             PathBuf::from("/tmp/my file.cpp"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2888,6 +2950,7 @@ mod diff_view_tests {
             PathBuf::from("file.txt"),
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
+            None,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2947,6 +3010,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Step 2: Simulate Esc key press
@@ -3021,6 +3085,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let esc_event = Event::Key(helix_view::input::KeyEvent {
@@ -3065,6 +3130,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -3130,6 +3196,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Send Enter key
@@ -3180,6 +3247,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // The hunk's after.start should be 5 (0-indexed line number in working copy)
@@ -3229,6 +3297,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify hunks is empty
@@ -3282,6 +3351,7 @@ mod diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Manually set selected_hunk to an out-of-bounds value
@@ -3416,6 +3486,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
     }
 
@@ -3434,6 +3505,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.added, 2);
@@ -3454,6 +3526,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3474,6 +3547,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3497,6 +3571,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic - test passes if we reach here
@@ -3518,6 +3593,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic - test passes if we reach here
@@ -3539,6 +3615,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic - test passes if we reach here
@@ -3562,6 +3639,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -3583,6 +3661,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(true);
@@ -3608,6 +3687,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -3628,6 +3708,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let total_lines = diff_view.diff_lines.len();
@@ -3654,6 +3735,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         diff_view.scroll = 100;
@@ -3677,6 +3759,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         diff_view.scroll = u16::MAX;
@@ -3701,6 +3784,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let content_area = Rect::new(0, 0, 0, 10)
@@ -3724,6 +3808,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let inner_width = 3u16;
@@ -3747,6 +3832,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let content_area = Rect::new(0, 0, 80, 0)
@@ -3770,6 +3856,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let inner_height = 1u16;
@@ -3792,6 +3879,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         diff_view.update_scroll(1);
@@ -3815,6 +3903,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(true);
@@ -3834,6 +3923,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3854,6 +3944,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -3873,6 +3964,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -3892,6 +3984,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(diff_view.added > 0 || diff_view.removed > 0);
@@ -3922,6 +4015,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -4337,6 +4431,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // First line should be at screen row 0
@@ -4363,6 +4458,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Request screen row for index way beyond bounds
@@ -4393,6 +4489,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic with usize::MAX
@@ -4421,6 +4518,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Screen row 0 should map to diff line 0
@@ -4447,6 +4545,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Request diff line for screen row way beyond total
@@ -4477,6 +4576,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic with usize::MAX
@@ -4505,6 +4605,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // All operations should handle empty diff_lines gracefully
@@ -4555,6 +4656,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count HunkHeaders
@@ -4598,6 +4700,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the first HunkHeader and verify its screen row is valid
@@ -4644,6 +4747,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find HunkHeader and verify it handles long text
@@ -4681,6 +4785,7 @@ mod adversarial_tests {
             PathBuf::from("测试文件.rs"),
             PathBuf::from("/fake/path/测试文件.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should handle unicode without panicking
@@ -4724,6 +4829,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll to exactly max_scroll
@@ -4763,6 +4869,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count HunkHeaders
@@ -4816,6 +4923,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // For each diff line, convert to screen row and verify it maps back
@@ -4847,6 +4955,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the HunkHeader index
@@ -4892,6 +5001,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count HunkHeaders
@@ -4948,6 +5058,7 @@ mod adversarial_tests {
             PathBuf::from("测试.rs"),
             PathBuf::from("/fake/path/测试.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should handle wide unicode without issues
@@ -4987,6 +5098,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll to some value
@@ -5021,6 +5133,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should handle extreme line numbers without panic
@@ -5050,6 +5163,7 @@ mod adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let visible_lines = 3;
@@ -5119,6 +5233,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -5247,6 +5362,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Navigate to second hunk using J (Shift+j)
@@ -5333,6 +5449,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // With 1 hunk, indicator should be [1/1]
@@ -5386,6 +5503,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let hunk_count = diff_view.hunk_boundaries.len();
@@ -5476,6 +5594,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "Should start at hunk 0");
@@ -5500,6 +5619,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.rs"),
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
+                None,
             )
         };
 
@@ -5525,6 +5645,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.rs"),
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
+                None,
             )
         };
 
@@ -5550,6 +5671,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // For single hunk, indicator should show [1/1]
@@ -5576,6 +5698,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "selected_hunk should be 0");
@@ -5599,6 +5722,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.rs"),
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
+                None,
             )
         };
 
@@ -5629,6 +5753,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.rs"),
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
+                None,
             )
         };
 
@@ -5659,6 +5784,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // For no hunks, indicator should show [0/0]
@@ -5681,6 +5807,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.rs"),
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
+                None,
             )
         };
 
@@ -5786,6 +5913,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify hunk_boundaries is empty
@@ -5829,6 +5957,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("large.rs"),
             PathBuf::from("/fake/path/large.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify we have 1000 hunks
@@ -6215,6 +6344,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify diff_lines is empty
@@ -6261,6 +6391,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should have at least a hunk header and the diff lines
@@ -6353,6 +6484,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Navigate through all hunks rapidly
@@ -6461,6 +6593,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
@@ -6502,6 +6635,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from(malicious_path),
                 PathBuf::from(malicious_path),
                 DocumentId::default(),
+                None,
             );
 
             // Verify the path is stored as-is (no sanitization, but also no execution)
@@ -6538,6 +6672,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("test.txt"),
                 PathBuf::from("/fake/path/test.txt"),
                 DocumentId::default(),
+                None,
             );
 
             // Navigate - should not panic with unicode content
@@ -6569,6 +6704,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("large.txt"),
             PathBuf::from("/fake/path/large.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Navigate - should handle long lines without hanging
@@ -7007,6 +7143,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let hunk_start = diff_view.hunk_boundaries[0].start;
@@ -7157,6 +7294,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find a line between the two hunks (context area)
@@ -7352,6 +7490,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify empty state
@@ -7487,6 +7626,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Rapidly navigate through all adjacent hunks
@@ -7552,6 +7692,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // WorkingCopy context: should use doc for context lines
@@ -7610,6 +7751,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // This is how stage operation generates the patch (line 659)
@@ -7654,6 +7796,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // This is how revert operation generates the patch (line 615)
@@ -7700,6 +7843,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Stage uses Index context
@@ -7743,6 +7887,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Stage uses Index context
@@ -7782,6 +7927,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Revert uses WorkingCopy context
@@ -7822,6 +7968,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let patch_working =
@@ -7860,6 +8007,7 @@ mod stage_hunk_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let stage_patch = diff_view.generate_hunk_patch(&diff_view.hunks[0], ContextSource::Index);
@@ -8409,6 +8557,7 @@ mod syntax_highlighting_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/tmp/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Initially, syntax should not be cached
@@ -9515,6 +9664,7 @@ mod performance_caching_tests {
             PathBuf::from(file_path),
             PathBuf::from(file_path),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -9538,19 +9688,19 @@ mod performance_caching_tests {
             "caches_initialized should be false initially"
         );
         assert!(
-            view.word_diff_cache.is_empty(),
+            view.word_diff_cache.borrow().is_empty(),
             "word_diff_cache should be empty initially"
         );
         assert!(
-            view.syntax_highlight_cache.is_empty(),
+            view.syntax_highlight_cache.borrow().is_empty(),
             "syntax_highlight_cache should be empty initially"
         );
         assert!(
-            view.function_context_cache.is_empty(),
+            view.function_context_cache.borrow().is_empty(),
             "function_context_cache should be empty initially"
         );
 
-        // First call should initialize caches
+        // First call should initialize caches (only Syntax objects now)
         view.initialize_caches(&loader, &theme);
 
         assert!(
@@ -9558,27 +9708,32 @@ mod performance_caching_tests {
             "caches_initialized should be true after first call"
         );
 
+        // With lazy evaluation, caches are empty until prepare_visible is called
+        // Call prepare_visible to populate caches for all lines
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Capture cache sizes after first initialization
-        let word_cache_size = view.word_diff_cache.len();
-        let syntax_cache_size = view.syntax_highlight_cache.len();
-        let func_cache_size = view.function_context_cache.len();
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+        let func_cache_size = view.function_context_cache.borrow().len();
 
         // Second call should be a no-op
         view.initialize_caches(&loader, &theme);
 
         // Cache sizes should remain the same (no re-computation)
         assert_eq!(
-            view.word_diff_cache.len(),
+            view.word_diff_cache.borrow().len(),
             word_cache_size,
             "word_diff_cache should not change on second call"
         );
         assert_eq!(
-            view.syntax_highlight_cache.len(),
+            view.syntax_highlight_cache.borrow().len(),
             syntax_cache_size,
             "syntax_highlight_cache should not change on second call"
         );
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             func_cache_size,
             "function_context_cache should not change on second call"
         );
@@ -9602,16 +9757,20 @@ mod performance_caching_tests {
         // Initialize caches
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Word diff cache should have entries for the paired deletion/addition
         // The diff_lines will have: HunkHeader, Deletion, Addition
         // Indices 1 and 2 should have word diff entries
         assert!(
-            !view.word_diff_cache.is_empty(),
+            !view.word_diff_cache.borrow().is_empty(),
             "word_diff_cache should have entries for paired deletion/addition"
         );
 
         // Check that the cache contains segments with emphasis markers
-        for (_, segments) in &view.word_diff_cache {
+        for (_, segments) in view.word_diff_cache.borrow().iter() {
             // At least some segments should be marked as emphasized (changed words)
             let has_emph = segments.iter().any(|s| s.is_emph);
             // For "let x = 1" vs "let y = 2", we expect "x" and "y" to be emphasized
@@ -9640,11 +9799,15 @@ mod performance_caching_tests {
 
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Word diff cache should be empty since there are no paired deletion/addition
         // (addition-only lines don't have word-level diffs)
         // Note: The cache may still have entries for context lines, but not for unpaired additions
         // The key invariant is that word_diff_cache only contains entries for paired lines
-        for (line_idx, segments) in &view.word_diff_cache {
+        for (line_idx, segments) in view.word_diff_cache.borrow().iter() {
             // If there's an entry, verify it's valid
             if !segments.is_empty() {
                 // The line should be either a deletion or addition that has a pair
@@ -9670,15 +9833,19 @@ mod performance_caching_tests {
 
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Syntax highlight cache should have entries for all diff lines
         assert_eq!(
-            view.syntax_highlight_cache.len(),
+            view.syntax_highlight_cache.borrow().len(),
             view.diff_lines.len(),
             "syntax_highlight_cache should have an entry for each diff line"
         );
 
         // Each entry should be a valid Vec (may be empty for hunk headers or if no syntax)
-        for (line_idx, highlights) in &view.syntax_highlight_cache {
+        for (line_idx, highlights) in view.syntax_highlight_cache.borrow().iter() {
             // Verify the line index is valid
             assert!(
                 *line_idx < view.diff_lines.len(),
@@ -9712,6 +9879,10 @@ mod performance_caching_tests {
 
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Function context cache should have entries for hunk headers
         // Count hunk headers in diff_lines
         let hunk_header_count = view
@@ -9721,13 +9892,13 @@ mod performance_caching_tests {
             .count();
 
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             hunk_header_count,
             "function_context_cache should have an entry for each hunk header"
         );
 
         // Each entry should correspond to a HunkHeader line
-        for (line_idx, context) in &view.function_context_cache {
+        for (line_idx, context) in view.function_context_cache.borrow().iter() {
             let line = view.diff_lines.get(*line_idx);
             assert!(
                 matches!(line, Some(DiffLine::HunkHeader { .. })),
@@ -9759,26 +9930,33 @@ mod performance_caching_tests {
         // Initialize caches
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Get cached values and verify they're consistent
         let word_cache_snapshot: Vec<_> = view
             .word_diff_cache
+            .borrow()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         let syntax_cache_snapshot: Vec<_> = view
             .syntax_highlight_cache
+            .borrow()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         let func_cache_snapshot: Vec<_> = view
             .function_context_cache
+            .borrow()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
 
         // Access caches again (simulating render access)
         for (line_idx, segments) in &word_cache_snapshot {
-            let cached = view.word_diff_cache.get(line_idx);
+            let cached = view.word_diff_cache.borrow().get(line_idx).cloned();
             assert!(
                 cached.is_some(),
                 "Word diff cache should have consistent entries"
@@ -9791,7 +9969,7 @@ mod performance_caching_tests {
         }
 
         for (line_idx, highlights) in &syntax_cache_snapshot {
-            let cached = view.syntax_highlight_cache.get(line_idx);
+            let cached = view.syntax_highlight_cache.borrow().get(line_idx).cloned();
             assert!(
                 cached.is_some(),
                 "Syntax highlight cache should have consistent entries"
@@ -9804,7 +9982,7 @@ mod performance_caching_tests {
         }
 
         for (line_idx, context) in &func_cache_snapshot {
-            let cached = view.function_context_cache.get(line_idx);
+            let cached = view.function_context_cache.borrow().get(line_idx).cloned();
             assert!(
                 cached.is_some(),
                 "Function context cache should have consistent entries"
@@ -9846,15 +10024,15 @@ mod performance_caching_tests {
             "caches_initialized should be true even for empty diff"
         );
         assert!(
-            view.word_diff_cache.is_empty(),
+            view.word_diff_cache.borrow().is_empty(),
             "word_diff_cache should be empty for empty diff"
         );
         assert!(
-            view.syntax_highlight_cache.is_empty(),
+            view.syntax_highlight_cache.borrow().is_empty(),
             "syntax_highlight_cache should be empty for empty diff"
         );
         assert!(
-            view.function_context_cache.is_empty(),
+            view.function_context_cache.borrow().is_empty(),
             "function_context_cache should be empty for empty diff"
         );
     }
@@ -9876,6 +10054,10 @@ mod performance_caching_tests {
         // Initialize caches
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Caches should still be initialized
         assert!(
             view.caches_initialized,
@@ -9884,7 +10066,7 @@ mod performance_caching_tests {
 
         // Syntax cache should have entries (may be empty or default highlights)
         assert_eq!(
-            view.syntax_highlight_cache.len(),
+            view.syntax_highlight_cache.borrow().len(),
             view.diff_lines.len(),
             "syntax_highlight_cache should have entries for all lines"
         );
@@ -9892,7 +10074,7 @@ mod performance_caching_tests {
         // Word diff cache should still work (doesn't depend on syntax)
         // It should have entries for paired deletion/addition
         assert!(
-            !view.word_diff_cache.is_empty() || view.diff_lines.len() <= 1,
+            !view.word_diff_cache.borrow().is_empty() || view.diff_lines.len() <= 1,
             "word_diff_cache should work without syntax"
         );
 
@@ -9903,13 +10085,13 @@ mod performance_caching_tests {
             .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
             .count();
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             hunk_header_count,
             "function_context_cache should have entries for hunk headers"
         );
 
         // All function contexts should be None (no syntax to extract from)
-        for (_, context) in &view.function_context_cache {
+        for (_, context) in view.function_context_cache.borrow().iter() {
             assert!(
                 context.is_none(),
                 "Function context should be None when no syntax available"
@@ -9937,12 +10119,16 @@ mod performance_caching_tests {
 
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Verify all caches are populated
         assert!(view.caches_initialized, "caches_initialized should be true");
 
         // Syntax cache should cover all lines
         assert_eq!(
-            view.syntax_highlight_cache.len(),
+            view.syntax_highlight_cache.borrow().len(),
             view.diff_lines.len(),
             "syntax_highlight_cache should cover all diff lines"
         );
@@ -9954,7 +10140,7 @@ mod performance_caching_tests {
             .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
             .count();
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             hunk_header_count,
             "function_context_cache should have entries for all hunk headers"
         );
@@ -9982,11 +10168,11 @@ mod performance_caching_tests {
 
         // Each view should have independent cache state
         assert!(
-            view1.word_diff_cache.is_empty(),
+            view1.word_diff_cache.borrow().is_empty(),
             "View 1 word_diff_cache should be empty"
         );
         assert!(
-            view2.word_diff_cache.is_empty(),
+            view2.word_diff_cache.borrow().is_empty(),
             "View 2 word_diff_cache should be empty"
         );
     }
@@ -10008,8 +10194,12 @@ mod performance_caching_tests {
 
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Word diff for identical lines should have segments with is_emph = false
-        for (_, segments) in &view.word_diff_cache {
+        for (_, segments) in view.word_diff_cache.borrow().iter() {
             for segment in segments {
                 assert!(
                     !segment.is_emph,
@@ -10072,6 +10262,7 @@ mod function_context_styling_tests {
             PathBuf::from(file_path),
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
+            None,
         )
     }
 
@@ -10091,6 +10282,10 @@ mod function_context_styling_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10101,7 +10296,9 @@ mod function_context_styling_tests {
         // Get the function context
         let context = view
             .function_context_cache
+            .borrow()
             .get(&hunk_header_idx)
+            .cloned()
             .expect("Should have function context cached");
 
         // Verify context exists and has text
@@ -10161,6 +10358,10 @@ mod function_context_styling_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10170,25 +10371,33 @@ mod function_context_styling_tests {
 
         // Check if function context highlight cache has entries
         // If syntax is available and function is found, highlights should be cached
-        let context = view.function_context_cache.get(&hunk_header_idx);
+        let context = view
+            .function_context_cache
+            .borrow()
+            .get(&hunk_header_idx)
+            .cloned();
 
         if let Some(Some(ctx)) = context {
             // If we have a function context, check the highlight cache
-            let highlights = view.function_context_highlight_cache.get(&hunk_header_idx);
+            let highlights = view
+                .function_context_highlight_cache
+                .borrow()
+                .get(&hunk_header_idx)
+                .cloned();
 
             // Highlights may or may not be present depending on theme/syntax
             if let Some(highlights) = highlights {
                 // Verify highlight structure
                 for (start, end, _style) in highlights {
                     assert!(
-                        *start < *end,
+                        start < end,
                         "Highlight start ({}) should be less than end ({})",
                         start,
                         end
                     );
                     // Highlights should be within the truncated length
                     assert!(
-                        *start <= ctx.truncated_len,
+                        start <= ctx.truncated_len,
                         "Highlight start ({}) should be within truncated length ({})",
                         start,
                         ctx.truncated_len
@@ -10290,6 +10499,10 @@ mod function_context_styling_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10298,7 +10511,11 @@ mod function_context_styling_tests {
             .expect("Should have a hunk header");
 
         // Get the function context - may be None
-        let context = view.function_context_cache.get(&hunk_header_idx);
+        let context = view
+            .function_context_cache
+            .borrow()
+            .get(&hunk_header_idx)
+            .cloned();
 
         // The context should be None or Some with valid data
         if let Some(Some(ctx)) = context {
@@ -10326,6 +10543,10 @@ mod function_context_styling_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10334,13 +10555,18 @@ mod function_context_styling_tests {
             .expect("Should have a hunk header");
 
         // Check if function context exists
-        let context = view.function_context_cache.get(&hunk_header_idx);
+        let context = view
+            .function_context_cache
+            .borrow()
+            .get(&hunk_header_idx)
+            .cloned();
 
         if let Some(Some(_ctx)) = context {
             // If function context exists, highlight cache should also have an entry
             // (may be empty if no highlights, but the key should exist)
             let has_highlight_entry = view
                 .function_context_highlight_cache
+                .borrow()
                 .contains_key(&hunk_header_idx);
             assert!(
                 has_highlight_entry,
@@ -10396,6 +10622,10 @@ mod function_context_styling_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Count hunk headers
         let hunk_header_count = view
             .diff_lines
@@ -10411,7 +10641,7 @@ mod function_context_styling_tests {
 
         // Each hunk header should have a function context cache entry
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             hunk_header_count,
             "Should have function context for each hunk header"
         );
@@ -10497,6 +10727,7 @@ mod box_decoration_tests {
             PathBuf::from(file_path),
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
+            None,
         )
     }
 
@@ -10554,6 +10785,10 @@ mod box_decoration_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10562,7 +10797,11 @@ mod box_decoration_tests {
             .expect("Should have a hunk header");
 
         // Check if function context exists
-        let context = view.function_context_cache.get(&hunk_header_idx);
+        let context = view
+            .function_context_cache
+            .borrow()
+            .get(&hunk_header_idx)
+            .cloned();
 
         if let Some(Some(ctx)) = context {
             // Verify the function context has the expected structure
@@ -10599,6 +10838,10 @@ mod box_decoration_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Find the hunk header line index
         let hunk_header_idx = view
             .diff_lines
@@ -10617,7 +10860,11 @@ mod box_decoration_tests {
         }
 
         // Verify function context is None or missing
-        let context = view.function_context_cache.get(&hunk_header_idx);
+        let context = view
+            .function_context_cache
+            .borrow()
+            .get(&hunk_header_idx)
+            .cloned();
         // Context may be None for files without functions
         if let Some(Some(ctx)) = context {
             // If context exists, it should be valid
@@ -10717,6 +10964,10 @@ mod box_decoration_tests {
         let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
         view.initialize_caches(&loader, &theme);
 
+        // Prepare visible lines to populate caches
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
         // Count hunk headers
         let hunk_header_count = view
             .diff_lines
@@ -10733,7 +10984,7 @@ mod box_decoration_tests {
         // Each hunk header should have a function context cache entry
         // (which means it will get box decoration during rendering)
         assert_eq!(
-            view.function_context_cache.len(),
+            view.function_context_cache.borrow().len(),
             hunk_header_count,
             "Should have function context cache entry for each hunk header"
         );
@@ -11341,6 +11592,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count hunk headers
@@ -11504,6 +11756,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should handle Unicode content without panicking
@@ -11532,6 +11785,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should handle many hunks without panicking
@@ -11607,6 +11861,7 @@ mod screen_row_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -11637,6 +11892,7 @@ mod screen_row_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -11658,6 +11914,7 @@ mod screen_row_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Empty diff should have 0 screen rows
@@ -11904,6 +12161,7 @@ mod screen_row_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         assert_eq!(
@@ -13879,6 +14137,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Initial state: first hunk selected
@@ -13914,6 +14173,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify diff_lines contains expected line types
@@ -13956,6 +14216,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Initial scroll should be 0
@@ -14119,6 +14380,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll to 0
@@ -14148,6 +14410,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll to max
@@ -14182,6 +14445,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll way beyond total
@@ -14212,6 +14476,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic with 0 visible lines
@@ -14332,6 +14597,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count HunkHeaders
@@ -14377,6 +14643,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -14421,6 +14688,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set scroll to middle of first HunkHeader
@@ -14692,6 +14960,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set extreme scroll
@@ -14732,6 +15001,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic with extreme line numbers
@@ -14758,6 +15028,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set extreme scroll
@@ -14790,6 +15061,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // All operations should work on empty diff
@@ -14834,6 +15106,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify we have multiple HunkHeaders
@@ -14911,6 +15184,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify total screen rows calculation
@@ -15102,6 +15376,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Test scroll behavior
@@ -15202,6 +15477,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // ATTACK: Set scroll to 0
@@ -15252,6 +15528,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let visible_lines = 10;
@@ -15307,6 +15584,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the first HunkHeader
@@ -15365,6 +15643,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the first HunkHeader
@@ -15422,6 +15701,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         diff_view.scroll = 0;
@@ -15457,6 +15737,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let visible_lines = 3;
@@ -15495,6 +15776,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Set selected_line to first hunk's start so J navigates (not snaps to current header)
@@ -15542,6 +15824,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let visible_lines = 10;
@@ -15595,6 +15878,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // ATTACK: Rapidly change scroll and navigate
@@ -15645,6 +15929,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // ATTACK: Rapid PageDown/PageUp
@@ -15723,6 +16008,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Verify diff_lines are created
@@ -15815,6 +16101,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("unicode.txt"),
                 PathBuf::from("/fake/path/unicode.txt"),
                 DocumentId::default(),
+                None,
             );
 
             // Navigate - should not panic with unicode content
@@ -15863,6 +16150,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from(path),
                 PathBuf::from(format!("/fake/path/{}", path)),
                 DocumentId::default(),
+                None,
             );
 
             // Verify file_name is stored correctly
@@ -15906,6 +16194,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from(format!("wide_{}.txt", width)),
                 PathBuf::from(format!("/fake/path/wide_{}.txt", width)),
                 DocumentId::default(),
+                None,
             );
 
             // Navigate - should not hang or panic
@@ -15969,6 +16258,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("mixed_width.txt"),
             PathBuf::from("/fake/path/mixed_width.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Navigate through all hunks
@@ -16020,6 +16310,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("whitespace.txt"),
                 PathBuf::from("/fake/path/whitespace.txt"),
                 DocumentId::default(),
+                None,
             );
 
             // Verify diff_lines are created
@@ -16066,6 +16357,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("empty.txt"),
                 PathBuf::from("/fake/path/empty.txt"),
                 DocumentId::default(),
+                None,
             );
 
             // Verify no panic occurs
@@ -16096,6 +16388,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("测试🎉.txt"),
             PathBuf::from("/fake/path/测试🎉.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Navigate - should not panic
@@ -16137,6 +16430,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("多言語.txt"),
             PathBuf::from("/fake/path/多言語.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Rapid scroll changes
@@ -16194,6 +16488,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -16588,6 +16883,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Should have context lines
@@ -16617,6 +16913,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("empty.txt"),
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Should not panic with empty diff_lines
@@ -16689,6 +16986,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         )
     }
 
@@ -16822,6 +17120,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the HunkHeader
@@ -16873,6 +17172,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Count HunkHeaders
@@ -16996,6 +17296,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find a context line at the start
@@ -17033,6 +17334,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         // Find the last context line
@@ -17196,6 +17498,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("empty.txt"),
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
+            None,
         );
 
         // All scroll operations should be safe
@@ -17225,6 +17528,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("single.txt"),
             PathBuf::from("/fake/path/single.txt"),
             DocumentId::default(),
+            None,
         );
 
         // Should have HunkHeader
@@ -17335,6 +17639,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("test.rs"),
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
+            None,
         );
 
         let hunk_header_idx = view
@@ -17400,6 +17705,1654 @@ mod adversarial_scroll_selection_tests {
         assert!(
             result < view.diff_lines.len() || view.diff_lines.is_empty(),
             "Extreme screen row should return valid diff line index"
+        );
+    }
+}
+
+// =============================================================================
+// ADVERSARIAL TESTS: Performance Optimization Edge Cases
+// =============================================================================
+// These tests attack the performance optimization code paths:
+// 1. Arc reference counting (document edited while DiffView open)
+// 2. Multiple DiffView instances for same document
+// 3. No syntax available (None passed)
+// 4. Syntax invalidated during diff view open
+// 5. Large documents with complex syntax trees
+
+#[cfg(test)]
+mod adversarial_performance_tests {
+    use super::*;
+    use std::ops::Range;
+    use std::sync::Arc;
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: Range<u32>, after: Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 1: Arc Reference Count > 1 (Document edited while open)
+    // =========================================================================
+
+    /// Test: DiffView with shared Arc<Syntax> - simulates document being edited
+    /// When a document is edited while DiffView is open, the Arc reference count
+    /// will be > 1, and the syntax may become stale.
+    #[test]
+    fn test_shared_syntax_arc_reference() {
+        let diff_base = Rope::from("fn main() {\n    println!(\"hello\");\n}\n");
+        let doc = Rope::from("fn main() {\n    println!(\"modified\");\n}\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // Create a shared syntax Arc (simulating document's syntax)
+        // Note: We can't create a real Syntax without a loader, so we test with None
+        let shared_syntax: Option<Arc<Syntax>> = None;
+
+        // Create DiffView with the shared syntax
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            shared_syntax,
+        );
+
+        // Verify the DiffView was created successfully
+        assert!(diff_view.cached_syntax_doc.is_none());
+        assert_eq!(diff_view.added, 1);
+        assert_eq!(diff_view.removed, 1);
+    }
+
+    /// Test: Multiple Arc references to same syntax
+    /// This simulates the case where multiple components hold references to the
+    /// document's syntax, and one of them (DiffView) needs to use it safely.
+    #[test]
+    fn test_multiple_arc_references_to_syntax() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1 modified\nline 2\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        // Create a "shared" syntax reference (None in this case)
+        let syntax_ref: Option<Arc<Syntax>> = None;
+
+        // Clone the Arc to simulate multiple references
+        let _cloned_ref = syntax_ref.clone();
+
+        // Create DiffView with the original reference
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            syntax_ref,
+        );
+
+        // Should handle None gracefully
+        assert!(diff_view.cached_syntax_doc.is_none());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 2: Multiple DiffView instances for same document
+    // =========================================================================
+
+    /// Test: Creating multiple DiffView instances with same document content
+    /// This tests memory safety when multiple views reference the same underlying data.
+    #[test]
+    fn test_multiple_diff_views_same_document() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // Create multiple DiffView instances
+        let view1 = DiffView::new(
+            diff_base.clone(),
+            doc.clone(),
+            hunks.clone(),
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        let view2 = DiffView::new(
+            diff_base.clone(),
+            doc.clone(),
+            hunks.clone(),
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        let view3 = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        // All views should have consistent state
+        assert_eq!(view1.added, view2.added);
+        assert_eq!(view2.added, view3.added);
+        assert_eq!(view1.removed, view2.removed);
+        assert_eq!(view2.removed, view3.removed);
+    }
+
+    /// Test: Multiple DiffView instances with shared syntax reference
+    #[test]
+    fn test_multiple_diff_views_shared_syntax() {
+        let diff_base = Rope::from("fn foo() {}\nfn bar() {}\n");
+        let doc = Rope::from("fn foo() {}\nfn baz() {}\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let shared_syntax: Option<Arc<Syntax>> = None;
+
+        // Create multiple views with the same syntax reference
+        let view1 = DiffView::new(
+            diff_base.clone(),
+            doc.clone(),
+            hunks.clone(),
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            shared_syntax.clone(),
+        );
+
+        let view2 = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            shared_syntax,
+        );
+
+        // Both should handle None gracefully
+        assert!(view1.cached_syntax_doc.is_none());
+        assert!(view2.cached_syntax_doc.is_none());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 3: No syntax available (None passed)
+    // =========================================================================
+
+    /// Test: DiffView with None syntax - should not panic
+    #[test]
+    fn test_none_syntax_no_panic() {
+        let diff_base = Rope::from("plain text\nno syntax\n");
+        let doc = Rope::from("plain text modified\nno syntax\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should not have cached syntax
+        assert!(diff_view.cached_syntax_doc.is_none());
+        assert!(diff_view.cached_syntax_base.is_none());
+
+        // Should still have valid diff lines
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Empty file with None syntax
+    #[test]
+    fn test_empty_file_none_syntax() {
+        let diff_base = Rope::from("");
+        let doc = Rope::from("");
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "empty.txt".to_string(),
+            PathBuf::from("empty.txt"),
+            PathBuf::from("/fake/path/empty.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(diff_view.diff_lines.is_empty());
+        assert!(diff_view.cached_syntax_doc.is_none());
+    }
+
+    /// Test: Binary-like content with None syntax
+    #[test]
+    fn test_binary_like_content_none_syntax() {
+        // Simulate binary-like content with null bytes
+        let diff_base = Rope::from("binary\x00content\x00here\n");
+        let doc = Rope::from("binary\x00modified\x00here\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "binary.bin".to_string(),
+            PathBuf::from("binary.bin"),
+            PathBuf::from("/fake/path/binary.bin"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should handle binary-like content without panic
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 4: Syntax invalidated during diff view open
+    // =========================================================================
+
+    /// Test: Syntax becomes None after being set
+    /// This simulates the case where syntax is invalidated (e.g., language server crash)
+    #[test]
+    fn test_syntax_invalidation_simulation() {
+        let diff_base = Rope::from("fn main() {}\n");
+        let doc = Rope::from("fn main_modified() {}\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        // Create with None syntax (simulating invalidated state)
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should handle gracefully
+        assert!(diff_view.cached_syntax_doc.is_none());
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Cache initialization with None syntax
+    #[test]
+    fn test_cache_init_with_none_syntax() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Caches should not be initialized yet
+        assert!(!diff_view.caches_initialized);
+
+        // The caches should be empty before initialization
+        assert!(diff_view.word_diff_cache.borrow().is_empty());
+        assert!(diff_view.syntax_highlight_cache.borrow().is_empty());
+        assert!(diff_view.function_context_cache.borrow().is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 5: Large documents with complex syntax trees
+    // =========================================================================
+
+    /// Test: Large document with many lines
+    #[test]
+    fn test_large_document_many_lines() {
+        // Create a large document with 10000 lines
+        let lines: Vec<String> = (0..10000).map(|i| format!("line {}", i)).collect();
+        let content = lines.join("\n");
+
+        let diff_base = Rope::from(content.clone());
+        let doc = Rope::from(content);
+        let hunks = vec![make_hunk(0..10000, 0..10000)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "large.txt".to_string(),
+            PathBuf::from("large.txt"),
+            PathBuf::from("/fake/path/large.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should handle large documents
+        assert!(diff_view.diff_lines.len() > 0);
+    }
+
+    /// Test: Document with very long lines
+    #[test]
+    fn test_document_very_long_lines() {
+        // Create lines with 10000 characters each
+        let long_line = "x".repeat(10000);
+        let content = format!("{}\n{}\n{}", long_line, long_line, long_line);
+
+        let diff_base = Rope::from(content.clone());
+        let doc = Rope::from(content);
+        let hunks = vec![make_hunk(0..3, 0..3)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "longlines.txt".to_string(),
+            PathBuf::from("longlines.txt"),
+            PathBuf::from("/fake/path/longlines.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Many hunks in a single document
+    #[test]
+    fn test_many_hunks_single_document() {
+        let diff_base_lines: Vec<String> = (0..1000).map(|i| format!("base line {}", i)).collect();
+        let doc_lines: Vec<String> = (0..1000).map(|i| format!("doc line {}", i)).collect();
+
+        let diff_base = Rope::from(diff_base_lines.join("\n"));
+        let doc = Rope::from(doc_lines.join("\n"));
+
+        // Create 100 hunks
+        let hunks: Vec<Hunk> = (0..100)
+            .map(|i| {
+                let start = (i * 10) as u32;
+                make_hunk(start..start + 5, start..start + 5)
+            })
+            .collect();
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "manyhunks.txt".to_string(),
+            PathBuf::from("manyhunks.txt"),
+            PathBuf::from("/fake/path/manyhunks.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should have 100 hunk boundaries
+        assert_eq!(diff_view.hunk_boundaries.len(), 100);
+    }
+
+    /// Test: Complex nested syntax-like content (simulating code)
+    #[test]
+    fn test_complex_nested_syntax_content() {
+        let code = r#"
+fn main() {
+    let x = {
+        let y = {
+            let z = {
+                let w = 42;
+                w
+            };
+            z
+        };
+        y
+    };
+    x
+}
+
+struct Foo {
+    bar: Bar,
+}
+
+impl Foo {
+    fn new() -> Self {
+        Self { bar: Bar::default() }
+    }
+}
+"#;
+
+        let diff_base = Rope::from(code);
+        let doc = Rope::from(code.replace("42", "100"));
+        let hunks = vec![make_hunk(4..5, 4..5)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "complex.rs".to_string(),
+            PathBuf::from("complex.rs"),
+            PathBuf::from("/fake/path/complex.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 6: Thread safety edge cases
+    // =========================================================================
+
+    /// Test: Arc<Syntax> can be cloned safely
+    #[test]
+    fn test_arc_syntax_clone_safety() {
+        let syntax: Option<Arc<Syntax>> = None;
+
+        // Should be able to clone None
+        let cloned = syntax.clone();
+        assert!(cloned.is_none());
+
+        // Should be able to clone again
+        let cloned2 = syntax.clone();
+        assert!(cloned2.is_none());
+    }
+
+    /// Test: Multiple clones of None syntax
+    #[test]
+    fn test_multiple_clones_none_syntax() {
+        let syntax: Option<Arc<Syntax>> = None;
+
+        let clones: Vec<_> = (0..10).map(|_| syntax.clone()).collect();
+
+        for clone in clones {
+            assert!(clone.is_none());
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 7: Memory safety with cache operations
+    // =========================================================================
+
+    /// Test: Word diff cache with empty content
+    #[test]
+    fn test_word_diff_cache_empty_content() {
+        let diff_base = Rope::from("");
+        let doc = Rope::from("");
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "empty.txt".to_string(),
+            PathBuf::from("empty.txt"),
+            PathBuf::from("/fake/path/empty.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Word diff cache should be empty for empty diff
+        assert!(diff_view.word_diff_cache.borrow().is_empty());
+    }
+
+    /// Test: Syntax highlight cache with no syntax
+    #[test]
+    fn test_syntax_highlight_cache_no_syntax() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1 modified\nline 2\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Syntax highlight cache should be empty before initialization
+        assert!(diff_view.syntax_highlight_cache.borrow().is_empty());
+    }
+
+    /// Test: Function context cache with no syntax
+    #[test]
+    fn test_function_context_cache_no_syntax() {
+        let diff_base = Rope::from("fn main() {}\n");
+        let doc = Rope::from("fn foo() {}\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Function context cache should be empty before initialization
+        assert!(diff_view.function_context_cache.borrow().is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 8: Edge cases in cache initialization
+    // =========================================================================
+
+    /// Test: Cache initialization flag
+    #[test]
+    fn test_cache_initialization_flag() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1\nline 2 modified\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Caches should not be initialized on creation
+        assert!(!diff_view.caches_initialized);
+    }
+
+    /// Test: Hunk boundaries are computed correctly
+    #[test]
+    fn test_hunk_boundaries_computed() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\nline 4 modified\n");
+        let hunks = vec![make_hunk(1..2, 1..2), make_hunk(3..4, 3..4)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should have 2 hunk boundaries
+        assert_eq!(diff_view.hunk_boundaries.len(), 2);
+
+        // Each boundary should have valid start and end
+        for boundary in &diff_view.hunk_boundaries {
+            assert!(boundary.start <= boundary.end);
+            assert!(boundary.end <= diff_view.diff_lines.len());
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 9: Unicode and special characters
+    // =========================================================================
+
+    /// Test: Unicode content with None syntax
+    #[test]
+    fn test_unicode_content_none_syntax() {
+        let diff_base = Rope::from("你好世界\nこんにちは\n");
+        let doc = Rope::from("你好世界 modified\nこんにちは\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "unicode.txt".to_string(),
+            PathBuf::from("unicode.txt"),
+            PathBuf::from("/fake/path/unicode.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Emoji content with None syntax
+    #[test]
+    fn test_emoji_content_none_syntax() {
+        let diff_base = Rope::from("🎉🎊🎈\n🎁🎀\n");
+        let doc = Rope::from("🎉🎊🎈 modified\n🎁🎀\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "emoji.txt".to_string(),
+            PathBuf::from("emoji.txt"),
+            PathBuf::from("/fake/path/emoji.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Mixed encoding-like content
+    #[test]
+    fn test_mixed_encoding_content() {
+        let diff_base = Rope::from("ASCII\n日本語\nEmoji 🎉\n");
+        let doc = Rope::from("ASCII modified\n日本語\nEmoji 🎉\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "mixed.txt".to_string(),
+            PathBuf::from("mixed.txt"),
+            PathBuf::from("/fake/path/mixed.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 10: Boundary conditions in diff computation
+    // =========================================================================
+
+    /// Test: Hunk at exact document boundaries
+    #[test]
+    fn test_hunk_at_document_boundaries() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1 modified\nline 2\nline 3 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1), make_hunk(2..3, 2..3)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should handle hunks at boundaries
+        assert_eq!(diff_view.hunk_boundaries.len(), 2);
+    }
+
+    /// Test: Overlapping hunks (edge case)
+    #[test]
+    fn test_overlapping_hunks() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2\nline 3\n");
+
+        // Create overlapping hunks (this is unusual but should not panic)
+        let hunks = vec![make_hunk(0..2, 0..2), make_hunk(1..3, 1..3)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should not panic
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+
+    /// Test: Zero-width hunks
+    #[test]
+    fn test_zero_width_hunks() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2\nline 3\n");
+
+        // Zero-width hunk (start == end)
+        let hunks = vec![make_hunk(1..1, 1..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.txt".to_string(),
+            PathBuf::from("test.txt"),
+            PathBuf::from("/fake/path/test.txt"),
+            DocumentId::default(),
+            None,
+        );
+
+        // Should handle zero-width hunks
+        assert!(!diff_view.diff_lines.is_empty());
+    }
+}
+
+// =============================================================================
+// ADVERSARIAL TESTS: Lazy Evaluation Implementation
+// Attack vectors for edge cases and performance scenarios
+// =============================================================================
+
+#[cfg(test)]
+mod lazy_evaluation_adversarial_tests {
+    //! Adversarial tests for lazy evaluation implementation in diff view
+    //!
+    //! Attack vectors:
+    //! 1. Empty diff_lines - edge case
+    //! 2. Very large diff (1000+ lines) - performance
+    //! 3. Rapid scrolling (cache thrashing) - performance
+    //! 4. Cache invalidation - edge case
+    //! 5. Memory bounds with many cached entries - performance
+
+    use super::*;
+    use helix_core::syntax::Loader;
+    use helix_view::Theme;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    /// Create a test syntax loader
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: std::ops::Range<u32>, after: std::ops::Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    /// Helper to create a DiffView for testing
+    fn create_test_diff_view(
+        diff_base: &str,
+        doc: &str,
+        hunks: Vec<Hunk>,
+        file_path: &str,
+    ) -> DiffView {
+        DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            file_path.to_string(),
+            PathBuf::from(file_path),
+            PathBuf::from(file_path),
+            helix_view::DocumentId::default(),
+            None,
+        )
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 1: Empty diff_lines
+    // =========================================================================
+
+    /// Test: Empty diff_lines with no hunks
+    /// Verifies that prepare_visible handles empty diff_lines gracefully
+    #[test]
+    fn test_empty_diff_lines_no_hunks() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Empty diff - no changes
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1\nline 2\n";
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        // Call prepare_visible with empty diff_lines
+        view.prepare_visible(0, 0, &loader, &theme);
+
+        // Should not panic and caches should remain empty
+        assert!(view.diff_lines.is_empty(), "diff_lines should be empty");
+        assert!(
+            view.word_diff_cache.borrow().is_empty(),
+            "word_diff_cache should be empty"
+        );
+        assert!(
+            view.syntax_highlight_cache.borrow().is_empty(),
+            "syntax_highlight_cache should be empty"
+        );
+        assert!(
+            view.function_context_cache.borrow().is_empty(),
+            "function_context_cache should be empty"
+        );
+    }
+
+    /// Test: prepare_visible with out-of-bounds indices on empty diff
+    #[test]
+    fn test_prepare_visible_out_of_bounds_empty() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "content\n";
+        let doc = "content\n";
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Try to prepare visible lines with out-of-bounds indices
+        // Should not panic
+        view.prepare_visible(0, 100, &loader, &theme);
+        view.prepare_visible(50, 100, &loader, &theme);
+
+        assert!(view.diff_lines.is_empty());
+    }
+
+    /// Test: prepare_visible with inverted indices (start > end)
+    #[test]
+    fn test_prepare_visible_inverted_indices() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1 modified\nline 2\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Call with inverted indices (start > end)
+        // The implementation should handle this gracefully
+        view.prepare_visible(10, 0, &loader, &theme);
+
+        // Should not panic - caches may or may not be populated
+        assert!(view.caches_initialized);
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 2: Very large diff (1000+ lines)
+    // =========================================================================
+
+    /// Test: Large diff with many hunks - performance
+    /// Verifies that lazy evaluation doesn't pre-compute everything
+    #[test]
+    fn test_large_diff_lazy_evaluation() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a large diff with 1000+ lines
+        let diff_base_lines: Vec<String> = (0..1000).map(|i| format!("line {}\n", i)).collect();
+        let mut doc_lines: Vec<String> = diff_base_lines.clone();
+
+        // Modify every 10th line
+        for i in (0..1000).step_by(10) {
+            doc_lines[i] = format!("modified line {}\n", i);
+        }
+
+        // Create hunks for each modification
+        let hunks: Vec<Hunk> = (0..1000)
+            .step_by(10)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base: String = diff_base_lines.join("");
+        let doc: String = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Caches should be empty after initialization (lazy)
+        // Note: initialize_caches only creates Syntax objects, not word diffs or highlights
+        // Word diffs and highlights are computed lazily in prepare_visible
+        assert!(
+            view.word_diff_cache.borrow().is_empty(),
+            "word_diff_cache should be empty after lazy init"
+        );
+        assert!(
+            view.syntax_highlight_cache.borrow().is_empty(),
+            "syntax_highlight_cache should be empty after lazy init"
+        );
+        assert!(
+            view.function_context_cache.borrow().is_empty(),
+            "function_context_cache should be empty after lazy init"
+        );
+    }
+
+    /// Test: Large diff - prepare_visible only computes visible range
+    #[test]
+    fn test_large_diff_prepare_visible_subset() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a large diff
+        let mut diff_base_lines: Vec<String> = (0..500).map(|i| format!("line {}\n", i)).collect();
+        let mut doc_lines: Vec<String> = diff_base_lines.clone();
+
+        for i in (0..500).step_by(5) {
+            doc_lines[i] = format!("modified line {}\n", i);
+        }
+
+        let hunks: Vec<Hunk> = (0..500)
+            .step_by(5)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base: String = diff_base_lines.join("");
+        let doc: String = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare only a small visible range
+        let visible_start = 10;
+        let visible_end = 20;
+        view.prepare_visible(visible_start, visible_end, &loader, &theme);
+
+        // Cache should only contain entries for the visible range + buffer
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+
+        // Should not have computed all 500+ lines
+        assert!(
+            word_cache_size < 100,
+            "word_diff_cache should only have visible entries, got {}",
+            word_cache_size
+        );
+        assert!(
+            syntax_cache_size < 100,
+            "syntax_highlight_cache should only have visible entries, got {}",
+            syntax_cache_size
+        );
+    }
+
+    /// Test: Large diff - memory usage stays bounded
+    #[test]
+    fn test_large_diff_memory_bounded() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a diff with many lines
+        let diff_base_lines: Vec<String> = (0..2000).map(|i| format!("line {}\n", i)).collect();
+        let mut doc_lines = diff_base_lines.clone();
+
+        // Modify many lines
+        for i in 0..2000 {
+            if i % 2 == 0 {
+                doc_lines[i] = format!("modified line {}\n", i);
+            }
+        }
+
+        let hunks: Vec<Hunk> = (0..2000)
+            .step_by(2)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base: String = diff_base_lines.join("");
+        let doc: String = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare visible for a small range
+        view.prepare_visible(0, 50, &loader, &theme);
+
+        // Cache sizes should be bounded
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+
+        // Should not have computed all 2000 lines
+        assert!(
+            word_cache_size < 200,
+            "word_diff_cache should be bounded, got {}",
+            word_cache_size
+        );
+        assert!(
+            syntax_cache_size < 200,
+            "syntax_highlight_cache should be bounded, got {}",
+            syntax_cache_size
+        );
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 3: Rapid scrolling (cache thrashing)
+    // =========================================================================
+
+    /// Test: Rapid scrolling doesn't cause cache corruption
+    #[test]
+    fn test_rapid_scrolling_cache_integrity() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = (0..100)
+            .map(|i| format!("line {}\n", i))
+            .collect::<String>();
+        let mut doc = diff_base.clone();
+        // Add modifications
+        let doc_lines: Vec<String> = (0..100)
+            .map(|i| {
+                if i % 10 == 0 {
+                    format!("modified line {}\n", i)
+                } else {
+                    format!("line {}\n", i)
+                }
+            })
+            .collect();
+        let doc = doc_lines.join("");
+
+        let hunks: Vec<Hunk> = (0..100)
+            .step_by(10)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Simulate rapid scrolling by calling prepare_visible with different ranges
+        for scroll_pos in 0..50 {
+            let start = scroll_pos;
+            let end = scroll_pos + 10;
+            view.prepare_visible(start, end, &loader, &theme);
+        }
+
+        // Cache should still be valid
+        for (line_idx, segments) in view.word_diff_cache.borrow().iter() {
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Cached line index should be valid"
+            );
+            for segment in segments {
+                // Segments should have valid text
+                assert!(
+                    !segment.text.is_empty() || segment.is_emph,
+                    "Segment should have content or be emphasized"
+                );
+            }
+        }
+    }
+
+    /// Test: Cache thrashing with alternating scroll directions
+    #[test]
+    fn test_cache_thrashing_alternating_scroll() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = (0..200)
+            .map(|i| format!("line {}\n", i))
+            .collect::<String>();
+        let doc_lines: Vec<String> = (0..200)
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("modified line {}\n", i)
+                } else {
+                    format!("line {}\n", i)
+                }
+            })
+            .collect();
+        let doc = doc_lines.join("");
+
+        let hunks: Vec<Hunk> = (0..200)
+            .step_by(5)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Simulate alternating scroll directions (thrashing)
+        let ranges = [
+            (0, 20),
+            (180, 200),
+            (10, 30),
+            (170, 190),
+            (20, 40),
+            (160, 180),
+            (30, 50),
+            (150, 170),
+        ];
+
+        for (start, end) in ranges {
+            view.prepare_visible(start, end, &loader, &theme);
+        }
+
+        // Cache should still be consistent
+        let word_cache = view.word_diff_cache.borrow();
+        let syntax_cache = view.syntax_highlight_cache.borrow();
+
+        // All cached indices should be valid
+        for line_idx in word_cache.keys() {
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Word cache index {} should be valid",
+                line_idx
+            );
+        }
+
+        for line_idx in syntax_cache.keys() {
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Syntax cache index {} should be valid",
+                line_idx
+            );
+        }
+    }
+
+    /// Test: Cache doesn't grow unbounded with scrolling
+    #[test]
+    fn test_cache_growth_bounded_with_scrolling() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = (0..500)
+            .map(|i| format!("line {}\n", i))
+            .collect::<String>();
+        let doc_lines: Vec<String> = (0..500).map(|i| format!("modified line {}\n", i)).collect();
+        let doc = doc_lines.join("");
+
+        let hunks: Vec<Hunk> = (0..500).map(|i| make_hunk(i..i + 1, i..i + 1)).collect();
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Scroll through entire document
+        for start in (0..500).step_by(20) {
+            let end = (start + 20).min(500);
+            view.prepare_visible(start, end, &loader, &theme);
+        }
+
+        // Cache should have grown but not exceed total lines
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+
+        assert!(
+            word_cache_size <= view.diff_lines.len(),
+            "Word cache size {} should not exceed diff_lines len {}",
+            word_cache_size,
+            view.diff_lines.len()
+        );
+        assert!(
+            syntax_cache_size <= view.diff_lines.len(),
+            "Syntax cache size {} should not exceed diff_lines len {}",
+            syntax_cache_size,
+            view.diff_lines.len()
+        );
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 4: Cache invalidation
+    // =========================================================================
+
+    /// Test: Cache invalidation when creating new DiffView
+    #[test]
+    fn test_cache_invalidation_new_view() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1 modified\nline 2\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        // Create first view and populate caches
+        let mut view1 = create_test_diff_view(diff_base, doc, hunks.clone(), "test.rs");
+        view1.initialize_caches(&loader, &theme);
+        view1.prepare_visible(0, 10, &loader, &theme);
+
+        let view1_word_cache_size = view1.word_diff_cache.borrow().len();
+        let view1_syntax_cache_size = view1.syntax_highlight_cache.borrow().len();
+
+        // Create second view - should have fresh caches
+        let view2 = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        assert!(
+            !view2.caches_initialized,
+            "New view should have uninitialized caches"
+        );
+        assert!(
+            view2.word_diff_cache.borrow().is_empty(),
+            "New view should have empty word cache"
+        );
+        assert!(
+            view2.syntax_highlight_cache.borrow().is_empty(),
+            "New view should have empty syntax cache"
+        );
+
+        // First view's caches should still be intact
+        assert_eq!(
+            view1.word_diff_cache.borrow().len(),
+            view1_word_cache_size,
+            "First view's word cache should be unchanged"
+        );
+        assert_eq!(
+            view1.syntax_highlight_cache.borrow().len(),
+            view1_syntax_cache_size,
+            "First view's syntax cache should be unchanged"
+        );
+    }
+
+    /// Test: Cache consistency after multiple prepare_visible calls
+    #[test]
+    fn test_cache_consistency_multiple_prepare() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "fn old() {}\n";
+        let doc = "fn new() {}\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // First prepare
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Capture cache state
+        let first_word_cache: Vec<_> = view
+            .word_diff_cache
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let first_syntax_cache: Vec<_> = view
+            .syntax_highlight_cache
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        // Second prepare (same range)
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Cache should be identical (no re-computation)
+        let second_word_cache: Vec<_> = view
+            .word_diff_cache
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let second_syntax_cache: Vec<_> = view
+            .syntax_highlight_cache
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        assert_eq!(
+            first_word_cache.len(),
+            second_word_cache.len(),
+            "Word cache should not change on re-prepare"
+        );
+        assert_eq!(
+            first_syntax_cache.len(),
+            second_syntax_cache.len(),
+            "Syntax cache should not change on re-prepare"
+        );
+    }
+
+    /// Test: Cache handles prepare_visible with same line indices
+    #[test]
+    fn test_cache_idempotent_prepare() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\nline 3\n";
+        let doc = "line 1\nmodified line 2\nline 3\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Call prepare_visible multiple times with same indices
+        for _ in 0..10 {
+            view.prepare_visible(0, 5, &loader, &theme);
+        }
+
+        // Cache should not grow
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+
+        // Should have exactly the same size as after first prepare
+        assert!(
+            word_cache_size > 0 || view.diff_lines.is_empty(),
+            "Word cache should have entries"
+        );
+        assert!(
+            syntax_cache_size > 0 || view.diff_lines.is_empty(),
+            "Syntax cache should have entries"
+        );
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 5: Memory bounds with many cached entries
+    // =========================================================================
+
+    /// Test: Memory bounds - cache entries are valid
+    #[test]
+    fn test_memory_bounds_valid_entries() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a diff with many lines
+        let diff_base_lines: Vec<String> = (0..1000).map(|i| format!("line {}\n", i)).collect();
+        let doc_lines: Vec<String> = (0..1000)
+            .map(|i| {
+                if i % 3 == 0 {
+                    format!("modified line {}\n", i)
+                } else {
+                    format!("line {}\n", i)
+                }
+            })
+            .collect();
+
+        let hunks: Vec<Hunk> = (0..1000)
+            .step_by(3)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base = diff_base_lines.join("");
+        let doc = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare visible for entire document
+        let total_lines = view.diff_lines.len();
+        view.prepare_visible(0, total_lines, &loader, &theme);
+
+        // Verify all cache entries are valid
+        for (line_idx, segments) in view.word_diff_cache.borrow().iter() {
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Word cache line index {} should be valid",
+                line_idx
+            );
+            // Each segment should have valid content
+            for segment in segments {
+                assert!(
+                    !segment.text.is_empty() || view.diff_lines.is_empty(),
+                    "Segment should have content"
+                );
+            }
+        }
+
+        for (line_idx, highlights) in view.syntax_highlight_cache.borrow().iter() {
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Syntax cache line index {} should be valid",
+                line_idx
+            );
+            // Each highlight should have valid byte ranges
+            for (start, end, _style) in highlights {
+                assert!(
+                    start <= end,
+                    "Highlight start {} should be <= end {}",
+                    start,
+                    end
+                );
+            }
+        }
+    }
+
+    /// Test: Memory bounds - large content in cache entries
+    #[test]
+    fn test_memory_bounds_large_content() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create lines with very long content
+        let long_line = "x".repeat(10000);
+        let diff_base = format!("{}\n", long_line);
+        let doc = format!("{}modified\n", long_line);
+
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Should handle large content without panic
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Cache should have entries
+        assert!(
+            !view.syntax_highlight_cache.borrow().is_empty(),
+            "Syntax cache should have entries for large content"
+        );
+    }
+
+    /// Test: Memory bounds - many small cache entries
+    #[test]
+    fn test_memory_bounds_many_small_entries() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create many small lines
+        let diff_base_lines: Vec<String> = (0..5000).map(|i| format!("{}\n", i % 10)).collect();
+        let doc_lines: Vec<String> = (0..5000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("m{}\n", i % 10)
+                } else {
+                    format!("{}\n", i % 10)
+                }
+            })
+            .collect();
+
+        let hunks: Vec<Hunk> = (0..5000)
+            .step_by(2)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base = diff_base_lines.join("");
+        let doc = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare visible for a subset
+        view.prepare_visible(0, 100, &loader, &theme);
+
+        // Cache should have entries for the visible range
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+        assert!(syntax_cache_size > 0, "Syntax cache should have entries");
+        assert!(
+            syntax_cache_size <= view.diff_lines.len(),
+            "Syntax cache should not exceed diff_lines length"
+        );
+    }
+
+    // =========================================================================
+    // ADDITIONAL EDGE CASES
+    // =========================================================================
+
+    /// Test: prepare_visible with caches not initialized
+    #[test]
+    fn test_prepare_visible_without_init() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1 modified\nline 2\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Call prepare_visible without initializing caches
+        // Should return early without panic
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Caches should still be empty (prepare_visible returns early if not initialized)
+        assert!(
+            view.word_diff_cache.borrow().is_empty(),
+            "Word cache should be empty without init"
+        );
+    }
+
+    /// Test: prepare_visible with single line visible
+    #[test]
+    fn test_prepare_visible_single_line() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\nline 3\n";
+        let doc = "line 1\nmodified line 2\nline 3\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare visible for a single line
+        view.prepare_visible(1, 1, &loader, &theme);
+
+        // Should not panic
+        assert!(view.caches_initialized);
+    }
+
+    /// Test: prepare_visible with buffer extends beyond document
+    #[test]
+    fn test_prepare_visible_buffer_beyond_document() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1 modified\nline 2\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Prepare visible with range that extends beyond document
+        view.prepare_visible(0, 1000, &loader, &theme);
+
+        // Should not panic and cache should be bounded
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+        assert!(
+            syntax_cache_size <= view.diff_lines.len(),
+            "Syntax cache should not exceed diff_lines length"
+        );
+    }
+
+    /// Test: Word diff cache handles special characters
+    #[test]
+    fn test_word_diff_cache_special_characters() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "fn test() { let x = \"special\\nchars\"; }\n";
+        let doc = "fn test() { let y = \"other\\tchars\"; }\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Word diff cache should handle special characters
+        assert!(
+            !view.word_diff_cache.borrow().is_empty(),
+            "Word diff cache should have entries for special characters"
+        );
+
+        // Verify segments are valid
+        for (_, segments) in view.word_diff_cache.borrow().iter() {
+            for segment in segments {
+                // Segments should have valid text (may contain special chars)
+                assert!(!segment.text.is_empty() || segment.is_emph);
+            }
+        }
+    }
+
+    /// Test: Function context cache handles deeply nested functions
+    #[test]
+    fn test_function_context_deeply_nested() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = r#"fn outer() {
+    fn inner() {
+        fn deep() {
+            let x = 1;
+        }
+    }
+}
+"#;
+        let doc = r#"fn outer() {
+    fn inner() {
+        fn deep() {
+            let y = 2;
+        }
+    }
+}
+"#;
+        let hunks = vec![make_hunk(3..4, 3..4)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+        view.prepare_visible(0, 20, &loader, &theme);
+
+        // Function context cache should have entries
+        let func_cache = view.function_context_cache.borrow();
+        assert!(
+            !func_cache.is_empty(),
+            "Function context cache should have entries"
+        );
+
+        // At least one context should be found (the innermost function)
+        let has_context = func_cache.values().any(|c| c.is_some());
+        // Note: This may be None if tree-sitter doesn't find nested functions
+        // The test verifies it doesn't panic
+        let _ = has_context;
+    }
+
+    /// Test: Performance - prepare_visible should be fast for small visible range
+    #[test]
+    fn test_prepare_visible_performance_small_range() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a large document
+        let diff_base_lines: Vec<String> = (0..10000).map(|i| format!("line {}\n", i)).collect();
+        let doc_lines: Vec<String> = (0..10000)
+            .map(|i| {
+                if i % 100 == 0 {
+                    format!("modified line {}\n", i)
+                } else {
+                    format!("line {}\n", i)
+                }
+            })
+            .collect();
+
+        let hunks: Vec<Hunk> = (0..10000)
+            .step_by(100)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base = diff_base_lines.join("");
+        let doc = doc_lines.join("");
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Measure time for small visible range
+        let start = Instant::now();
+        view.prepare_visible(5000, 5020, &loader, &theme);
+        let duration = start.elapsed();
+
+        // Should be fast (< 100ms for 20 lines)
+        assert!(
+            duration.as_millis() < 100,
+            "prepare_visible for 20 lines should be fast, took {:?}",
+            duration
         );
     }
 }

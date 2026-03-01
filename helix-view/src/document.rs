@@ -168,7 +168,7 @@ pub struct Document {
     /// The document's default line ending.
     pub line_ending: LineEnding,
 
-    pub syntax: Option<Syntax>,
+    pub syntax: Option<Arc<Syntax>>,
     /// Corresponding language scope name. Usually `source.<lang>`.
     pub language: Option<Arc<LanguageConfiguration>>,
 
@@ -1313,6 +1313,7 @@ impl Document {
                     }
                 })
                 .ok()
+                .map(Arc::new)
         });
     }
 
@@ -1447,12 +1448,30 @@ impl Document {
         // update tree-sitter syntax tree
         if let Some(syntax) = &mut self.syntax {
             let loader = self.syn_loader.load();
-            if let Err(err) = syntax.update(
-                old_doc.slice(..),
-                self.text.slice(..),
-                transaction.changes(),
-                &loader,
-            ) {
+            // Try to get exclusive access to the Syntax via Arc::get_mut
+            // If there are other references (e.g., DiffView), we need to create a new Syntax
+            let update_result = if let Some(syntax_inner) = Arc::get_mut(syntax) {
+                // We have exclusive access, update in place
+                syntax_inner.update(
+                    old_doc.slice(..),
+                    self.text.slice(..),
+                    transaction.changes(),
+                    &loader,
+                )
+            } else {
+                // Other references exist, create a new Syntax for the updated document
+                self.language.as_ref().map_or(Ok(()), |config| {
+                    match Syntax::new(self.text.slice(..), config.language(), &loader) {
+                        Ok(new_syntax) => {
+                            *syntax = Arc::new(new_syntax);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
+                })
+            };
+
+            if let Err(err) = update_result {
                 log::error!("TS parser failed, disabling TS for the current buffer: {err}");
                 self.syntax = None;
             }
@@ -1905,7 +1924,12 @@ impl Document {
     #[inline]
     /// Tree-sitter AST tree
     pub fn syntax(&self) -> Option<&Syntax> {
-        self.syntax.as_ref()
+        self.syntax.as_ref().map(|arc| arc.as_ref())
+    }
+
+    /// Tree-sitter AST tree as Arc (for cloning/sharing)
+    pub fn syntax_arc(&self) -> Option<Arc<Syntax>> {
+        self.syntax.clone()
     }
 
     /// The width that the tab character is rendered at

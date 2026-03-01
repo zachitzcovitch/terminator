@@ -4237,6 +4237,12 @@ fn diff_view(cx: &mut Context) {
         (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id)
     }; // diff is dropped here
 
+    // Get the document's existing syntax to reuse for performance
+    let existing_syntax = {
+        let (_view, doc) = current!(cx.editor);
+        doc.syntax_arc()
+    };
+
     let diff_view = ui::DiffView::new(
         diff_base,
         doc_text,
@@ -4245,6 +4251,7 @@ fn diff_view(cx: &mut Context) {
         file_path,
         absolute_path,
         doc_id,
+        existing_syntax,
     );
 
     cx.push_layer(Box::new(overlaid(diff_view)));
