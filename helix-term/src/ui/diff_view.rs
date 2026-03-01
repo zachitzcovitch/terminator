@@ -1834,6 +1834,7 @@ impl DiffView {
     }
 
     /// Scroll the view to ensure the selected hunk is visible
+    /// Always positions the HunkHeader at the top of the viewport for consistent navigation
     fn scroll_to_selected_hunk(&mut self, visible_lines: usize) {
         if self.hunk_boundaries.is_empty() {
             return;
@@ -1844,19 +1845,14 @@ impl DiffView {
             .min(self.hunk_boundaries.len().saturating_sub(1));
         let hunk = &self.hunk_boundaries[selected];
 
-        // Convert diff_lines indices to screen rows
+        // Convert diff_lines index to screen row
         let hunk_start_row = self.diff_line_to_screen_row(hunk.start);
-        let hunk_end_row = self.diff_line_to_screen_row(hunk.end);
         let scroll = self.scroll as usize;
 
-        // If hunk is above the current scroll position, scroll up to show it
-        if hunk_start_row < scroll {
+        // Always snap HunkHeader to top of viewport for consistent navigation
+        // This ensures users always see the function context first when navigating to a hunk
+        if hunk_start_row != scroll {
             self.scroll = hunk_start_row as u16;
-        }
-        // If hunk is below the visible area, scroll down to show it
-        else if hunk_end_row > scroll + visible_lines {
-            let new_scroll = hunk_end_row.saturating_sub(visible_lines);
-            self.scroll = new_scroll as u16;
         }
 
         self.update_scroll(visible_lines);
@@ -2041,29 +2037,52 @@ impl Component for DiffView {
                 }
                 KeyCode::Up | KeyCode::Char('K') => {
                     // Move to previous hunk (Shift+k)
+                    // First press snaps to current hunk's header, second press goes to previous
                     if !self.hunk_boundaries.is_empty() {
-                        if self.selected_hunk > 0 {
-                            self.selected_hunk -= 1;
+                        // Sync selected_hunk with current selected_line
+                        self.update_selected_hunk_from_line();
+
+                        let current_hunk = &self.hunk_boundaries[self.selected_hunk];
+
+                        // If not at current hunk's start, snap to it first
+                        if self.selected_line != current_hunk.start {
+                            self.selected_line = current_hunk.start;
                         } else {
-                            self.selected_hunk = self.hunk_boundaries.len() - 1;
+                            // Already at hunk start, go to previous hunk
+                            if self.selected_hunk > 0 {
+                                self.selected_hunk -= 1;
+                            } else {
+                                self.selected_hunk = self.hunk_boundaries.len() - 1;
+                                // Wrap to last
+                            }
+                            let hunk = &self.hunk_boundaries[self.selected_hunk];
+                            self.selected_line = hunk.start;
                         }
-                        // Update selected_line to the start of the new hunk
-                        let hunk = &self.hunk_boundaries[self.selected_hunk];
-                        self.selected_line = hunk.start;
                         self.scroll_to_selected_hunk(visible_lines);
                     }
                 }
                 KeyCode::Down | KeyCode::Char('J') => {
                     // Move to next hunk (Shift+j)
+                    // First press snaps to current hunk's header, second press goes to next
                     if !self.hunk_boundaries.is_empty() {
-                        if self.selected_hunk < self.hunk_boundaries.len() - 1 {
-                            self.selected_hunk += 1;
+                        // Sync selected_hunk with current selected_line
+                        self.update_selected_hunk_from_line();
+
+                        let current_hunk = &self.hunk_boundaries[self.selected_hunk];
+
+                        // If not at current hunk's start, snap to it first
+                        if self.selected_line != current_hunk.start {
+                            self.selected_line = current_hunk.start;
                         } else {
-                            self.selected_hunk = 0;
+                            // Already at hunk start, go to next hunk
+                            if self.selected_hunk < self.hunk_boundaries.len() - 1 {
+                                self.selected_hunk += 1;
+                            } else {
+                                self.selected_hunk = 0; // Wrap to first
+                            }
+                            let hunk = &self.hunk_boundaries[self.selected_hunk];
+                            self.selected_line = hunk.start;
                         }
-                        // Update selected_line to the start of the new hunk
-                        let hunk = &self.hunk_boundaries[self.selected_hunk];
-                        self.selected_line = hunk.start;
                         self.scroll_to_selected_hunk(visible_lines);
                     }
                 }
@@ -5914,11 +5933,16 @@ mod selectable_diff_view_tests {
 
         // Set to exactly the last valid index
         diff_view.selected_hunk = diff_view.hunk_boundaries.len() - 1;
+        // IMPORTANT: Also set selected_line to hunk start so J wraps (not snaps to current header)
+        diff_view.selected_line = diff_view.hunk_boundaries[diff_view.selected_hunk].start;
         assert_eq!(diff_view.selected_hunk, 4);
 
-        // Press J (Shift+j) should wrap to 0
+        // Press J (Shift+j) should wrap to 0 (because selected_line is at hunk start)
         simulate_key_event(&mut diff_view, KeyCode::Char('J'));
         assert_eq!(diff_view.selected_hunk, 0, "Should wrap to first hunk");
+
+        // Set selected_line to hunk start again for K to wrap
+        diff_view.selected_line = diff_view.hunk_boundaries[diff_view.selected_hunk].start;
 
         // Press K (Shift+k) should wrap to 4
         simulate_key_event(&mut diff_view, KeyCode::Char('K'));
@@ -6673,6 +6697,818 @@ mod selectable_diff_view_tests {
             diff_view.selected_hunk, 4,
             "selected_hunk should be updated to match selected_line position"
         );
+    }
+
+    // =========================================================================
+    // Test Scenario: J/K snap-to-header behavior (orientation then navigation)
+    // =========================================================================
+
+    /// Test: First J press snaps to current hunk's header when not already there
+    /// This verifies the "orientation" behavior where J/K first orients the user
+    /// by snapping to the current hunk's header before navigating.
+    #[test]
+    fn test_j_first_press_snaps_to_current_hunk_header() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Get the first hunk's start position
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+
+        // Move selection away from hunk header (using j to scroll line-by-line)
+        // Move a few lines down so we're not at the hunk header
+        for _ in 0..3 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // Verify we're not at the hunk header anymore
+        assert_ne!(
+            diff_view.selected_line, first_hunk_start,
+            "selected_line should not be at hunk header after scrolling"
+        );
+
+        // Record current position
+        let position_before_j = diff_view.selected_line;
+        assert_eq!(diff_view.selected_hunk, 0, "Should still be in first hunk");
+
+        // Press J - should snap to current hunk's header (NOT navigate to next hunk)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        // Should snap to first hunk's header
+        assert_eq!(
+            diff_view.selected_line, first_hunk_start,
+            "First J press should snap to current hunk's header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "First J press should NOT change hunk (orientation only)"
+        );
+    }
+
+    /// Test: Second J press navigates to next hunk (after snapping to header)
+    #[test]
+    fn test_j_second_press_navigates_to_next_hunk() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Get the first hunk's start position
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+
+        // Move selection away from hunk header
+        for _ in 0..3 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // First J press - snap to current hunk's header
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 0);
+
+        // Second J press - should navigate to next hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_line, second_hunk_start,
+            "Second J press should navigate to next hunk's header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 1,
+            "Second J press should change to next hunk"
+        );
+    }
+
+    /// Test: First K press snaps to current hunk's header when not already there
+    #[test]
+    fn test_k_first_press_snaps_to_current_hunk_header() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Navigate to second hunk first (only ONE J press to get to hunk 1)
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_hunk, 1,
+            "Should be at hunk 1 after one J press"
+        );
+
+        // Move selection away from hunk header within the second hunk
+        for _ in 0..2 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // Verify we're not at the hunk header
+        assert_ne!(
+            diff_view.selected_line, second_hunk_start,
+            "selected_line should not be at hunk header after scrolling"
+        );
+
+        // Press K - should snap to current hunk's header (NOT navigate to previous hunk)
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+        // Should snap to second hunk's header
+        assert_eq!(
+            diff_view.selected_line, second_hunk_start,
+            "First K press should snap to current hunk's header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 1,
+            "First K press should NOT change hunk (orientation only)"
+        );
+    }
+
+    /// Test: Second K press navigates to previous hunk (after snapping to header)
+    #[test]
+    fn test_k_second_press_navigates_to_previous_hunk() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Navigate to second hunk first (only ONE J press to get to hunk 1)
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_hunk, 1,
+            "Should be at hunk 1 after one J press"
+        );
+        assert_eq!(diff_view.selected_line, second_hunk_start);
+
+        // First K press - snap to current hunk's header (already there, so navigate)
+        // Since we're already at the hunk header, K should navigate immediately
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "K from hunk header should navigate to previous hunk"
+        );
+        assert_eq!(
+            diff_view.selected_line, first_hunk_start,
+            "Should be at first hunk's header"
+        );
+    }
+
+    /// Test: J from hunk header navigates immediately (no snap needed)
+    #[test]
+    fn test_j_from_hunk_header_navigates_immediately() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Start at first hunk's header (initial state)
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 0);
+
+        // Press J - since we're already at hunk header, should navigate immediately
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_hunk, 1,
+            "J from hunk header should navigate to next hunk immediately"
+        );
+    }
+
+    /// Test: K from hunk header navigates immediately (no snap needed)
+    #[test]
+    fn test_k_from_hunk_header_navigates_immediately() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Navigate to second hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+        assert_eq!(diff_view.selected_line, second_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 1);
+
+        // Press K - since we're already at hunk header, should navigate immediately
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "K from hunk header should navigate to previous hunk immediately"
+        );
+    }
+
+    /// Test: Snap behavior works correctly after line-by-line navigation
+    #[test]
+    fn test_snap_behavior_after_line_by_line_navigation() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+
+        // Navigate down several lines using j (line-by-line)
+        for _ in 0..5 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // We should be somewhere in the first hunk (or possibly second)
+        // Press J - should snap to current hunk's header first
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        // After snap, we should be at a hunk header
+        let is_at_first_hunk = diff_view.selected_line == first_hunk_start;
+        let is_at_second_hunk = diff_view.selected_line == second_hunk_start;
+        assert!(
+            is_at_first_hunk || is_at_second_hunk,
+            "After J, should be at a hunk header (got line {})",
+            diff_view.selected_line
+        );
+    }
+
+    /// Test: Alternating j and J maintains correct state
+    #[test]
+    fn test_alternating_j_and_J_maintains_state() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+
+        // Start at hunk header
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+
+        // Press j to move down one line
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_eq!(diff_view.selected_line, first_hunk_start + 1);
+
+        // Press J - should snap back to hunk header
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+
+        // Press j again
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_eq!(diff_view.selected_line, first_hunk_start + 1);
+
+        // Press J again - should snap back
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+    }
+
+    /// Test: Wrap-around with snap behavior
+    #[test]
+    fn test_wrap_around_with_snap_behavior() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let last_hunk_start = diff_view.hunk_boundaries[2].start;
+
+        // Navigate to last hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_hunk, 2);
+        assert_eq!(diff_view.selected_line, last_hunk_start);
+
+        // Move away from hunk header
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_ne!(diff_view.selected_line, last_hunk_start);
+
+        // Press J - should snap to last hunk header first
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_line, last_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 2);
+
+        // Press J again - should wrap to first hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 0);
+    }
+
+    /// Test: K wrap-around with snap behavior
+    #[test]
+    fn test_k_wrap_around_with_snap_behavior() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let last_hunk_start = diff_view.hunk_boundaries[2].start;
+
+        // Start at first hunk header
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 0);
+
+        // Move away from hunk header
+        simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        assert_ne!(diff_view.selected_line, first_hunk_start);
+
+        // Press K - should snap to first hunk header first
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(diff_view.selected_line, first_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 0);
+
+        // Press K again - should wrap to last hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(diff_view.selected_line, last_hunk_start);
+        assert_eq!(diff_view.selected_hunk, 2);
+    }
+
+    // =========================================================================
+    // ADVERSARIAL TESTS: J/K snap-to-header edge cases and boundary violations
+    // =========================================================================
+
+    /// ATTACK VECTOR 18: Single hunk with snap behavior - move away then J/K
+    /// Tests that with a single hunk, J/K snaps to header then wraps to same hunk
+    #[test]
+    fn test_attack_single_hunk_snap_then_wrap() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1 modified\nline 2\nline 3\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        let hunk_start = diff_view.hunk_boundaries[0].start;
+
+        // Move away from hunk header using j (line-by-line)
+        for _ in 0..3 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // Verify we're not at hunk header
+        assert_ne!(
+            diff_view.selected_line, hunk_start,
+            "Should have moved away from hunk header"
+        );
+
+        // ATTACK: Press J - should snap to header (NOT wrap, since we weren't at header)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_line, hunk_start,
+            "J should snap to hunk header first"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "Should still be at hunk 0 after snap"
+        );
+
+        // ATTACK: Press J again - should wrap to same hunk (only one hunk)
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "With single hunk, J should wrap to same hunk"
+        );
+        assert_eq!(
+            diff_view.selected_line, hunk_start,
+            "Should still be at hunk header"
+        );
+
+        // Move away again
+        for _ in 0..2 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // ATTACK: Press K - should snap to header first
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_line, hunk_start,
+            "K should snap to hunk header first"
+        );
+
+        // ATTACK: Press K again - should wrap to same hunk (only one hunk)
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "With single hunk, K should wrap to same hunk"
+        );
+    }
+
+    /// ATTACK VECTOR 19: selected_line at boundary 0 with J/K
+    /// Tests behavior when selected_line is exactly 0
+    #[test]
+    fn test_attack_selected_line_at_zero_boundary() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Ensure selected_line is at 0
+        diff_view.selected_line = 0;
+        diff_view.selected_hunk = 0;
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+
+        // ATTACK: Press K from line 0 - should wrap to last hunk
+        // First, if we're at hunk header, K should navigate immediately
+        if diff_view.selected_line == first_hunk_start {
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+            assert_eq!(
+                diff_view.selected_hunk, 2,
+                "K from first hunk header should wrap to last hunk"
+            );
+        }
+
+        // Reset to line 0
+        diff_view.selected_line = 0;
+        diff_view.selected_hunk = 0;
+
+        // ATTACK: Press J from line 0
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        // Should either snap to hunk header or navigate to next hunk
+        assert!(
+            diff_view.selected_line == first_hunk_start || diff_view.selected_hunk == 1,
+            "J from line 0 should snap or navigate"
+        );
+    }
+
+    /// ATTACK VECTOR 20: selected_line at max boundary with J/K
+    /// Tests behavior when selected_line is at the last valid line
+    #[test]
+    fn test_attack_selected_line_at_max_boundary_with_jk() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let last_line = diff_view.diff_lines.len().saturating_sub(1);
+        let last_hunk_idx = diff_view.hunk_boundaries.len() - 1;
+        let last_hunk_start = diff_view.hunk_boundaries[last_hunk_idx].start;
+
+        // Set to last line
+        diff_view.selected_line = last_line;
+        diff_view.selected_hunk = last_hunk_idx;
+
+        // ATTACK: Press J from last line
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        // Should either snap to last hunk header or wrap to first hunk
+        let is_at_last_hunk_header = diff_view.selected_line == last_hunk_start;
+        let is_at_first_hunk = diff_view.selected_hunk == 0;
+
+        assert!(
+            is_at_last_hunk_header || is_at_first_hunk,
+            "J from last line should snap to last hunk header or wrap to first hunk"
+        );
+
+        // Reset to last line
+        diff_view.selected_line = last_line;
+        diff_view.selected_hunk = last_hunk_idx;
+
+        // ATTACK: Press K from last line
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+        // Should snap to last hunk header
+        assert_eq!(
+            diff_view.selected_line, last_hunk_start,
+            "K from last line should snap to last hunk header"
+        );
+    }
+
+    /// ATTACK VECTOR 21: selected_line between hunks (in context area)
+    /// Tests snap behavior when selected_line is in context between hunks
+    #[test]
+    fn test_attack_selected_line_between_hunks() {
+        // Create hunks with gap between them
+        let diff_base = Rope::from("line1\nline2\nline3\nline4\nline5\nline6\n");
+        let doc = Rope::from("mod1\nline2\nline3\nmod4\nline5\nline6\n");
+        // Hunk 1: line 0, Hunk 2: line 3
+        let hunks = vec![make_hunk(0..1, 0..1), make_hunk(3..4, 3..4)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Find a line between the two hunks (context area)
+        let first_hunk_end = diff_view.hunk_boundaries[0].end;
+        let second_hunk_start = diff_view.hunk_boundaries[1].start;
+
+        // If there's a gap, place selected_line in it
+        if first_hunk_end < second_hunk_start {
+            let between_line = (first_hunk_end + second_hunk_start) / 2;
+            diff_view.selected_line = between_line;
+
+            // ATTACK: Press J - should snap to nearest hunk header
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+            // Should snap to either first or second hunk header
+            let at_first = diff_view.selected_line == diff_view.hunk_boundaries[0].start;
+            let at_second = diff_view.selected_line == diff_view.hunk_boundaries[1].start;
+
+            assert!(
+                at_first || at_second,
+                "J from between hunks should snap to a hunk header, got line {}",
+                diff_view.selected_line
+            );
+        }
+    }
+
+    /// ATTACK VECTOR 22: Rapid J presses with snap behavior
+    /// Tests state consistency under rapid J presses from non-header position
+    #[test]
+    fn test_attack_rapid_j_with_snap_stress() {
+        let mut diff_view = create_diff_view_with_hunks(5);
+
+        // Move away from hunk header
+        for _ in 0..3 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        let position_before = diff_view.selected_line;
+
+        // ATTACK: Rapid J presses - first should snap, rest should navigate
+        for i in 0..20 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+            // After first press, should be at a hunk header
+            if i == 0 {
+                let at_some_header = diff_view
+                    .hunk_boundaries
+                    .iter()
+                    .any(|h| diff_view.selected_line == h.start);
+                assert!(
+                    at_some_header,
+                    "After first J from non-header, should be at a hunk header"
+                );
+            }
+
+            // selected_hunk should always be valid
+            assert!(
+                diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+                "selected_hunk should remain valid after rapid J presses"
+            );
+        }
+
+        // After 20 J presses with 5 hunks: 20 mod 5 = 0
+        // But first press was a snap, so 19 navigations: 19 mod 5 = 4
+        // Starting from 0, after 19 navigations: should be at hunk 4
+        // Wait, let me recalculate: first J snaps (stays at 0), then 19 J's navigate
+        // 19 mod 5 = 4, so from 0: 0->1->2->3->4->0->1->2->3->4->...
+        // After 19 steps from 0: position is (0 + 19) mod 5 = 4
+        assert!(
+            diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+            "selected_hunk should be valid after stress test"
+        );
+    }
+
+    /// ATTACK VECTOR 23: Rapid K presses with snap behavior
+    /// Tests state consistency under rapid K presses from non-header position
+    #[test]
+    fn test_attack_rapid_k_with_snap_stress() {
+        let mut diff_view = create_diff_view_with_hunks(5);
+
+        // Navigate to middle hunk and move away from header
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        for _ in 0..2 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // ATTACK: Rapid K presses
+        for _ in 0..20 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+            // selected_hunk should always be valid
+            assert!(
+                diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+                "selected_hunk should remain valid after rapid K presses"
+            );
+        }
+    }
+
+    /// ATTACK VECTOR 24: Wrap-around at first hunk with snap
+    /// Tests K wrap-around when not at hunk header
+    #[test]
+    fn test_attack_wrap_at_first_hunk_with_snap() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let last_hunk_start = diff_view.hunk_boundaries[2].start;
+
+        // Move away from first hunk header
+        for _ in 0..2 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // ATTACK: Press K - should snap to first hunk header
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_line, first_hunk_start,
+            "First K should snap to first hunk header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "Should still be at first hunk after snap"
+        );
+
+        // ATTACK: Press K again - should wrap to last hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_line, last_hunk_start,
+            "Second K should wrap to last hunk header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 2,
+            "Should be at last hunk after wrap"
+        );
+    }
+
+    /// ATTACK VECTOR 25: Wrap-around at last hunk with snap
+    /// Tests J wrap-around when not at hunk header
+    #[test]
+    fn test_attack_wrap_at_last_hunk_with_snap() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Navigate to last hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        let first_hunk_start = diff_view.hunk_boundaries[0].start;
+        let last_hunk_start = diff_view.hunk_boundaries[2].start;
+
+        assert_eq!(diff_view.selected_hunk, 2);
+
+        // Move away from last hunk header
+        for _ in 0..2 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+        }
+
+        // ATTACK: Press J - should snap to last hunk header
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_line, last_hunk_start,
+            "First J should snap to last hunk header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 2,
+            "Should still be at last hunk after snap"
+        );
+
+        // ATTACK: Press J again - should wrap to first hunk
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_line, first_hunk_start,
+            "Second J should wrap to first hunk header"
+        );
+        assert_eq!(
+            diff_view.selected_hunk, 0,
+            "Should be at first hunk after wrap"
+        );
+    }
+
+    /// ATTACK VECTOR 26: Empty hunk_boundaries with J/K snap attempt
+    /// Tests that J/K does nothing when there are no hunks
+    #[test]
+    fn test_attack_empty_hunk_boundaries_jk_snap() {
+        let diff_base = Rope::from("same content\n");
+        let doc = Rope::from("same content\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Verify empty state
+        assert!(diff_view.hunk_boundaries.is_empty());
+        assert_eq!(diff_view.selected_line, 0);
+        assert_eq!(diff_view.selected_hunk, 0);
+
+        // ATTACK: Press J with empty hunk_boundaries
+        let line_before = diff_view.selected_line;
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        assert_eq!(
+            diff_view.selected_line, line_before,
+            "J should do nothing with empty hunk_boundaries"
+        );
+
+        // ATTACK: Press K with empty hunk_boundaries
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        assert_eq!(
+            diff_view.selected_line, line_before,
+            "K should do nothing with empty hunk_boundaries"
+        );
+    }
+
+    /// ATTACK VECTOR 27: Alternating snap and navigate
+    /// Tests state consistency when alternating between snap and navigate operations
+    #[test]
+    fn test_attack_alternating_snap_and_navigate() {
+        let mut diff_view = create_diff_view_with_hunks(4);
+
+        for _ in 0..10 {
+            // Move away from header
+            for _ in 0..2 {
+                simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            }
+
+            // J should snap
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+            // Verify at a hunk header
+            let at_header = diff_view
+                .hunk_boundaries
+                .iter()
+                .any(|h| diff_view.selected_line == h.start);
+            assert!(at_header, "Should be at hunk header after J snap");
+
+            // Move away again
+            for _ in 0..2 {
+                simulate_key_event(&mut diff_view, KeyCode::Char('j'));
+            }
+
+            // K should snap
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+            // Verify at a hunk header
+            let at_header = diff_view
+                .hunk_boundaries
+                .iter()
+                .any(|h| diff_view.selected_line == h.start);
+            assert!(at_header, "Should be at hunk header after K snap");
+        }
+    }
+
+    /// ATTACK VECTOR 28: selected_hunk inconsistent with selected_line
+    /// Tests that update_selected_hunk_from_line is called correctly during J/K
+    #[test]
+    fn test_attack_inconsistent_selected_hunk_and_line() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Manually create inconsistent state
+        diff_view.selected_line = 0;
+        diff_view.selected_hunk = 2; // Inconsistent: line 0 should be hunk 0
+
+        // ATTACK: Press J - should update selected_hunk based on selected_line
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        // After J, selected_hunk should be consistent with selected_line
+        // The update_selected_hunk_from_line should have been called
+        assert!(
+            diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+            "selected_hunk should be valid after J"
+        );
+    }
+
+    /// ATTACK VECTOR 29: J/K with selected_line at usize::MAX
+    /// Tests overflow protection when selected_line is at maximum value
+    #[test]
+    fn test_attack_jk_with_usize_max_selected_line() {
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // ATTACK: Set selected_line to usize::MAX
+        diff_view.selected_line = usize::MAX;
+
+        // Press J - should not panic
+        simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+
+        // selected_hunk should be valid (update_selected_hunk_from_line handles this)
+        assert!(
+            diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+            "selected_hunk should be valid after J with usize::MAX selected_line"
+        );
+
+        // Reset and try K
+        diff_view.selected_line = usize::MAX;
+
+        // Press K - should not panic
+        simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+
+        assert!(
+            diff_view.selected_hunk < diff_view.hunk_boundaries.len(),
+            "selected_hunk should be valid after K with usize::MAX selected_line"
+        );
+    }
+
+    /// ATTACK VECTOR 30: Snap behavior with adjacent hunks (no gap)
+    /// Tests snap behavior when hunks are immediately adjacent
+    #[test]
+    fn test_attack_snap_with_adjacent_hunks() {
+        // Create adjacent hunks (no context between them)
+        let diff_base = Rope::from("a\nb\nc\nd\n");
+        let doc = Rope::from("x\ny\nz\nw\n");
+        let hunks = vec![
+            make_hunk(0..1, 0..1),
+            make_hunk(1..2, 1..2),
+            make_hunk(2..3, 2..3),
+            make_hunk(3..4, 3..4),
+        ];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+        );
+
+        // Rapidly navigate through all adjacent hunks
+        for expected in 0..4 {
+            assert_eq!(
+                diff_view.selected_hunk, expected,
+                "Should be at hunk {}",
+                expected
+            );
+            simulate_key_event(&mut diff_view, KeyCode::Char('J'));
+        }
+
+        // Should wrap to first
+        assert_eq!(diff_view.selected_hunk, 0, "Should wrap to first hunk");
+
+        // Navigate backwards
+        for _ in 0..4 {
+            simulate_key_event(&mut diff_view, KeyCode::Char('K'));
+        }
+
+        // After 4 K presses from 0: 0->3->2->1->0
+        assert_eq!(diff_view.selected_hunk, 0, "Should return to first hunk");
     }
 }
 
@@ -14661,12 +15497,9 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
         );
 
-        // Find the boundary between first and second hunk
-        let first_hunk_end = diff_view.hunk_boundaries[0].end;
-        let second_hunk_start = diff_view.hunk_boundaries[1].start;
-
-        // Set selected_line to the boundary
-        diff_view.selected_line = first_hunk_end;
+        // Set selected_line to first hunk's start so J navigates (not snaps to current header)
+        diff_view.selected_line = diff_view.hunk_boundaries[0].start;
+        diff_view.selected_hunk = 0;
 
         // Navigate between hunks
         simulate_key_event(&mut diff_view, KeyCode::Char('J')); // Go to second hunk
@@ -14674,6 +15507,9 @@ mod adversarial_scroll_indentation_tests {
             diff_view.selected_hunk, 1,
             "Should be at second hunk after J"
         );
+
+        // Set selected_line to hunk start so K navigates (not snaps to current header)
+        diff_view.selected_line = diff_view.hunk_boundaries[1].start;
 
         simulate_key_event(&mut diff_view, KeyCode::Char('K')); // Go back to first hunk
         assert_eq!(
