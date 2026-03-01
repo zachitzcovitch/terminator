@@ -103,6 +103,83 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Revert a hunk by applying a reverse patch using `git apply -R`
+pub fn revert_hunk(file_path: &Path, patch: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let file = gix::path::realpath(file_path).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    // Use git apply -R with stdin to pass the patch
+    let mut child = Command::new("git")
+        .arg("apply")
+        .arg("-R") // Reverse patch
+        .arg("--")
+        .arg("-")
+        .current_dir(repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git apply -R")?;
+
+    // Write the patch to stdin
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(patch.as_bytes())?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git apply -R")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git apply -R failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Stage a hunk by applying the patch to the index using `git apply --cached`
+pub fn stage_hunk(file_path: &Path, patch: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let file = gix::path::realpath(file_path).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    // Use git apply --cached with stdin to pass the patch
+    // --cached applies the patch to the index (staging area) without modifying the worktree
+    let mut child = Command::new("git")
+        .arg("apply")
+        .arg("--cached") // Apply to index (staging area)
+        .arg("--")
+        .arg("-")
+        .current_dir(repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git apply --cached")?;
+
+    // Write the patch to stdin
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(patch.as_bytes())?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git apply --cached")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git apply --cached failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
@@ -242,6 +319,41 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
     }
 
     Ok(())
+}
+
+/// Get the path relative to the repository root for a given file path.
+/// Returns the relative path if the file is in a git repository, otherwise returns None.
+pub fn get_relative_path(file_path: &Path) -> Option<std::path::PathBuf> {
+    // First resolve to absolute path
+    let abs_path = match gix::path::realpath(file_path) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    // Find the repo root using gix::discover
+    // gix::discover::upwards returns (gix::discover::repository::Path, gix::sec::trust::Level)
+    let repo_path = match gix::discover::upwards(&abs_path) {
+        Ok((path, _)) => path,
+        Err(_) => return None,
+    };
+
+    // Convert gix::discover::repository::Path to std::path::Path
+    // The Path variant contains a PathBuf
+    let repo_path_std: &std::path::Path = repo_path.as_ref();
+
+    // Open the repository to get the workdir
+    let repo = match open_repo(repo_path_std) {
+        Ok(r) => r.to_thread_local(),
+        Err(_) => return None,
+    };
+
+    // Get the workdir (repo root)
+    let repo_root = repo.workdir()?;
+
+    // Strip the repo root to get the relative path
+    let rel_path = abs_path.strip_prefix(repo_root).ok()?;
+
+    Some(rel_path.to_path_buf())
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.

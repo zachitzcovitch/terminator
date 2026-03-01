@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(feature = "git")]
-mod git;
+pub mod git;
 
 mod diff;
 

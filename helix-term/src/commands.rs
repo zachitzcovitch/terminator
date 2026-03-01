@@ -10,7 +10,7 @@ use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{FileChange, Hunk};
+use helix_vcs::{git, FileChange, Hunk};
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -4174,8 +4174,9 @@ fn goto_prev_hunk(cx: &mut Context) {
 
 fn diff_view(cx: &mut Context) {
     // Get diff data first to avoid borrow issues
-    let (diff_base, doc_text, hunks, file_name) = {
+    let (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id) = {
         let (_view, doc) = current!(cx.editor);
+        let doc_id = doc.id();
 
         let diff_handle = match doc.diff_handle() {
             Some(handle) => handle,
@@ -4201,20 +4202,50 @@ fn diff_view(cx: &mut Context) {
         // Get hunks
         let hunks: Vec<Hunk> = (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
 
-        // Get file name
-        let file_name = doc
-            .path()
-            .map(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_else(|| "untitled".to_string());
+        // Get file name and path info
+        let (file_name, file_path, absolute_path) = match doc.path() {
+            Some(path) => {
+                // Get the absolute path
+                let abs_path = path.to_path_buf();
 
-        (diff_base, doc_text, hunks, file_name)
+                // Use helix_vcs to compute the relative path from repo root
+                let rel_path = git::get_relative_path(&abs_path);
+
+                if let Some(rel_path) = rel_path {
+                    let file_name = rel_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "untitled".to_string());
+
+                    (file_name, rel_path, abs_path)
+                } else {
+                    // Fallback: use just the file name if not in a git repo
+                    let file_name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "untitled".to_string());
+                    (file_name.clone(), PathBuf::from(&file_name), abs_path)
+                }
+            }
+            None => (
+                "untitled".to_string(),
+                PathBuf::from("untitled"),
+                PathBuf::from("untitled"),
+            ),
+        };
+
+        (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id)
     }; // diff is dropped here
 
-    let diff_view = ui::DiffView::new(diff_base, doc_text, hunks, file_name);
+    let diff_view = ui::DiffView::new(
+        diff_base,
+        doc_text,
+        hunks,
+        file_name,
+        file_path,
+        absolute_path,
+        doc_id,
+    );
 
     cx.push_layer(Box::new(overlaid(diff_view)));
 }
