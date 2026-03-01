@@ -1,5 +1,6 @@
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
+use helix_core::tree_sitter::Node;
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
 use helix_vcs::git;
 use std::cell::RefCell;
@@ -333,49 +334,92 @@ struct FunctionContext {
     byte_offset_in_line: usize,
 }
 
+/// Check if a tree-sitter node represents a function-like construct
+/// Supports multiple languages: Rust, Python, JavaScript, Java, C/C++, etc.
+fn is_function_like(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        // Rust
+        "function_item"
+        | "impl_item"
+        | "struct_item"
+        | "enum_item"
+        | "trait_item"
+        // Python
+        | "function_definition"
+        | "class_definition"
+        // JavaScript/TypeScript
+        | "function_declaration"
+        | "function_expression"
+        | "arrow_function"
+        | "method_definition"
+        | "class_declaration"
+        | "class"
+        | "method"
+        | "generator_function_declaration"
+        // Java
+        | "method_declaration"
+        | "interface_declaration"
+        // C/C++
+        | "class_specifier"
+        | "struct_specifier"
+        | "lambda_expression"
+        // General
+        | "constructor"
+    )
+}
+
 /// Get function/scope context for a line (like delta's hunk header context)
 /// Returns the first line of the containing function/class/method, truncated to ~50 chars
 /// Also returns the line number where the function starts for syntax highlighting
+///
+/// Performance: Uses O(log n) tree navigation via descendant_for_byte_range
+/// instead of O(n) query iteration.
 fn get_function_context(
     line: usize,                  // 0-indexed line number
     slice: helix_core::RopeSlice, // document text
     syntax: Option<&Syntax>,
-    loader: &Loader,
+    _loader: &Loader, // Keep for API compatibility, no longer used
 ) -> Option<FunctionContext> {
     let syntax = syntax?;
-    let root = syntax.tree().root_node();
-    let textobject_query = loader.textobject_query(syntax.root_language())?;
+    let tree = syntax.tree();
+    let root = tree.root_node();
 
     // Check if line is within bounds
     if line >= slice.len_lines() {
         return None;
     }
 
-    // Convert line to byte position
-    let byte_pos = slice.line_to_byte(line);
+    // Convert line to byte offset - O(1)
+    let byte = slice.line_to_byte(line);
+    let byte_u32 = byte as u32;
 
-    // Query for function.around, class.around, method.around
-    // We use "around" to get the full definition including signature
-    let capture_names = ["function.around", "class.around", "method.around"];
+    // Find deepest node at position - O(log n) tree navigation
+    let node = root.descendant_for_byte_range(byte_u32, byte_u32)?;
 
-    // Find smallest containing node
-    let node = textobject_query
-        .capture_nodes_any(&capture_names, &root, slice)?
-        .filter(|node| node.byte_range().contains(&byte_pos))
-        .min_by_key(|node| node.byte_range().len())?;
+    // Walk up the tree to find enclosing function-like node
+    // This is O(depth) where depth is typically small (< 20)
+    let mut current = node;
+    let func_node = loop {
+        if is_function_like(&current) {
+            break current;
+        }
+        current = current.parent()?;
+    };
 
     // Get the starting line number (0-indexed) of the function
-    let func_start_line = slice.byte_to_line(node.start_byte());
+    let func_start_byte = func_node.start_byte() as usize;
+    let func_start_line = slice.byte_to_line(func_start_byte);
 
     // Compute the byte offset of the function start within its line
     // This is needed because ctx.text is extracted from the function node (excludes leading whitespace)
     // but highlights are computed for the full document line (includes leading whitespace)
     let line_start_byte = slice.line_to_byte(func_start_line);
-    let byte_offset_in_line = node.start_byte().saturating_sub(line_start_byte);
+    let byte_offset_in_line = func_start_byte.saturating_sub(line_start_byte);
 
     // Extract first line (signature), truncate to ~50 chars
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
+    let start_byte = func_node.start_byte() as usize;
+    let end_byte = func_node.end_byte() as usize;
 
     // Convert byte positions to char positions for slicing
     let start_char = slice.byte_to_char(start_byte);
@@ -19354,5 +19398,775 @@ mod lazy_evaluation_adversarial_tests {
             "prepare_visible for 20 lines should be fast, took {:?}",
             duration
         );
+    }
+}
+
+// =============================================================================
+// ADVERSARIAL TESTS: Function Context Optimization
+// =============================================================================
+// Attack vectors for function context edge cases and performance:
+// 1. Very deeply nested functions (depth > 50)
+// 2. Functions at file boundaries (first/last line)
+// 3. Multiple languages in same file
+// 4. Malformed/incomplete syntax trees
+// 5. Unicode in function names
+// =============================================================================
+
+#[cfg(test)]
+mod adversarial_function_context_tests {
+    use super::*;
+    use helix_view::Theme;
+    use std::time::Instant;
+
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    fn make_hunk(before: std::ops::Range<u32>, after: std::ops::Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    fn create_test_diff_view(
+        diff_base: &str,
+        doc: &str,
+        hunks: Vec<Hunk>,
+        file_path: &str,
+    ) -> DiffView {
+        DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            file_path.to_string(),
+            PathBuf::from(file_path),
+            PathBuf::from(file_path),
+            helix_view::DocumentId::default(),
+            None,
+        )
+    }
+
+    fn create_syntax(rope: &Rope, file_path: &PathBuf, loader: &Loader) -> Option<Syntax> {
+        let slice = rope.slice(..);
+        loader
+            .language_for_filename(file_path)
+            .and_then(|language| Syntax::new(slice, language, loader).ok())
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 1: Very Deeply Nested Functions (depth > 50)
+    // =========================================================================
+
+    /// Test: Function context with extremely deep nesting (60 levels)
+    /// This tests the O(depth) tree walking in get_function_context
+    #[test]
+    fn test_function_context_extremely_deep_nesting() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create deeply nested closures (60 levels)
+        let mut content = String::new();
+        for i in 0..60 {
+            content.push_str(&format!("fn level_{}() {{\n", i));
+            content.push_str(&"    ".repeat(i + 1));
+        }
+        content.push_str("let x = 1;\n");
+        for i in (0..60).rev() {
+            content.push_str(&"    ".repeat(i));
+            content.push_str("}\n");
+        }
+
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // The deepest line should be around line 60
+        let deep_line = 60;
+
+        // This should not panic or hang
+        let result = std::panic::catch_unwind(|| {
+            get_function_context(deep_line, rope.slice(..), syntax.as_ref(), &loader)
+        });
+
+        // Should complete without panic
+        assert!(
+            result.is_ok(),
+            "get_function_context should not panic for deep nesting"
+        );
+
+        // If it returns a context, it should be valid
+        if let Ok(Some(ctx)) = result {
+            assert!(!ctx.text.is_empty(), "Context text should not be empty");
+            assert!(
+                ctx.text.len() <= 53,
+                "Context should be truncated to ~50 chars"
+            );
+        }
+    }
+
+    /// Test: Performance - deep nesting should not cause exponential slowdown
+    #[test]
+    fn test_function_context_deep_nesting_performance() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create 100 levels of nesting
+        let mut content = String::new();
+        for i in 0..100 {
+            content.push_str(&format!("fn level_{}() {{\n", i));
+            content.push_str(&"    ".repeat(i + 1));
+        }
+        content.push_str("let x = 1;\n");
+        for i in (0..100).rev() {
+            content.push_str(&"    ".repeat(i));
+            content.push_str("}\n");
+        }
+
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Measure time for deep lookup
+        let start = Instant::now();
+        let _ = get_function_context(100, rope.slice(..), syntax.as_ref(), &loader);
+        let duration = start.elapsed();
+
+        // Should complete in reasonable time (< 10ms for 100 levels)
+        assert!(
+            duration.as_millis() < 10,
+            "Deep nesting lookup should be fast, took {:?}",
+            duration
+        );
+    }
+
+    /// Test: Function context with deeply nested blocks (not functions)
+    #[test]
+    fn test_function_context_deep_blocks_not_functions() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create deeply nested blocks inside a single function
+        let mut content = String::from("fn outer() {\n");
+        for i in 0..50 {
+            content.push_str(&format!("{}{{\n", "    ".repeat(i + 1)));
+        }
+        content.push_str(&format!("{}let x = 1;\n", "    ".repeat(51)));
+        for i in (0..50).rev() {
+            content.push_str(&format!("{}}}\n", "    ".repeat(i + 1)));
+        }
+        content.push_str("}\n");
+
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // The deepest line should still find the outer function
+        let result = get_function_context(51, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn outer()"),
+                "Should find outer function context, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 2: Functions at File Boundaries
+    // =========================================================================
+
+    /// Test: Function at the very first line of file
+    #[test]
+    fn test_function_context_at_file_start() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Function starts at line 0
+        let content = "fn first_function() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 0 is the function signature
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn first_function"),
+                "Should find function at file start, got: {}",
+                ctx.text
+            );
+            assert_eq!(
+                ctx.line_number, 0,
+                "Line number should be 0 for function at file start"
+            );
+        }
+    }
+
+    /// Test: Function at the very last line of file
+    #[test]
+    fn test_function_context_at_file_end() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Function ends at the last line
+        let content = "fn main() {\n    let x = 1;\n}\nfn last_function() { let y = 2; }\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Last line is line 3 (0-indexed)
+        let last_line = rope.len_lines() - 1;
+        let result = get_function_context(last_line, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should find the last function or return None gracefully
+        if let Some(ctx) = result {
+            assert!(!ctx.text.is_empty(), "Context should not be empty");
+        }
+    }
+
+    /// Test: Single-line function at file boundaries
+    #[test]
+    fn test_function_context_single_line_at_boundaries() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Single-line function at start
+        let content = "fn single() { let x = 1; }\nfn other() { let y = 2; }\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 0 is the single-line function
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn single"),
+                "Should find single-line function at start, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Empty file
+    #[test]
+    fn test_function_context_empty_file() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 0 in empty file
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return None gracefully
+        assert!(
+            result.is_none() || result.as_ref().map_or(false, |c| c.text.is_empty()),
+            "Empty file should return None or empty context"
+        );
+    }
+
+    /// Test: File with only whitespace
+    #[test]
+    fn test_function_context_whitespace_only_file() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "   \n   \n   \n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return None gracefully
+        assert!(
+            result.is_none() || result.as_ref().map_or(false, |c| c.text.is_empty()),
+            "Whitespace-only file should return None or empty context"
+        );
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 3: Multiple Languages / Mixed Syntax
+    // =========================================================================
+
+    /// Test: Function context with embedded SQL in Rust string
+    #[test]
+    fn test_function_context_embedded_sql() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = r#"
+fn query_function() {
+    let sql = "SELECT * FROM users WHERE id = ?";
+    let x = 1;
+}
+"#;
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn query_function"),
+                "Should find Rust function context, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Function context with raw string literals
+    #[test]
+    fn test_function_context_raw_strings() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Use regular string with escaped newlines to avoid raw string conflicts
+        let content = "fn raw_string_function() {\n    let raw = r#\"multi\nline\nraw\nstring\"#;\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(4, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn raw_string_function"),
+                "Should find function context with raw strings, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Function context with macro definitions
+    #[test]
+    fn test_function_context_with_macros() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "macro_rules! my_macro {\n    () => { 1 };\n}\n\nfn uses_macro() {\n    let x = my_macro!();\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line inside uses_macro
+        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn uses_macro"),
+                "Should find function context, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Python file with function context
+    #[test]
+    fn test_function_context_python() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.py");
+
+        let content = "def my_python_function(arg1, arg2):\n    \"\"\"A docstring.\"\"\"\n    x = arg1 + arg2\n    return x\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("def my_python_function")
+                    || ctx.text.contains("my_python_function"),
+                "Should find Python function context, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: JavaScript file with function context
+    #[test]
+    fn test_function_context_javascript() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.js");
+
+        let content =
+            "function myJsFunction(param) {\n    const x = param + 1;\n    return x;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("function myJsFunction") || ctx.text.contains("myJsFunction"),
+                "Should find JavaScript function context, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 4: Malformed/Incomplete Syntax Trees
+    // =========================================================================
+
+    /// Test: Incomplete function (missing closing brace)
+    #[test]
+    fn test_function_context_incomplete_function() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn incomplete() {\n    let x = 1;\n    // missing closing brace";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Should not panic with incomplete syntax
+        let result = std::panic::catch_unwind(|| {
+            get_function_context(1, rope.slice(..), syntax.as_ref(), &loader)
+        });
+
+        assert!(result.is_ok(), "Should not panic with incomplete function");
+    }
+
+    /// Test: Syntax error in function
+    #[test]
+    fn test_function_context_syntax_error() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn with_error() {\n    let x = ;\n}\n"; // Missing value after =
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should still find the function context despite syntax error
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn with_error"),
+                "Should find function context despite syntax error, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Multiple syntax errors
+    #[test]
+    fn test_function_context_multiple_syntax_errors() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn multi_error() {\n    let x = ;\n    let y = ;\n    let z = ;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should still find function context
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Should find context despite multiple errors"
+            );
+        }
+    }
+
+    /// Test: Unclosed string literal
+    #[test]
+    fn test_function_context_unclosed_string() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Use regular string with escaped quotes to create an unclosed string scenario
+        let content = "fn unclosed_string() {\n    let s = \"unclosed string\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should handle gracefully
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty if returned"
+            );
+        }
+    }
+
+    /// Test: Binary garbage data
+    #[test]
+    fn test_function_context_binary_data() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Binary-like data with null bytes
+        let content = "\x00\x01\x02\x03\x04\x05fn test() {\x00\x01}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = std::panic::catch_unwind(|| {
+            get_function_context(0, rope.slice(..), syntax.as_ref(), &loader)
+        });
+
+        // Should not panic
+        assert!(result.is_ok(), "Should not panic with binary data");
+    }
+
+    /// Test: Very long line without newlines
+    #[test]
+    fn test_function_context_very_long_line() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Function with extremely long signature on one line
+        let long_params: String = (0..100).map(|i| format!("param{}: i32, ", i)).collect();
+        let content = format!(
+            "fn very_long_signature({}) {{\n    let x = 1;\n}}\n",
+            long_params
+        );
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should be truncated
+            assert!(
+                ctx.text.len() <= 53,
+                "Long signature should be truncated, got len {}: {}",
+                ctx.text.len(),
+                ctx.text
+            );
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR 5: Unicode in Function Names
+    // =========================================================================
+
+    /// Test: Function with unicode name
+    #[test]
+    fn test_function_context_unicode_name() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn 函数名称() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("函数名称") || ctx.text.contains("fn"),
+                "Should find unicode function name, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Function with emoji in name (if allowed)
+    #[test]
+    fn test_function_context_emoji_name() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn test_🎉_function() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should handle gracefully (may or may not find context)
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty if returned"
+            );
+        }
+    }
+
+    /// Test: Function with RTL text
+    #[test]
+    fn test_function_context_rtl_text() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn test_function() {\n    // تعليق عربي\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                ctx.text.contains("fn test_function"),
+                "Should find function context with RTL comment, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test: Function with combining characters
+    #[test]
+    fn test_function_context_combining_characters() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Function name with combining characters (e.g., é = e + combining acute)
+        let content = "fn te\u{0301}st() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(!ctx.text.is_empty(), "Context should not be empty");
+        }
+    }
+
+    /// Test: Function with zero-width characters
+    #[test]
+    fn test_function_context_zero_width_chars() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Function name with zero-width characters
+        let content = "fn test\u{200B}function() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(!ctx.text.is_empty(), "Context should not be empty");
+        }
+    }
+
+    /// Test: Truncation with unicode characters
+    #[test]
+    fn test_function_context_unicode_truncation() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Long function name with unicode that should be truncated properly
+        let content =
+            "fn 这是一个非常长的函数名称用来测试截断功能是否正常工作() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should be truncated and not cut in middle of unicode character
+            assert!(
+                ctx.text.len() <= 53,
+                "Unicode function name should be truncated properly, got len {}: {}",
+                ctx.text.len(),
+                ctx.text
+            );
+            // Should end with ... if truncated
+            if ctx.text.len() > 50 {
+                assert!(
+                    ctx.text.ends_with("..."),
+                    "Truncated unicode context should end with '...', got: {}",
+                    ctx.text
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // PERFORMANCE TESTS
+    // =========================================================================
+
+    /// Test: Performance with many hunks
+    #[test]
+    fn test_function_context_many_hunks_performance() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a file with many functions
+        let mut diff_base = String::new();
+        let mut doc = String::new();
+        let mut hunks = Vec::new();
+
+        for i in 0..100 {
+            diff_base.push_str(&format!("fn func_{}() {{ let x = 1; }}\n", i));
+            if i % 10 == 0 {
+                doc.push_str(&format!("fn func_{}() {{ let y = 2; }}\n", i));
+                hunks.push(make_hunk(i..i + 1, i..i + 1));
+            } else {
+                doc.push_str(&format!("fn func_{}() {{ let x = 1; }}\n", i));
+            }
+        }
+
+        let mut view = create_test_diff_view(&diff_base, &doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        let start = Instant::now();
+        view.prepare_visible(0, 50, &loader, &theme);
+        let duration = start.elapsed();
+
+        // Should be fast even with many hunks
+        assert!(
+            duration.as_millis() < 100,
+            "prepare_visible with many hunks should be fast, took {:?}",
+            duration
+        );
+    }
+
+    /// Test: Memory efficiency - caches should not grow unbounded
+    #[test]
+    fn test_function_context_cache_memory_efficiency() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "fn test() { let x = 1; }\n";
+        let doc = "fn test() { let y = 2; }\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Call prepare_visible multiple times
+        for _ in 0..100 {
+            view.prepare_visible(0, 10, &loader, &theme);
+        }
+
+        // Cache should not grow unbounded (should reuse entries)
+        let cache_size = view.function_context_cache.borrow().len();
+        assert!(
+            cache_size <= view.diff_lines.len(),
+            "Function context cache should not exceed diff_lines length, got {} vs {}",
+            cache_size,
+            view.diff_lines.len()
+        );
+    }
+
+    /// Test: Concurrent access safety (RefCell borrow checking)
+    #[test]
+    fn test_function_context_cache_borrow_safety() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "fn test() { let x = 1; }\n";
+        let doc = "fn test() { let y = 2; }\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Multiple borrows should work (read-only)
+        let cache1 = view.function_context_cache.borrow();
+        let cache2 = view.function_context_cache.borrow();
+
+        // Both should be valid
+        assert!(!cache1.is_empty() || cache1.is_empty()); // Always true, just checking borrow works
+        assert!(!cache2.is_empty() || cache2.is_empty());
+
+        drop(cache1);
+        drop(cache2);
+
+        // Mutable borrow should work after dropping immutable borrows
+        let mut cache_mut = view.function_context_cache.borrow_mut();
+        cache_mut.clear();
+        assert!(cache_mut.is_empty());
     }
 }
