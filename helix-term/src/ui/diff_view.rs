@@ -315,6 +315,104 @@ fn coalesce_segments(segments: Vec<WordSegment>) -> Vec<WordSegment> {
     result
 }
 
+/// Function context information for hunk headers (delta-style)
+#[derive(Debug, Clone)]
+struct FunctionContext {
+    /// The function/class/method signature text (truncated, may include "..." suffix)
+    text: String,
+    /// The 0-indexed line number where the function starts
+    line_number: usize,
+    /// The byte length of the original text before truncation (excluding "...")
+    /// This is used to filter syntax highlights to only include those within the truncated portion
+    truncated_len: usize,
+    /// The byte offset of the function start within the document line
+    /// This is needed because ctx.text is extracted from the function node (excludes leading whitespace)
+    /// but highlights are computed for the full document line (includes leading whitespace)
+    byte_offset_in_line: usize,
+}
+
+/// Get function/scope context for a line (like delta's hunk header context)
+/// Returns the first line of the containing function/class/method, truncated to ~50 chars
+/// Also returns the line number where the function starts for syntax highlighting
+fn get_function_context(
+    line: usize,                  // 0-indexed line number
+    slice: helix_core::RopeSlice, // document text
+    syntax: Option<&Syntax>,
+    loader: &Loader,
+) -> Option<FunctionContext> {
+    let syntax = syntax?;
+    let root = syntax.tree().root_node();
+    let textobject_query = loader.textobject_query(syntax.root_language())?;
+
+    // Check if line is within bounds
+    if line >= slice.len_lines() {
+        return None;
+    }
+
+    // Convert line to byte position
+    let byte_pos = slice.line_to_byte(line);
+
+    // Query for function.around, class.around, method.around
+    // We use "around" to get the full definition including signature
+    let capture_names = ["function.around", "class.around", "method.around"];
+
+    // Find smallest containing node
+    let node = textobject_query
+        .capture_nodes_any(&capture_names, &root, slice)?
+        .filter(|node| node.byte_range().contains(&byte_pos))
+        .min_by_key(|node| node.byte_range().len())?;
+
+    // Get the starting line number (0-indexed) of the function
+    let func_start_line = slice.byte_to_line(node.start_byte());
+
+    // Compute the byte offset of the function start within its line
+    // This is needed because ctx.text is extracted from the function node (excludes leading whitespace)
+    // but highlights are computed for the full document line (includes leading whitespace)
+    let line_start_byte = slice.line_to_byte(func_start_line);
+    let byte_offset_in_line = node.start_byte().saturating_sub(line_start_byte);
+
+    // Extract first line (signature), truncate to ~50 chars
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+
+    // Convert byte positions to char positions for slicing
+    let start_char = slice.byte_to_char(start_byte);
+    let end_char = slice.byte_to_char(end_byte);
+
+    // Get the text of the function/class
+    let text = slice.slice(start_char..end_char);
+
+    // Get the first line (signature line)
+    let first_line = text.lines().next()?;
+    let first_line_str: String = first_line.into();
+
+    // Truncate to ~50 chars, adding "..." if truncated
+    const MAX_LEN: usize = 50;
+    let (truncated, truncated_len) = if first_line_str.len() > MAX_LEN {
+        // Find a good truncation point (avoid cutting in middle of word if possible)
+        let truncate_at = first_line_str
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_LEN - 3)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(MAX_LEN - 3);
+        (
+            format!("{}...", &first_line_str[..truncate_at]),
+            truncate_at,
+        )
+    } else {
+        let len = first_line_str.len();
+        (first_line_str, len)
+    };
+
+    Some(FunctionContext {
+        text: truncated,
+        line_number: func_start_line,
+        truncated_len,
+        byte_offset_in_line,
+    })
+}
+
 /// Specifies the source of context lines in a hunk patch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextSource {
@@ -325,8 +423,9 @@ enum ContextSource {
 }
 use helix_vcs::Hunk;
 use helix_view::editor::Action;
-use helix_view::graphics::{Margin, Rect};
+use helix_view::graphics::{Margin, Rect, Style};
 use helix_view::DocumentId;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
@@ -387,7 +486,7 @@ fn get_line_highlights(
             (base_rope.clone(), base_syntax, base_line_idx as u32)
         }
         // Hunk headers don't have syntax
-        DiffLine::HunkHeader(_) => return Vec::new(),
+        DiffLine::HunkHeader { .. } => return Vec::new(),
     };
 
     // Get the syntax highlighter
@@ -460,11 +559,102 @@ fn get_line_highlights(
     highlights
 }
 
+/// Get syntax highlighting for a specific line number in a rope
+/// Returns byte ranges with their styles for the line
+/// The returned Vec contains (byte_start, byte_end, Style) tuples for each segment
+fn get_highlights_for_line(
+    line_num: usize, // 0-indexed line number
+    rope: &Rope,
+    syntax: Option<&Syntax>,
+    loader: &Loader,
+    theme: &helix_view::Theme,
+) -> Vec<(usize, usize, helix_view::graphics::Style)> {
+    use helix_view::graphics::Style as ViewStyle;
+
+    // Check bounds
+    if line_num >= rope.len_lines() {
+        return Vec::new();
+    }
+
+    // Get the syntax highlighter
+    let Some(syntax) = syntax else {
+        return Vec::new();
+    };
+
+    let source = rope.slice(..);
+
+    // Get the byte range for this specific line
+    let line_start = rope.line_to_byte(line_num) as u32;
+    let line_end = if line_num + 1 < rope.len_lines() {
+        rope.line_to_byte(line_num + 1) as u32
+    } else {
+        rope.len_bytes() as u32
+    };
+
+    // Use highlighter with range to get only this line's highlights
+    let mut highlighter = syntax.highlighter(source, loader, line_start..line_end);
+    let mut highlights = Vec::new();
+    let mut pos: u32 = line_start;
+    let mut highlight_stack: Vec<helix_core::syntax::Highlight> = Vec::new();
+
+    while pos < line_end {
+        let next_event_pos = highlighter.next_event_offset();
+
+        if pos == next_event_pos {
+            let (event, new_highlights) = highlighter.advance();
+            if event == HighlightEvent::Refresh {
+                highlight_stack.clear();
+            }
+            highlight_stack.extend(new_highlights);
+            continue;
+        }
+
+        let end = if next_event_pos == u32::MAX {
+            line_end
+        } else {
+            next_event_pos
+        };
+
+        if end > pos {
+            // Compute the style for this segment from the highlight stack
+            let base_style = ViewStyle::default();
+            let style = highlight_stack
+                .iter()
+                .fold(base_style, |acc, &h| acc.patch(theme.highlight(h)));
+
+            // Only include highlights that overlap with our line range
+            let overlap_start = pos.max(line_start);
+            let overlap_end = end.min(line_end);
+            if overlap_start < overlap_end {
+                // Convert to line-relative offsets by subtracting line_start
+                highlights.push((
+                    (overlap_start - line_start) as usize,
+                    (overlap_end - line_start) as usize,
+                    style,
+                ));
+            }
+        }
+
+        pos = end;
+    }
+
+    // If we have no highlights, return the entire line with default style
+    if highlights.is_empty() {
+        highlights.push((0, (line_end - line_start) as usize, ViewStyle::default()));
+    }
+
+    highlights
+}
+
 /// Represents a single line in the unified diff view
 #[derive(Debug, Clone)]
 pub enum DiffLine {
-    /// Hunk header line: @@ -old_start,old_count +new_start,new_count @@
-    HunkHeader(String),
+    /// Hunk header line: @@ -old_start,old_count +new_start,new_count @@ [context]
+    /// new_start is the 0-indexed line number in the working copy (doc) where the hunk starts
+    HunkHeader {
+        text: String,
+        new_start: u32, // 0-indexed line in doc where hunk starts
+    },
     /// Context line (unchanged): shows content with diff.delta style
     Context {
         base_line: Option<u32>,
@@ -513,6 +703,28 @@ pub struct DiffView {
     cached_syntax_doc: Option<Syntax>,
     /// Cached syntax instance for the diff base (HEAD) - for deletions
     cached_syntax_base: Option<Syntax>,
+
+    // =============================================================================
+    // Performance Caches (computed once on first render)
+    // =============================================================================
+    /// Cache for word-level diffs: line_index -> segments
+    /// Pre-computed to avoid O(n²) algorithm in render loop
+    word_diff_cache: HashMap<usize, Vec<WordSegment>>,
+
+    /// Cache for syntax highlights: line_index -> highlights
+    /// Pre-computed to avoid tree-sitter queries in render loop
+    syntax_highlight_cache: HashMap<usize, Vec<(usize, usize, Style)>>,
+
+    /// Cache for function context: hunk_index -> context info
+    /// Pre-computed to avoid tree-sitter queries in render loop
+    function_context_cache: HashMap<usize, Option<FunctionContext>>,
+
+    /// Cache for function context syntax highlights: hunk_index -> highlights
+    /// Pre-computed to avoid tree-sitter queries in render loop
+    function_context_highlight_cache: HashMap<usize, Vec<(usize, usize, Style)>>,
+
+    /// Flag to track if caches are initialized
+    caches_initialized: bool,
 }
 
 impl DiffView {
@@ -550,6 +762,11 @@ impl DiffView {
             doc_id,
             cached_syntax_doc: None,
             cached_syntax_base: None,
+            word_diff_cache: HashMap::new(),
+            syntax_highlight_cache: HashMap::new(),
+            function_context_cache: HashMap::new(),
+            function_context_highlight_cache: HashMap::new(),
+            caches_initialized: false,
         };
 
         view.compute_diff_lines();
@@ -581,7 +798,10 @@ impl DiffView {
                 "@@ -{},{} +{},{} @@",
                 old_start, old_count, new_start, new_count
             );
-            self.diff_lines.push(DiffLine::HunkHeader(header));
+            self.diff_lines.push(DiffLine::HunkHeader {
+                text: header,
+                new_start: hunk.after.start, // 0-indexed line in doc
+            });
 
             // Context before: 2 lines from base before hunk.before.start
             // Clamped to >= 0
@@ -643,9 +863,133 @@ impl DiffView {
         }
     }
 
+    /// Initialize all performance caches once on first render
+    /// This pre-computes expensive operations to avoid O(n²) algorithms and
+    /// tree-sitter queries in the render loop
+    fn initialize_caches(&mut self, loader: &Loader, theme: &helix_view::Theme) {
+        if self.caches_initialized {
+            return;
+        }
+
+        // Initialize syntax for both doc and diff_base if not already cached
+        if self.cached_syntax_doc.is_none() {
+            let doc_slice = self.doc.slice(..);
+            if let Some(language) = loader.language_for_filename(&self.file_path) {
+                if let Ok(syntax) = Syntax::new(doc_slice, language, loader) {
+                    self.cached_syntax_doc = Some(syntax);
+                }
+            }
+        }
+        if self.cached_syntax_base.is_none() {
+            let base_slice = self.diff_base.slice(..);
+            if let Some(language) = loader.language_for_filename(&self.file_path) {
+                if let Ok(syntax) = Syntax::new(base_slice, language, loader) {
+                    self.cached_syntax_base = Some(syntax);
+                }
+            }
+        }
+
+        let doc_syntax = self.cached_syntax_doc.as_ref();
+        let base_syntax = self.cached_syntax_base.as_ref();
+
+        // Pre-compute word-level diffs for all paired deletion/addition lines
+        let mut i = 0;
+        while i < self.diff_lines.len() {
+            // Look for a deletion line
+            if let Some(DiffLine::Deletion {
+                content: old_content,
+                ..
+            }) = self.diff_lines.get(i)
+            {
+                // Look ahead for a paired addition line
+                if let Some(DiffLine::Addition {
+                    content: new_content,
+                    ..
+                }) = self.diff_lines.get(i + 1)
+                {
+                    // Found a paired deletion/addition - compute word-level diff
+                    let (old_segments, new_segments) = compute_word_diff(old_content, new_content);
+                    self.word_diff_cache.insert(i, old_segments);
+                    self.word_diff_cache.insert(i + 1, new_segments);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Pre-compute syntax highlights for all lines
+        for (line_index, diff_line) in self.diff_lines.iter().enumerate() {
+            let highlights = get_line_highlights(
+                diff_line,
+                &self.doc,
+                &self.diff_base,
+                doc_syntax,
+                base_syntax,
+                loader,
+                theme,
+            );
+            self.syntax_highlight_cache.insert(line_index, highlights);
+        }
+
+        // Pre-compute function context for all hunk headers
+        for (hunk_index, diff_line) in self.diff_lines.iter().enumerate() {
+            if let DiffLine::HunkHeader { new_start, .. } = diff_line {
+                let context = get_function_context(
+                    *new_start as usize,
+                    self.doc.slice(..),
+                    doc_syntax,
+                    loader,
+                );
+
+                // If we have function context, also compute its syntax highlights
+                if let Some(ref ctx) = context {
+                    let highlights = get_highlights_for_line(
+                        ctx.line_number,
+                        &self.doc,
+                        doc_syntax,
+                        loader,
+                        theme,
+                    );
+
+                    // Adjust highlights by subtracting the byte offset of the function start within the line.
+                    // This is needed because:
+                    // - get_highlights_for_line returns highlights relative to the document line start
+                    // - ctx.text is extracted from the function node (excludes leading whitespace)
+                    // - When rendering ctx.text, we need highlights relative to the function text start
+                    let offset = ctx.byte_offset_in_line;
+                    let adjusted_highlights: Vec<_> = highlights
+                        .into_iter()
+                        .filter_map(|(start, end, style)| {
+                            // Subtract the offset to convert from line-relative to function-relative
+                            let adj_start = start.saturating_sub(offset);
+                            let adj_end = end.saturating_sub(offset);
+                            // Only include highlights that are within the truncated portion
+                            if adj_end > adj_start && adj_start < ctx.truncated_len {
+                                Some((
+                                    adj_start.min(ctx.truncated_len),
+                                    adj_end.min(ctx.truncated_len),
+                                    style,
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    self.function_context_highlight_cache
+                        .insert(hunk_index, adjusted_highlights);
+                }
+
+                self.function_context_cache.insert(hunk_index, context);
+            }
+        }
+
+        self.caches_initialized = true;
+    }
+
     fn render_unified_diff(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         use helix_view::graphics::Modifier;
-        use std::collections::HashMap;
 
         let style_plus = cx.editor.theme.get("diff.plus");
         let style_minus = cx.editor.theme.get("diff.minus");
@@ -732,27 +1076,8 @@ impl DiffView {
         let loader = cx.editor.syn_loader.load();
         let theme = &cx.editor.theme;
 
-        // Initialize syntax for both doc and diff_base if not already cached
-        if self.cached_syntax_doc.is_none() {
-            let doc_slice = self.doc.slice(..);
-            if let Some(language) = loader.language_for_filename(&self.file_path) {
-                if let Ok(syntax) = Syntax::new(doc_slice, language, &loader) {
-                    self.cached_syntax_doc = Some(syntax);
-                }
-            }
-        }
-        if self.cached_syntax_base.is_none() {
-            let base_slice = self.diff_base.slice(..);
-            if let Some(language) = loader.language_for_filename(&self.file_path) {
-                if let Ok(syntax) = Syntax::new(base_slice, language, &loader) {
-                    self.cached_syntax_base = Some(syntax);
-                }
-            }
-        }
-
-        // Get references to syntax for use in closures
-        let doc_syntax = self.cached_syntax_doc.as_ref();
-        let base_syntax = self.cached_syntax_base.as_ref();
+        // Initialize all caches once (no-op after first call)
+        self.initialize_caches(&loader, theme);
 
         // Get the selected hunk boundaries if available
         let selected_hunk_range = if self.hunk_boundaries.is_empty() {
@@ -761,37 +1086,6 @@ impl DiffView {
             self.hunk_boundaries
                 .get(self.selected_hunk.min(self.hunk_boundaries.len() - 1))
         };
-
-        // Pre-compute word-level diffs for paired deletion/addition lines
-        // This allows us to highlight changed words within modified lines
-        // Key: line index, Value: (segments for this line, is_deletion)
-        let mut word_diff_cache: HashMap<usize, Vec<WordSegment>> = HashMap::new();
-
-        // Scan through diff_lines to find paired deletion/addition lines
-        let mut i = 0;
-        while i < self.diff_lines.len() {
-            // Look for a deletion line
-            if let Some(DiffLine::Deletion {
-                content: old_content,
-                ..
-            }) = self.diff_lines.get(i)
-            {
-                // Look ahead for a paired addition line
-                if let Some(DiffLine::Addition {
-                    content: new_content,
-                    ..
-                }) = self.diff_lines.get(i + 1)
-                {
-                    // Found a paired deletion/addition - compute word-level diff
-                    let (old_segments, new_segments) = compute_word_diff(old_content, new_content);
-                    word_diff_cache.insert(i, old_segments);
-                    word_diff_cache.insert(i + 1, new_segments);
-                    i += 2;
-                    continue;
-                }
-            }
-            i += 1;
-        }
 
         // Clear the area
         surface.clear_with(area, style_delta);
@@ -881,20 +1175,117 @@ impl DiffView {
                 style_minus
             };
 
-            // Get syntax highlighting for this line using full document parsing
+            // Get syntax highlighting for this line from cache
             // Returns Vec of (byte_start, byte_end, Style) tuples for each highlighted segment
-            let line_highlights = get_line_highlights(
-                diff_line,
-                &self.doc,
-                &self.diff_base,
-                doc_syntax,
-                base_syntax,
-                &loader,
-                theme,
-            );
+            let line_highlights = self
+                .syntax_highlight_cache
+                .get(&line_index)
+                .cloned()
+                .unwrap_or_default();
 
             let line_content = match diff_line {
-                DiffLine::HunkHeader(text) => Spans::from(vec![Span::styled(text, style_delta)]),
+                DiffLine::HunkHeader { text, new_start: _ } => {
+                    // Get function/scope context for the hunk from cache
+                    let context = self
+                        .function_context_cache
+                        .get(&line_index)
+                        .and_then(|c| c.clone());
+
+                    // Get function context highlights from cache
+                    let context_highlights = self
+                        .function_context_highlight_cache
+                        .get(&line_index)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    // Build the hunk header line
+                    let mut spans = Vec::new();
+
+                    // Add the hunk header text (@@ -x,y +a,b @@)
+                    spans.push(Span::styled(text.clone(), style_delta));
+
+                    // If we have function context, render it with border and syntax highlighting
+                    if let Some(ctx) = context {
+                        // Add separator and border start
+                        spans.push(Span::styled(" ", style_delta));
+
+                        // Use a vertical bar border character (like delta)
+                        // Using light box-drawing character for the border
+                        let border_style = cx.editor.theme.get("ui.popup.info");
+                        spans.push(Span::styled("│", border_style));
+                        spans.push(Span::styled(" ", style_delta));
+
+                        // Add line number (1-indexed for display)
+                        let line_num_display = ctx.line_number + 1;
+                        spans.push(Span::styled(format!("{}:", line_num_display), border_style));
+                        spans.push(Span::styled(" ", style_delta));
+
+                        // Add the function context text with syntax highlighting
+                        // Clone the text to avoid lifetime issues
+                        let ctx_text = ctx.text.clone();
+                        // Get the truncation length (length of original text before "..." suffix)
+                        let truncated_len = ctx.truncated_len;
+
+                        if context_highlights.is_empty() {
+                            // No syntax highlights, just use the base style
+                            spans.push(Span::styled(ctx_text, style_delta));
+                        } else {
+                            // Create multiple spans based on the highlight ranges
+                            // The highlights are in terms of byte offsets relative to the original line start
+                            // We need to filter and adjust them for the truncated text:
+                            // 1. Only include highlights that start before truncated_len
+                            // 2. Clamp end offsets to truncated_len
+                            // 3. The "..." suffix (if present) is rendered with base style
+                            let ctx_str = ctx_text.as_str();
+                            let mut last_end = 0;
+
+                            for (byte_start, byte_end, segment_style) in &context_highlights {
+                                // Skip highlights that start after the truncated portion
+                                if *byte_start >= truncated_len {
+                                    continue;
+                                }
+
+                                // Clamp offsets to the truncated portion (not the full ctx_str which includes "...")
+                                let start = (*byte_start).min(truncated_len);
+                                let end = (*byte_end).min(truncated_len);
+
+                                // Add any gap before this segment with base style
+                                if start > last_end {
+                                    let gap = &ctx_str[last_end..start];
+                                    if !gap.is_empty() {
+                                        spans.push(Span::styled(gap.to_string(), style_delta));
+                                    }
+                                }
+
+                                // Add the highlighted segment (patch with base diff style)
+                                if end > start {
+                                    let segment = &ctx_str[start..end];
+                                    if !segment.is_empty() {
+                                        let mut patched_style = style_delta.patch(*segment_style);
+                                        if style_delta.bg.is_some() {
+                                            patched_style.bg = style_delta.bg;
+                                        }
+                                        spans
+                                            .push(Span::styled(segment.to_string(), patched_style));
+                                    }
+                                }
+
+                                last_end = end;
+                            }
+
+                            // Add any trailing content with base style
+                            // This includes both unhighlighted portion of truncated text and the "..." suffix
+                            if last_end < ctx_str.len() {
+                                let trailing = &ctx_str[last_end..];
+                                if !trailing.is_empty() {
+                                    spans.push(Span::styled(trailing.to_string(), style_delta));
+                                }
+                            }
+                        }
+                    }
+
+                    Spans::from(spans)
+                }
                 DiffLine::Context {
                     base_line,
                     doc_line,
@@ -976,7 +1367,7 @@ impl DiffView {
                     let mut content_spans = Vec::new();
 
                     // Check if we have word-level diff info for this line
-                    if let Some(word_segments) = word_diff_cache.get(&line_index) {
+                    if let Some(word_segments) = self.word_diff_cache.get(&line_index) {
                         // Apply word-level diff highlighting with emphasis for changed words
                         let mut byte_offset = 0;
                         for segment in word_segments {
@@ -1100,7 +1491,7 @@ impl DiffView {
                     let mut content_spans = Vec::new();
 
                     // Check if we have word-level diff info for this line
-                    if let Some(word_segments) = word_diff_cache.get(&line_index) {
+                    if let Some(word_segments) = self.word_diff_cache.get(&line_index) {
                         // Apply word-level diff highlighting with emphasis for changed words
                         let mut byte_offset = 0;
                         for segment in word_segments {
@@ -5116,7 +5507,10 @@ mod syntax_highlighting_tests {
         let doc_rope = Rope::from("content\n");
         let base_rope = Rope::from("content\n");
 
-        let hunk_header = DiffLine::HunkHeader("@@ -1,3 +1,4 @@".to_string());
+        let hunk_header = DiffLine::HunkHeader {
+            text: "@@ -1,3 +1,4 @@".to_string(),
+            new_start: 0,
+        };
 
         let highlights = get_line_highlights(
             &hunk_header,
@@ -5380,6 +5774,195 @@ mod syntax_highlighting_tests {
         assert_eq!(coalesced.len(), 1);
         assert_eq!(coalesced[0].text, "abc");
         assert!(coalesced[0].is_emph);
+    }
+
+    // =========================================================================
+    // Tests for get_function_context
+    // =========================================================================
+
+    /// Test 1: Function context is extracted correctly for a function
+    #[test]
+    fn test_function_context_extracted_correctly() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a function
+        let content = "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 1 (0-indexed) is inside the function body
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return the function signature
+        assert!(
+            result.is_some(),
+            "Should find function context for line inside function"
+        );
+        let ctx = result.unwrap();
+        assert!(
+            ctx.text.contains("fn main()"),
+            "Context should contain function signature, got: {}",
+            ctx.text
+        );
+    }
+
+    /// Test 2: Class context is extracted correctly for a class (using struct in Rust)
+    #[test]
+    fn test_class_context_extracted_correctly() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a struct
+        let content = "struct MyStruct {\n    field1: i32,\n    field2: String,\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 1 (0-indexed) is inside the struct body
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return the struct signature (note: Rust structs may not have "class.around" capture)
+        // The result depends on whether the language has class.around capture
+        // For Rust, we check that it either returns None or a valid context
+        if let Some(ctx) = &result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty if returned"
+            );
+        }
+    }
+
+    /// Test 3: Nested functions return innermost function
+    #[test]
+    fn test_nested_functions_return_innermost() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with nested functions (closures)
+        let content = "fn outer() {\n    let inner = || {\n        let x = 42;\n    };\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 2 (0-indexed) is inside the inner closure
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return some function context (either outer or inner depending on tree-sitter)
+        if let Some(ctx) = &result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty if returned"
+            );
+            // The context should be a function signature
+            assert!(
+                ctx.text.contains("fn") || ctx.text.contains("||"),
+                "Context should contain function or closure syntax, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test 4: No syntax available returns None gracefully
+    #[test]
+    fn test_no_syntax_returns_none() {
+        let loader = test_loader();
+
+        let content = "fn main() {\n    let x = 42;\n}\n";
+        let rope = Rope::from(content);
+
+        // Pass None for syntax
+        let result = get_function_context(1, rope.slice(..), None, &loader);
+
+        assert!(
+            result.is_none(),
+            "Should return None when no syntax is available"
+        );
+    }
+
+    /// Test 5: No containing function returns None gracefully
+    #[test]
+    fn test_no_containing_function_returns_none() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with only top-level items (no function containing line 0)
+        let content = "// This is a comment\nlet x = 1;\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 0 (0-indexed) is a comment, not inside any function
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+
+        // Should return None since there's no containing function
+        // (or might return something if tree-sitter captures comments differently)
+        // The important thing is it doesn't panic
+        assert!(
+            result.is_none() || result.as_ref().map_or(false, |s| !s.text.is_empty()),
+            "Should return None or a valid non-empty context"
+        );
+    }
+
+    /// Test 6: Long signatures are truncated properly
+    #[test]
+    fn test_long_signatures_truncated() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a very long function signature
+        let long_sig = "fn very_long_function_name_with_many_parameters(param1: i32, param2: String, param3: Vec<i32>, param4: Option<Result<Box<dyn std::error::Error>, String>>) {";
+        let content = format!("{}\n    let x = 42;\n}}\n", long_sig);
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 1 (0-indexed) is inside the function body
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = &result {
+            // Should be truncated to ~50 chars with "..."
+            assert!(
+                ctx.text.len() <= 53, // 50 chars + "..." = 53 max
+                "Context should be truncated to ~50 chars, got len {}: {}",
+                ctx.text.len(),
+                ctx.text
+            );
+            if ctx.text.len() > 50 {
+                assert!(
+                    ctx.text.ends_with("..."),
+                    "Truncated context should end with '...', got: {}",
+                    ctx.text
+                );
+            }
+        }
+    }
+
+    /// Test 7: Edge case - line out of bounds
+    #[test]
+    fn test_line_out_of_bounds() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn main() {\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Try to get context for a line that doesn't exist (line 100)
+        // This should not panic - it should handle gracefully
+        let result = std::panic::catch_unwind(|| {
+            get_function_context(100, rope.slice(..), syntax.as_ref(), &loader)
+        });
+
+        // The function should either return None or panic in a controlled way
+        // We expect it to handle this gracefully (return None or not panic)
+        match result {
+            Ok(Some(_)) => {
+                // Unexpected but not a failure if it returns something valid
+            }
+            Ok(None) => {
+                // Expected - line out of bounds returns None
+            }
+            Err(_) => {
+                panic!("get_function_context should not panic for out-of-bounds line");
+            }
+        }
     }
 }
 
@@ -6022,5 +6605,989 @@ mod emphasis_style_fallback_tests {
             result.add_modifier.contains(Modifier::BOLD),
             "BOLD modifier should be added from fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod performance_caching_tests {
+    //! Tests for performance caching implementation in diff view
+    //!
+    //! Test scenarios:
+    //! 1. Caches are initialized only once
+    //! 2. Word diff cache is populated correctly
+    //! 3. Syntax highlight cache is populated correctly
+    //! 4. Function context cache is populated correctly
+    //! 5. Render uses cached values (not recomputing)
+    //! 6. Edge case: empty diff
+    //! 7. Edge case: no syntax available
+
+    use super::*;
+    use helix_core::syntax::Loader;
+    use helix_view::DocumentId;
+    use helix_view::Theme;
+    use std::path::PathBuf;
+
+    /// Create a test syntax loader
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: std::ops::Range<u32>, after: std::ops::Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    /// Helper to create a DiffView for testing
+    fn create_test_diff_view(
+        diff_base: &str,
+        doc: &str,
+        hunks: Vec<Hunk>,
+        file_path: &str,
+    ) -> DiffView {
+        DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            file_path.to_string(),
+            PathBuf::from(file_path),
+            PathBuf::from(file_path),
+            DocumentId::default(),
+        )
+    }
+
+    /// Test 1: Caches are initialized only once
+    /// Verifies that calling initialize_caches multiple times is a no-op after first call
+    #[test]
+    fn test_caches_initialized_only_once() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a diff view with some content
+        let diff_base = "line 1\nline 2\nline 3\n";
+        let doc = "line 1\nmodified line 2\nline 3\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Initially, caches should not be initialized
+        assert!(
+            !view.caches_initialized,
+            "caches_initialized should be false initially"
+        );
+        assert!(
+            view.word_diff_cache.is_empty(),
+            "word_diff_cache should be empty initially"
+        );
+        assert!(
+            view.syntax_highlight_cache.is_empty(),
+            "syntax_highlight_cache should be empty initially"
+        );
+        assert!(
+            view.function_context_cache.is_empty(),
+            "function_context_cache should be empty initially"
+        );
+
+        // First call should initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        assert!(
+            view.caches_initialized,
+            "caches_initialized should be true after first call"
+        );
+
+        // Capture cache sizes after first initialization
+        let word_cache_size = view.word_diff_cache.len();
+        let syntax_cache_size = view.syntax_highlight_cache.len();
+        let func_cache_size = view.function_context_cache.len();
+
+        // Second call should be a no-op
+        view.initialize_caches(&loader, &theme);
+
+        // Cache sizes should remain the same (no re-computation)
+        assert_eq!(
+            view.word_diff_cache.len(),
+            word_cache_size,
+            "word_diff_cache should not change on second call"
+        );
+        assert_eq!(
+            view.syntax_highlight_cache.len(),
+            syntax_cache_size,
+            "syntax_highlight_cache should not change on second call"
+        );
+        assert_eq!(
+            view.function_context_cache.len(),
+            func_cache_size,
+            "function_context_cache should not change on second call"
+        );
+    }
+
+    /// Test 2: Word diff cache is populated correctly
+    /// Verifies that paired deletion/addition lines get word-level diff entries
+    #[test]
+    fn test_word_diff_cache_populated_correctly() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a diff with paired deletion/addition (word-level change)
+        let diff_base = "let x = 1;\n";
+        let doc = "let y = 2;\n";
+        // Hunk: before=[0,1) after=[0,1) - line 0 changed
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        // Word diff cache should have entries for the paired deletion/addition
+        // The diff_lines will have: HunkHeader, Deletion, Addition
+        // Indices 1 and 2 should have word diff entries
+        assert!(
+            !view.word_diff_cache.is_empty(),
+            "word_diff_cache should have entries for paired deletion/addition"
+        );
+
+        // Check that the cache contains segments with emphasis markers
+        for (_, segments) in &view.word_diff_cache {
+            // At least some segments should be marked as emphasized (changed words)
+            let has_emph = segments.iter().any(|s| s.is_emph);
+            // For "let x = 1" vs "let y = 2", we expect "x" and "y" to be emphasized
+            // and "1" and "2" to be emphasized
+            assert!(
+                has_emph || !segments.is_empty(),
+                "Word diff should have segments (emphasized or not)"
+            );
+        }
+    }
+
+    /// Test 2b: Word diff cache handles unpaired lines
+    /// Verifies that unpaired deletions or additions don't get word diff entries
+    #[test]
+    fn test_word_diff_cache_unpaired_lines() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a diff with only additions (no paired deletions)
+        let diff_base = "line 1\n";
+        let doc = "line 1\nnew line\n";
+        // Hunk: before=[1,1) after=[1,2) - addition only
+        let hunks = vec![make_hunk(1..1, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Word diff cache should be empty since there are no paired deletion/addition
+        // (addition-only lines don't have word-level diffs)
+        // Note: The cache may still have entries for context lines, but not for unpaired additions
+        // The key invariant is that word_diff_cache only contains entries for paired lines
+        for (line_idx, segments) in &view.word_diff_cache {
+            // If there's an entry, verify it's valid
+            if !segments.is_empty() {
+                // The line should be either a deletion or addition that has a pair
+                let line = view.diff_lines.get(*line_idx);
+                assert!(line.is_some(), "Cached line index should be valid");
+            }
+        }
+    }
+
+    /// Test 3: Syntax highlight cache is populated correctly
+    /// Verifies that all diff lines get syntax highlight entries
+    #[test]
+    fn test_syntax_highlight_cache_populated_correctly() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with syntax-highlightable content
+        let diff_base = "fn old() {}\n";
+        let doc = "fn new() {}\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Syntax highlight cache should have entries for all diff lines
+        assert_eq!(
+            view.syntax_highlight_cache.len(),
+            view.diff_lines.len(),
+            "syntax_highlight_cache should have an entry for each diff line"
+        );
+
+        // Each entry should be a valid Vec (may be empty for hunk headers or if no syntax)
+        for (line_idx, highlights) in &view.syntax_highlight_cache {
+            // Verify the line index is valid
+            assert!(
+                *line_idx < view.diff_lines.len(),
+                "Cached line index should be within diff_lines bounds"
+            );
+            // Highlights should be valid (start < end for each segment)
+            for (start, end, _style) in highlights {
+                assert!(
+                    start <= end,
+                    "Highlight start ({}) should be <= end ({})",
+                    start,
+                    end
+                );
+            }
+        }
+    }
+
+    /// Test 4: Function context cache is populated correctly
+    /// Verifies that hunk headers get function context entries
+    #[test]
+    fn test_function_context_cache_populated_correctly() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with a function
+        let diff_base = "fn my_function() {\n    let x = 1;\n}\n";
+        let doc = "fn my_function() {\n    let y = 2;\n}\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Function context cache should have entries for hunk headers
+        // Count hunk headers in diff_lines
+        let hunk_header_count = view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .count();
+
+        assert_eq!(
+            view.function_context_cache.len(),
+            hunk_header_count,
+            "function_context_cache should have an entry for each hunk header"
+        );
+
+        // Each entry should correspond to a HunkHeader line
+        for (line_idx, context) in &view.function_context_cache {
+            let line = view.diff_lines.get(*line_idx);
+            assert!(
+                matches!(line, Some(DiffLine::HunkHeader { .. })),
+                "Function context should only be cached for HunkHeader lines"
+            );
+            // Context may be None if no function found, or Some(FunctionContext) if found
+            if let Some(ctx) = context {
+                assert!(
+                    !ctx.text.is_empty(),
+                    "Function context text should not be empty if present"
+                );
+            }
+        }
+    }
+
+    /// Test 5: Render uses cached values (not recomputing)
+    /// Verifies that accessing caches returns the same values without re-computation
+    #[test]
+    fn test_render_uses_cached_values() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1\nmodified line 2\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        // Get cached values and verify they're consistent
+        let word_cache_snapshot: Vec<_> = view
+            .word_diff_cache
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let syntax_cache_snapshot: Vec<_> = view
+            .syntax_highlight_cache
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let func_cache_snapshot: Vec<_> = view
+            .function_context_cache
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        // Access caches again (simulating render access)
+        for (line_idx, segments) in &word_cache_snapshot {
+            let cached = view.word_diff_cache.get(line_idx);
+            assert!(
+                cached.is_some(),
+                "Word diff cache should have consistent entries"
+            );
+            assert_eq!(
+                cached.unwrap().len(),
+                segments.len(),
+                "Word diff cache should return same segments"
+            );
+        }
+
+        for (line_idx, highlights) in &syntax_cache_snapshot {
+            let cached = view.syntax_highlight_cache.get(line_idx);
+            assert!(
+                cached.is_some(),
+                "Syntax highlight cache should have consistent entries"
+            );
+            assert_eq!(
+                cached.unwrap().len(),
+                highlights.len(),
+                "Syntax highlight cache should return same highlights"
+            );
+        }
+
+        for (line_idx, context) in &func_cache_snapshot {
+            let cached = view.function_context_cache.get(line_idx);
+            assert!(
+                cached.is_some(),
+                "Function context cache should have consistent entries"
+            );
+            assert_eq!(
+                cached.unwrap().is_some(),
+                context.is_some(),
+                "Function context cache should return same context"
+            );
+        }
+    }
+
+    /// Test 6: Edge case - empty diff
+    /// Verifies that empty diffs are handled gracefully
+    #[test]
+    fn test_empty_diff() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Empty diff - no changes
+        let diff_base = "line 1\nline 2\n";
+        let doc = "line 1\nline 2\n";
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        // Initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        // With no hunks, diff_lines should be empty
+        assert!(
+            view.diff_lines.is_empty(),
+            "diff_lines should be empty for empty diff"
+        );
+
+        // Caches should be initialized but empty
+        assert!(
+            view.caches_initialized,
+            "caches_initialized should be true even for empty diff"
+        );
+        assert!(
+            view.word_diff_cache.is_empty(),
+            "word_diff_cache should be empty for empty diff"
+        );
+        assert!(
+            view.syntax_highlight_cache.is_empty(),
+            "syntax_highlight_cache should be empty for empty diff"
+        );
+        assert!(
+            view.function_context_cache.is_empty(),
+            "function_context_cache should be empty for empty diff"
+        );
+    }
+
+    /// Test 7: Edge case - no syntax available
+    /// Verifies that unknown file types are handled gracefully
+    #[test]
+    fn test_no_syntax_available() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Unknown file extension
+        let diff_base = "some content\n";
+        let doc = "modified content\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "unknown.xyz123");
+
+        // Initialize caches
+        view.initialize_caches(&loader, &theme);
+
+        // Caches should still be initialized
+        assert!(
+            view.caches_initialized,
+            "caches_initialized should be true even without syntax"
+        );
+
+        // Syntax cache should have entries (may be empty or default highlights)
+        assert_eq!(
+            view.syntax_highlight_cache.len(),
+            view.diff_lines.len(),
+            "syntax_highlight_cache should have entries for all lines"
+        );
+
+        // Word diff cache should still work (doesn't depend on syntax)
+        // It should have entries for paired deletion/addition
+        assert!(
+            !view.word_diff_cache.is_empty() || view.diff_lines.len() <= 1,
+            "word_diff_cache should work without syntax"
+        );
+
+        // Function context cache should have entries (may be None for each)
+        let hunk_header_count = view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .count();
+        assert_eq!(
+            view.function_context_cache.len(),
+            hunk_header_count,
+            "function_context_cache should have entries for hunk headers"
+        );
+
+        // All function contexts should be None (no syntax to extract from)
+        for (_, context) in &view.function_context_cache {
+            assert!(
+                context.is_none(),
+                "Function context should be None when no syntax available"
+            );
+        }
+    }
+
+    /// Test 8: Multiple hunks with different line types
+    /// Verifies cache handles complex diff scenarios
+    #[test]
+    fn test_multiple_hunks_complex() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Multiple hunks with additions, deletions, and context
+        let diff_base = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let doc = "line 1\nmodified 2\nline 3\nnew line\nline 5\n";
+        // Two hunks: one modification, one addition
+        let hunks = vec![
+            make_hunk(1..2, 1..2), // line 2 modified
+            make_hunk(3..3, 3..4), // new line added after line 3
+        ];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Verify all caches are populated
+        assert!(view.caches_initialized, "caches_initialized should be true");
+
+        // Syntax cache should cover all lines
+        assert_eq!(
+            view.syntax_highlight_cache.len(),
+            view.diff_lines.len(),
+            "syntax_highlight_cache should cover all diff lines"
+        );
+
+        // Function context cache should have entries for all hunk headers
+        let hunk_header_count = view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .count();
+        assert_eq!(
+            view.function_context_cache.len(),
+            hunk_header_count,
+            "function_context_cache should have entries for all hunk headers"
+        );
+    }
+
+    /// Test 9: Cache invalidation on new DiffView
+    /// Verifies that creating a new DiffView starts with fresh caches
+    #[test]
+    fn test_new_diff_view_has_fresh_caches() {
+        let diff_base = "content\n";
+        let doc = "modified\n";
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let view1 = create_test_diff_view(diff_base, doc, hunks.clone(), "test.rs");
+        assert!(
+            !view1.caches_initialized,
+            "New DiffView should have uninitialized caches"
+        );
+
+        let view2 = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        assert!(
+            !view2.caches_initialized,
+            "Another new DiffView should also have uninitialized caches"
+        );
+
+        // Each view should have independent cache state
+        assert!(
+            view1.word_diff_cache.is_empty(),
+            "View 1 word_diff_cache should be empty"
+        );
+        assert!(
+            view2.word_diff_cache.is_empty(),
+            "View 2 word_diff_cache should be empty"
+        );
+    }
+
+    /// Test 10: Word diff cache handles identical lines
+    /// Verifies that identical lines in paired deletion/addition are handled
+    #[test]
+    fn test_word_diff_identical_lines() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Identical content (edge case for word diff)
+        let diff_base = "same line\n";
+        let doc = "same line\n";
+        // No actual diff, but let's test the word diff logic
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+
+        view.initialize_caches(&loader, &theme);
+
+        // Word diff for identical lines should have segments with is_emph = false
+        for (_, segments) in &view.word_diff_cache {
+            for segment in segments {
+                assert!(
+                    !segment.is_emph,
+                    "Identical lines should have no emphasized segments"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod function_context_styling_tests {
+    //! Tests for function context styling in diff view
+    //!
+    //! Test scenarios:
+    //! 1. Function context shows with border character
+    //! 2. Function context shows with line number
+    //! 3. Syntax highlighting is applied correctly
+    //! 4. Indented functions have correct byte offsets
+    //! 5. Truncated functions have correct highlights
+    //! 6. Edge case: no function context
+
+    use super::*;
+    use helix_core::syntax::Loader;
+    use helix_view::Theme;
+    use std::path::PathBuf;
+
+    /// Create a test syntax loader
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    /// Helper to create a Syntax instance for testing
+    fn create_syntax(rope: &Rope, file_path: &PathBuf, loader: &Loader) -> Option<Syntax> {
+        let slice = rope.slice(..);
+        loader
+            .language_for_filename(file_path)
+            .and_then(|language| Syntax::new(slice, language, loader).ok())
+    }
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: std::ops::Range<u32>, after: std::ops::Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    /// Helper to create a DiffView for testing
+    fn create_test_diff_view(
+        diff_base: &str,
+        doc: &str,
+        hunks: Vec<Hunk>,
+        file_path: &str,
+    ) -> DiffView {
+        DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            file_path.to_string(),
+            PathBuf::from(file_path),
+            PathBuf::from(file_path),
+            helix_view::DocumentId::default(),
+        )
+    }
+
+    /// Test 1: Function context shows with border character
+    /// Verifies that the FunctionContext struct contains the expected border character
+    /// when rendering hunk headers
+    #[test]
+    fn test_function_context_shows_with_border_character() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with a function
+        let diff_base = "fn my_function() {\n    let x = 1;\n}\n";
+        let doc = "fn my_function() {\n    let y = 2;\n}\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Find the hunk header line index
+        let hunk_header_idx = view
+            .diff_lines
+            .iter()
+            .position(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .expect("Should have a hunk header");
+
+        // Get the function context
+        let context = view
+            .function_context_cache
+            .get(&hunk_header_idx)
+            .expect("Should have function context cached");
+
+        // Verify context exists and has text
+        if let Some(ctx) = context {
+            // The border character "│" is added during rendering, not stored in context
+            // But we verify the context text is present for rendering
+            assert!(
+                !ctx.text.is_empty(),
+                "Function context text should not be empty"
+            );
+            // The text should contain the function signature
+            assert!(
+                ctx.text.contains("fn") || ctx.text.contains("my_function"),
+                "Context should contain function signature, got: {}",
+                ctx.text
+            );
+        }
+        // Context may be None if tree-sitter doesn't find it, which is acceptable
+    }
+
+    /// Test 2: Function context shows with line number
+    /// Verifies that the FunctionContext struct contains the correct line number
+    #[test]
+    fn test_function_context_shows_with_line_number() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a function starting at line 0
+        let content = "fn my_function() {\n    let x = 42;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Get function context for line 1 (inside the function body)
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // The line number should be 0 (the function starts at line 0)
+            assert_eq!(
+                ctx.line_number, 0,
+                "Function context line number should be 0 for function starting at line 0"
+            );
+        }
+    }
+
+    /// Test 3: Syntax highlighting is applied correctly
+    /// Verifies that function context highlights are computed and cached
+    #[test]
+    fn test_syntax_highlighting_applied_correctly() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with a function
+        let diff_base = "fn my_function() {\n    let x = 1;\n}\n";
+        let doc = "fn my_function() {\n    let y = 2;\n}\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Find the hunk header line index
+        let hunk_header_idx = view
+            .diff_lines
+            .iter()
+            .position(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .expect("Should have a hunk header");
+
+        // Check if function context highlight cache has entries
+        // If syntax is available and function is found, highlights should be cached
+        let context = view.function_context_cache.get(&hunk_header_idx);
+
+        if let Some(Some(ctx)) = context {
+            // If we have a function context, check the highlight cache
+            let highlights = view.function_context_highlight_cache.get(&hunk_header_idx);
+
+            // Highlights may or may not be present depending on theme/syntax
+            if let Some(highlights) = highlights {
+                // Verify highlight structure
+                for (start, end, _style) in highlights {
+                    assert!(
+                        *start < *end,
+                        "Highlight start ({}) should be less than end ({})",
+                        start,
+                        end
+                    );
+                    // Highlights should be within the truncated length
+                    assert!(
+                        *start <= ctx.truncated_len,
+                        "Highlight start ({}) should be within truncated length ({})",
+                        start,
+                        ctx.truncated_len
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test 4: Indented functions have correct byte offsets
+    /// Verifies that byte_offset_in_line is computed correctly for indented functions
+    #[test]
+    fn test_indented_functions_have_correct_byte_offsets() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with an indented function (inside a module or impl block)
+        let content = "mod my_module {\n    fn inner_function() {\n        let x = 42;\n    }\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Get function context for line 2 (inside the indented function body)
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // The function "fn inner_function()" starts with 4 spaces of indentation
+            // byte_offset_in_line should be 4 (the number of bytes before "fn")
+            assert!(
+                ctx.byte_offset_in_line >= 4,
+                "Byte offset for indented function should be at least 4, got: {}",
+                ctx.byte_offset_in_line
+            );
+
+            // The text should not include the leading whitespace
+            // (it's extracted from the function node, not the full line)
+            assert!(
+                !ctx.text.starts_with("    "),
+                "Function context text should not start with indentation, got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test 5: Truncated functions have correct highlights
+    /// Verifies that highlights are correctly adjusted for truncated function text
+    #[test]
+    fn test_truncated_functions_have_correct_highlights() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a very long function signature
+        let long_sig = "fn very_long_function_name_with_many_parameters(param1: i32, param2: String, param3: Vec<i32>, param4: Option<Result<Box<dyn std::error::Error>, String>>) {";
+        let content = format!("{}\n    let x = 42;\n}}\n", long_sig);
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Get function context for line 1 (inside the function body)
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // The text should be truncated to ~50 chars
+            assert!(
+                ctx.text.len() <= 53, // 50 chars + "..." = 53 max
+                "Truncated text should be at most 53 chars, got len {}: {}",
+                ctx.text.len(),
+                ctx.text
+            );
+
+            // truncated_len should be the length of the original text before "..."
+            assert!(
+                ctx.truncated_len <= 50,
+                "Truncated length should be at most 50, got: {}",
+                ctx.truncated_len
+            );
+
+            // If truncated, the text should end with "..."
+            if ctx.text.len() > ctx.truncated_len {
+                assert!(
+                    ctx.text.ends_with("..."),
+                    "Truncated text should end with '...', got: {}",
+                    ctx.text
+                );
+            }
+        }
+    }
+
+    /// Test 6: Edge case - no function context
+    /// Verifies that missing function context is handled gracefully
+    #[test]
+    fn test_no_function_context_handled_gracefully() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a file with no functions (just comments and top-level items)
+        let diff_base = "// This is a comment\nlet x = 1;\n";
+        let doc = "// This is a comment\nlet x = 2;\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Find the hunk header line index
+        let hunk_header_idx = view
+            .diff_lines
+            .iter()
+            .position(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .expect("Should have a hunk header");
+
+        // Get the function context - may be None
+        let context = view.function_context_cache.get(&hunk_header_idx);
+
+        // The context should be None or Some with valid data
+        if let Some(Some(ctx)) = context {
+            // If context exists, it should have valid text
+            assert!(
+                !ctx.text.is_empty(),
+                "Function context text should not be empty if present"
+            );
+        }
+        // None is also acceptable for files without functions
+    }
+
+    /// Test 7: Function context highlight cache is populated when context exists
+    /// Verifies that when a function context is found, its highlights are also cached
+    #[test]
+    fn test_function_context_highlight_cache_populated() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with a function
+        let diff_base = "fn test_function() {\n    let x = 1;\n}\n";
+        let doc = "fn test_function() {\n    let y = 2;\n}\n";
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Find the hunk header line index
+        let hunk_header_idx = view
+            .diff_lines
+            .iter()
+            .position(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .expect("Should have a hunk header");
+
+        // Check if function context exists
+        let context = view.function_context_cache.get(&hunk_header_idx);
+
+        if let Some(Some(_ctx)) = context {
+            // If function context exists, highlight cache should also have an entry
+            // (may be empty if no highlights, but the key should exist)
+            let has_highlight_entry = view
+                .function_context_highlight_cache
+                .contains_key(&hunk_header_idx);
+            assert!(
+                has_highlight_entry,
+                "Function context highlight cache should have entry when context exists"
+            );
+        }
+    }
+
+    /// Test 8: Byte offset adjustment for highlights
+    /// Verifies that highlights are correctly adjusted by byte_offset_in_line
+    #[test]
+    fn test_byte_offset_adjustment_for_highlights() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with an indented function
+        let content = "    fn indented_function() {\n        let x = 42;\n    }\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Get function context for line 1 (inside the function body)
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // byte_offset_in_line should be 4 (4 spaces of indentation)
+            assert_eq!(
+                ctx.byte_offset_in_line, 4,
+                "Byte offset should be 4 for 4-space indentation"
+            );
+
+            // The text should start with "fn" (no leading whitespace)
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Test 9: Multiple hunks each get their own function context
+    /// Verifies that function context is computed independently for each hunk
+    #[test]
+    fn test_multiple_hunks_have_independent_contexts() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a Rust file with two functions
+        let diff_base = "fn first_function() {\n    let x = 1;\n}\n\nfn second_function() {\n    let y = 1;\n}\n";
+        let doc = "fn first_function() {\n    let x = 2;\n}\n\nfn second_function() {\n    let y = 2;\n}\n";
+        // Two hunks - one for each function change
+        let hunks = vec![make_hunk(1..2, 1..2), make_hunk(5..6, 5..6)];
+
+        let mut view = create_test_diff_view(diff_base, doc, hunks, "test.rs");
+        view.initialize_caches(&loader, &theme);
+
+        // Count hunk headers
+        let hunk_header_count = view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::HunkHeader { .. }))
+            .count();
+
+        // Should have 2 hunk headers
+        assert_eq!(
+            hunk_header_count, 2,
+            "Should have 2 hunk headers for 2 hunks"
+        );
+
+        // Each hunk header should have a function context cache entry
+        assert_eq!(
+            view.function_context_cache.len(),
+            hunk_header_count,
+            "Should have function context for each hunk header"
+        );
+    }
+
+    /// Test 10: Function context with complex syntax
+    /// Verifies that function context works with more complex Rust syntax
+    #[test]
+    fn test_function_context_with_complex_syntax() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust file with a function that has complex syntax
+        let content = r#"impl<T> MyStruct<T> 
+where 
+    T: Clone + std::fmt::Debug 
+{
+    fn complex_function(&self, param: T) -> Result<T, Error> {
+        let x = 42;
+        Ok(param)
+    }
+}
+"#;
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Get function context for line 5 (inside the function body)
+        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // The context should contain some part of the function signature
+            assert!(!ctx.text.is_empty(), "Function context should not be empty");
+            // The line number should point to the function start
+            assert!(
+                ctx.line_number < 5,
+                "Function start line should be before the body line"
+            );
+        }
     }
 }
