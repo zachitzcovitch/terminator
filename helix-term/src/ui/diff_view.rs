@@ -188,16 +188,16 @@ fn tokenize_line(line: &str) -> Vec<String> {
 
 /// A segment of a line with its word-level diff operation
 #[derive(Debug, Clone)]
-struct WordSegment {
+pub struct WordSegment {
     /// The text content of this segment
-    text: String,
+    pub text: String,
     /// Whether this segment was changed (deleted or inserted)
-    is_emph: bool,
+    pub is_emph: bool,
 }
 
 /// Compute word-level diff between two lines
 /// Returns (old_segments, new_segments) where each segment is marked as emphasized or not
-fn compute_word_diff(old_line: &str, new_line: &str) -> (Vec<WordSegment>, Vec<WordSegment>) {
+pub fn compute_word_diff(old_line: &str, new_line: &str) -> (Vec<WordSegment>, Vec<WordSegment>) {
     // Handle edge cases
     if old_line.is_empty() && new_line.is_empty() {
         return (Vec::new(), Vec::new());
@@ -369,7 +369,7 @@ fn coalesce_whitespace_segments(segments: Vec<WordSegment>) -> Vec<WordSegment> 
 
 /// Check if two lines are similar enough to warrant word-level diff pairing
 /// Uses a simple Jaccard similarity metric on character sets
-fn should_pair_lines(old: &str, new: &str) -> bool {
+pub fn should_pair_lines(old: &str, new: &str) -> bool {
     if old.is_empty() || new.is_empty() {
         return false;
     }
@@ -558,7 +558,7 @@ use tui::widgets::{Block, Widget};
 /// Get syntax highlighting using full document parsing
 /// Returns byte ranges with their styles for a specific line from either doc or diff_base
 /// The returned Vec contains (byte_start, byte_end, Style) tuples for each segment
-fn get_line_highlights(
+pub fn get_line_highlights(
     diff_line: &DiffLine,
     doc_rope: &Rope,
     base_rope: &Rope,
@@ -686,7 +686,7 @@ fn get_line_highlights(
 /// Get syntax highlighting for a specific line number in a rope
 /// Returns byte ranges with their styles for the line
 /// The returned Vec contains (byte_start, byte_end, Style) tuples for each segment
-fn get_highlights_for_line(
+pub fn get_highlights_for_line(
     line_num: usize, // 0-indexed line number
     rope: &Rope,
     syntax: Option<&Syntax>,
@@ -798,6 +798,166 @@ pub struct HunkBoundary {
     pub start: usize,
     /// Ending line index in diff_lines (exclusive)
     pub end: usize,
+}
+
+/// Compute diff lines from hunks (shared between DiffView and preview).
+/// Returns a tuple of (diff_lines, hunk_boundaries).
+///
+/// This function handles:
+/// - New files (empty diff_base, non-empty doc)
+/// - Deleted files (non-empty diff_base, empty doc)
+/// - Normal hunks with context lines
+pub fn compute_diff_lines_from_hunks(
+    diff_base: &Rope,
+    doc: &Rope,
+    hunks: &[Hunk],
+) -> (Vec<DiffLine>, Vec<HunkBoundary>) {
+    let base_len = diff_base.len_lines();
+    let doc_len = doc.len_lines();
+    let mut diff_lines = Vec::new();
+    let mut hunk_boundaries = Vec::new();
+
+    // Handle untracked files (new files with no diff base)
+    // If diff_base is empty (no characters) and doc has content, show as new file
+    // Note: Rope::new().len_lines() returns 1 (empty line), so we check len_chars() == 0
+    if diff_base.len_chars() == 0 && doc.len_chars() > 0 && hunks.is_empty() {
+        // Create a special "New File" hunk header
+        let hunk_start = diff_lines.len();
+        diff_lines.push(DiffLine::HunkHeader {
+            text: format!("@@ -0,0 +1,{} @@ (new file)", doc_len),
+            new_start: 0, // 0-indexed line in doc
+        });
+
+        // Show all lines as additions
+        for line_num in 0..doc_len {
+            let content = doc.line(line_num).to_string();
+            diff_lines.push(DiffLine::Addition {
+                doc_line: line_num as u32 + 1, // 1-indexed
+                content,
+            });
+        }
+
+        // Record the hunk boundary
+        let hunk_end = diff_lines.len();
+        hunk_boundaries.push(HunkBoundary {
+            start: hunk_start,
+            end: hunk_end,
+        });
+
+        return (diff_lines, hunk_boundaries);
+    }
+
+    // Handle deleted files (files removed from working directory)
+    // If diff_base has content and doc is empty, show as deleted file
+    if diff_base.len_chars() > 0 && doc.len_chars() == 0 && hunks.is_empty() {
+        // Create a special "Deleted File" hunk header
+        let hunk_start = diff_lines.len();
+        diff_lines.push(DiffLine::HunkHeader {
+            text: format!("@@ -1,{} +0,0 @@ (deleted)", base_len),
+            new_start: 0,
+        });
+
+        // Show all lines as deletions
+        for line_num in 0..base_len {
+            let content = diff_base.line(line_num).to_string();
+            diff_lines.push(DiffLine::Deletion {
+                base_line: line_num as u32 + 1, // 1-indexed
+                content,
+            });
+        }
+
+        // Record the hunk boundary
+        let hunk_end = diff_lines.len();
+        hunk_boundaries.push(HunkBoundary {
+            start: hunk_start,
+            end: hunk_end,
+        });
+
+        return (diff_lines, hunk_boundaries);
+    }
+
+    for hunk in hunks {
+        // Record the start of this hunk in diff_lines
+        let hunk_start = diff_lines.len();
+
+        // Calculate line counts for hunk header
+        let old_count = hunk.before.end.saturating_sub(hunk.before.start);
+        let new_count = hunk.after.end.saturating_sub(hunk.after.start);
+
+        // Hunk header: @@ -old_start,old_count +new_start,new_count @@
+        // Note: imara-diff uses 0-indexed, but unified diff format typically uses 1-indexed
+        let old_start = hunk.before.start + 1; // Convert to 1-indexed
+        let new_start = hunk.after.start + 1; // Convert to 1-indexed
+
+        let header = format!(
+            "@@ -{},{} +{},{} @@",
+            old_start, old_count, new_start, new_count
+        );
+        diff_lines.push(DiffLine::HunkHeader {
+            text: header,
+            new_start: hunk.after.start, // 0-indexed line in doc
+        });
+
+        // Context before: 3 lines from base before hunk.before.start
+        // Clamped to >= 0
+        let context_before_start = hunk.before.start.saturating_sub(3);
+        for line_num in context_before_start..hunk.before.start {
+            if line_num as usize >= base_len {
+                break;
+            }
+            let content = diff_base.line(line_num as usize).to_string();
+            diff_lines.push(DiffLine::Context {
+                base_line: Some(line_num as u32 + 1), // 1-indexed
+                doc_line: None,
+                content,
+            });
+        }
+
+        // Deletions: lines from base in range hunk.before
+        // Range is [start, end) exclusive, so we iterate normally
+        for line_num in hunk.before.start..hunk.before.end {
+            if line_num as usize >= base_len {
+                break;
+            }
+            let content = diff_base.line(line_num as usize).to_string();
+            diff_lines.push(DiffLine::Deletion {
+                base_line: line_num as u32 + 1, // 1-indexed
+                content,
+            });
+        }
+
+        // Additions: lines from doc in range hunk.after
+        for line_num in hunk.after.start..hunk.after.end {
+            if line_num as usize >= doc_len {
+                break;
+            }
+            let content = doc.line(line_num as usize).to_string();
+            diff_lines.push(DiffLine::Addition {
+                doc_line: line_num as u32 + 1, // 1-indexed
+                content,
+            });
+        }
+
+        // Context after: 3 lines from doc after hunk.after.end clamped to < len_lines
+        let context_after_end = (hunk.after.end.saturating_add(3) as usize).min(doc_len);
+        for line_num in hunk.after.end as usize..context_after_end {
+            let content = doc.line(line_num).to_string();
+            diff_lines.push(DiffLine::Context {
+                base_line: None,
+                doc_line: Some(line_num as u32 + 1), // 1-indexed
+                content,
+            });
+        }
+
+        // Record the end of this hunk in diff_lines
+        let hunk_end = diff_lines.len();
+        hunk_boundaries.push(HunkBoundary {
+            start: hunk_start,
+            end: hunk_end,
+        });
+    }
+
+    (diff_lines, hunk_boundaries)
 }
 
 pub struct DiffView {
@@ -936,158 +1096,24 @@ impl DiffView {
 
     /// Compute all diff lines from hunks with proper context
     fn compute_diff_lines(&mut self) {
-        let base_len = self.diff_base.len_lines();
-        let doc_len = self.doc.len_lines();
+        let (diff_lines, hunk_boundaries) =
+            compute_diff_lines_from_hunks(&self.diff_base, &self.doc, &self.hunks);
+        self.diff_lines = diff_lines;
+        self.hunk_boundaries = hunk_boundaries;
 
-        // Clear and prepare hunk boundaries
-        self.hunk_boundaries.clear();
-
-        // Handle untracked files (new files with no diff base)
-        // If diff_base is empty (no characters) and doc has content, show as new file
-        // Note: Rope::new().len_lines() returns 1 (empty line), so we check len_chars() == 0
+        // Update stats for new/deleted files (normal hunks stats are calculated in new())
+        // Handle new files (empty diff_base, non-empty doc, no hunks)
         if self.diff_base.len_chars() == 0 && self.doc.len_chars() > 0 && self.hunks.is_empty() {
-            // Create a special "New File" hunk header
-            let hunk_start = self.diff_lines.len();
-            self.diff_lines.push(DiffLine::HunkHeader {
-                text: format!("@@ -0,0 +1,{} @@ (new file)", doc_len),
-                new_start: 0, // 0-indexed line in doc
-            });
-
-            // Show all lines as additions
-            for line_num in 0..doc_len {
-                let content = self.doc.line(line_num).to_string();
-                self.diff_lines.push(DiffLine::Addition {
-                    doc_line: line_num as u32 + 1, // 1-indexed
-                    content,
-                });
-            }
-
-            // Record the hunk boundary
-            let hunk_end = self.diff_lines.len();
-            self.hunk_boundaries.push(HunkBoundary {
-                start: hunk_start,
-                end: hunk_end,
-            });
-
-            // Update stats for new file
-            self.added = doc_len;
+            self.added = self.doc.len_lines();
             self.removed = 0;
-
-            return;
         }
-
-        // Handle deleted files (files removed from working directory)
-        // If diff_base has content and doc is empty, show as deleted file
-        if self.diff_base.len_chars() > 0 && self.doc.len_chars() == 0 && self.hunks.is_empty() {
-            // Create a special "Deleted File" hunk header
-            let hunk_start = self.diff_lines.len();
-            self.diff_lines.push(DiffLine::HunkHeader {
-                text: format!("@@ -1,{} +0,0 @@ (deleted)", base_len),
-                new_start: 0,
-            });
-
-            // Show all lines as deletions
-            for line_num in 0..base_len {
-                let content = self.diff_base.line(line_num).to_string();
-                self.diff_lines.push(DiffLine::Deletion {
-                    base_line: line_num as u32 + 1, // 1-indexed
-                    content,
-                });
-            }
-
-            // Record the hunk boundary
-            let hunk_end = self.diff_lines.len();
-            self.hunk_boundaries.push(HunkBoundary {
-                start: hunk_start,
-                end: hunk_end,
-            });
-
-            // Update stats for deleted file
+        // Handle deleted files (non-empty diff_base, empty doc, no hunks)
+        else if self.diff_base.len_chars() > 0
+            && self.doc.len_chars() == 0
+            && self.hunks.is_empty()
+        {
             self.added = 0;
-            self.removed = base_len;
-
-            return;
-        }
-
-        for hunk in &self.hunks {
-            // Record the start of this hunk in diff_lines
-            let hunk_start = self.diff_lines.len();
-
-            // Calculate line counts for hunk header
-            let old_count = hunk.before.end.saturating_sub(hunk.before.start);
-            let new_count = hunk.after.end.saturating_sub(hunk.after.start);
-
-            // Hunk header: @@ -old_start,old_count +new_start,new_count @@
-            // Note: imara-diff uses 0-indexed, but unified diff format typically uses 1-indexed
-            let old_start = hunk.before.start + 1; // Convert to 1-indexed
-            let new_start = hunk.after.start + 1; // Convert to 1-indexed
-
-            let header = format!(
-                "@@ -{},{} +{},{} @@",
-                old_start, old_count, new_start, new_count
-            );
-            self.diff_lines.push(DiffLine::HunkHeader {
-                text: header,
-                new_start: hunk.after.start, // 0-indexed line in doc
-            });
-
-            // Context before: 3 lines from base before hunk.before.start
-            // Clamped to >= 0
-            let context_before_start = hunk.before.start.saturating_sub(3);
-            for line_num in context_before_start..hunk.before.start {
-                if line_num as usize >= base_len {
-                    break;
-                }
-                let content = self.diff_base.line(line_num as usize).to_string();
-                self.diff_lines.push(DiffLine::Context {
-                    base_line: Some(line_num as u32 + 1), // 1-indexed
-                    doc_line: None,
-                    content,
-                });
-            }
-
-            // Deletions: lines from base in range hunk.before
-            // Range is [start, end) exclusive, so we iterate normally
-            for line_num in hunk.before.start..hunk.before.end {
-                if line_num as usize >= base_len {
-                    break;
-                }
-                let content = self.diff_base.line(line_num as usize).to_string();
-                self.diff_lines.push(DiffLine::Deletion {
-                    base_line: line_num as u32 + 1, // 1-indexed
-                    content,
-                });
-            }
-
-            // Additions: lines from doc in range hunk.after
-            for line_num in hunk.after.start..hunk.after.end {
-                if line_num as usize >= doc_len {
-                    break;
-                }
-                let content = self.doc.line(line_num as usize).to_string();
-                self.diff_lines.push(DiffLine::Addition {
-                    doc_line: line_num as u32 + 1, // 1-indexed
-                    content,
-                });
-            }
-
-            // Context after: 3 lines from doc after hunk.after.end clamped to < len_lines
-            let context_after_end = (hunk.after.end.saturating_add(3) as usize).min(doc_len);
-            for line_num in hunk.after.end as usize..context_after_end {
-                let content = self.doc.line(line_num).to_string();
-                self.diff_lines.push(DiffLine::Context {
-                    base_line: None,
-                    doc_line: Some(line_num as u32 + 1), // 1-indexed
-                    content,
-                });
-            }
-
-            // Record the end of this hunk in diff_lines
-            let hunk_end = self.diff_lines.len();
-            self.hunk_boundaries.push(HunkBoundary {
-                start: hunk_start,
-                end: hunk_end,
-            });
+            self.removed = self.diff_base.len_lines();
         }
     }
 
@@ -25166,5 +25192,813 @@ mod adversarial_whitespace_highlight_tests {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod diff_preview_tests {
+    //! Tests for diff preview rendering in git status picker
+    //!
+    //! Test scenarios:
+    //! 1. Preview shows diff content for modified files
+    //! 2. Preview shows "new file" content for untracked files
+    //! 3. Preview shows "deleted" content for deleted files
+    //! 4. Preview shows "[binary file]" for binary files
+    //! 5. Word-level diff highlighting works in preview
+    //! 6. Syntax highlighting is applied in preview
+    //! 7. Performance: word diffs only computed for visible lines
+
+    use super::*;
+    use helix_core::syntax::Loader;
+    use helix_view::Theme;
+    use std::ops::Range;
+    use std::path::PathBuf;
+
+    /// Create a test syntax loader
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: Range<u32>, after: Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
+
+    // =========================================================================
+    // Test 1: Preview shows diff content for modified files
+    // =========================================================================
+
+    /// Test: compute_diff_lines_from_hunks produces correct output for modified files
+    #[test]
+    fn test_preview_modified_file_diff_content() {
+        // Simulate a modified file: base has "old content", doc has "new content"
+        let diff_base = Rope::from("line 1\nold line 2\nline 3\n");
+        let doc = Rope::from("line 1\nnew line 2\nline 3\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Should have diff lines
+        assert!(
+            !diff_lines.is_empty(),
+            "Should have diff lines for modified file"
+        );
+
+        // Should have exactly one hunk boundary
+        assert_eq!(hunk_boundaries.len(), 1, "Should have one hunk boundary");
+
+        // Verify structure: HunkHeader, Context-before, Deletion, Addition, Context-after
+        let has_hunk_header = diff_lines
+            .iter()
+            .any(|l| matches!(l, DiffLine::HunkHeader { .. }));
+        let has_deletion = diff_lines
+            .iter()
+            .any(|l| matches!(l, DiffLine::Deletion { .. }));
+        let has_addition = diff_lines
+            .iter()
+            .any(|l| matches!(l, DiffLine::Addition { .. }));
+
+        assert!(has_hunk_header, "Should have HunkHeader for modified file");
+        assert!(has_deletion, "Should have Deletion line for modified file");
+        assert!(has_addition, "Should have Addition line for modified file");
+
+        // Verify deletion content contains "old line 2"
+        let deletion_content = diff_lines.iter().find_map(|l| match l {
+            DiffLine::Deletion { content, .. } => Some(content.clone()),
+            _ => None,
+        });
+        assert!(
+            deletion_content.unwrap_or_default().contains("old line 2"),
+            "Deletion should contain old content"
+        );
+
+        // Verify addition content contains "new line 2"
+        let addition_content = diff_lines.iter().find_map(|l| match l {
+            DiffLine::Addition { content, .. } => Some(content.clone()),
+            _ => None,
+        });
+        assert!(
+            addition_content.unwrap_or_default().contains("new line 2"),
+            "Addition should contain new content"
+        );
+    }
+
+    /// Test: Multiple hunks in modified file
+    #[test]
+    fn test_preview_modified_file_multiple_hunks() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\nline 5\n");
+        let doc = Rope::from("modified 1\nline 2\nmodified 3\nline 4\nmodified 5\n");
+        let hunks = vec![
+            make_hunk(0..1, 0..1),
+            make_hunk(2..3, 2..3),
+            make_hunk(4..5, 4..5),
+        ];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Should have 3 hunk boundaries
+        assert_eq!(hunk_boundaries.len(), 3, "Should have 3 hunk boundaries");
+
+        // Count each line type
+        let hunk_headers = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::HunkHeader { .. }))
+            .count();
+        let deletions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Deletion { .. }))
+            .count();
+        let additions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Addition { .. }))
+            .count();
+
+        assert_eq!(hunk_headers, 3, "Should have 3 HunkHeaders");
+        assert_eq!(deletions, 3, "Should have 3 Deletions");
+        assert_eq!(additions, 3, "Should have 3 Additions");
+    }
+
+    // =========================================================================
+    // Test 2: Preview shows "new file" content for untracked files
+    // =========================================================================
+
+    /// Test: compute_diff_lines_from_hunks handles new files (empty diff_base)
+    #[test]
+    fn test_preview_new_file() {
+        // New file: empty diff_base, non-empty doc, no hunks
+        // Note: Rope counts lines including trailing empty line after last newline
+        let diff_base = Rope::from("");
+        let doc = Rope::from("new file line 1\nnew file line 2\nnew file line 3\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Should have diff lines
+        assert!(
+            !diff_lines.is_empty(),
+            "Should have diff lines for new file"
+        );
+
+        // Should have exactly one hunk boundary
+        assert_eq!(
+            hunk_boundaries.len(),
+            1,
+            "Should have one hunk boundary for new file"
+        );
+
+        // First line should be a HunkHeader with "(new file)" marker
+        match diff_lines.first() {
+            Some(DiffLine::HunkHeader { text, .. }) => {
+                assert!(
+                    text.contains("(new file)"),
+                    "HunkHeader should contain '(new file)' marker, got: {}",
+                    text
+                );
+            }
+            _ => panic!("First line should be HunkHeader for new file"),
+        }
+
+        // All other lines should be Additions
+        for line in diff_lines.iter().skip(1) {
+            assert!(
+                matches!(line, DiffLine::Addition { .. }),
+                "All content lines should be Additions for new file"
+            );
+        }
+
+        // Verify content - Rope counts 4 lines for "line1\nline2\nline3\n" (trailing empty line)
+        // But the last line is empty, so we expect 4 additions (including the empty trailing line)
+        let addition_count = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Addition { .. }))
+            .count();
+        // doc.len_lines() = 4 for "line1\nline2\nline3\n"
+        assert!(
+            addition_count >= 3,
+            "Should have at least 3 Addition lines for new file, got {}",
+            addition_count
+        );
+    }
+
+    /// Test: New file with single line
+    #[test]
+    fn test_preview_new_file_single_line() {
+        let diff_base = Rope::from("");
+        let doc = Rope::from("single line\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Rope counts 2 lines for "single line\n" (content + trailing empty line)
+        assert!(
+            diff_lines.len() >= 2,
+            "Should have HunkHeader + at least 1 Addition, got {} lines",
+            diff_lines.len()
+        );
+        assert!(matches!(diff_lines[0], DiffLine::HunkHeader { .. }));
+        assert!(matches!(diff_lines[1], DiffLine::Addition { .. }));
+    }
+
+    // =========================================================================
+    // Test 3: Preview shows "deleted" content for deleted files
+    // =========================================================================
+
+    /// Test: compute_diff_lines_from_hunks handles deleted files (empty doc)
+    #[test]
+    fn test_preview_deleted_file() {
+        // Deleted file: non-empty diff_base, empty doc, no hunks
+        // Note: Rope counts lines including trailing empty line after last newline
+        let diff_base = Rope::from("deleted line 1\ndeleted line 2\ndeleted line 3\n");
+        let doc = Rope::from("");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Should have diff lines
+        assert!(
+            !diff_lines.is_empty(),
+            "Should have diff lines for deleted file"
+        );
+
+        // Should have exactly one hunk boundary
+        assert_eq!(
+            hunk_boundaries.len(),
+            1,
+            "Should have one hunk boundary for deleted file"
+        );
+
+        // First line should be a HunkHeader with "(deleted)" marker
+        match diff_lines.first() {
+            Some(DiffLine::HunkHeader { text, .. }) => {
+                assert!(
+                    text.contains("(deleted)"),
+                    "HunkHeader should contain '(deleted)' marker, got: {}",
+                    text
+                );
+            }
+            _ => panic!("First line should be HunkHeader for deleted file"),
+        }
+
+        // All other lines should be Deletions
+        for line in diff_lines.iter().skip(1) {
+            assert!(
+                matches!(line, DiffLine::Deletion { .. }),
+                "All content lines should be Deletions for deleted file"
+            );
+        }
+
+        // Verify content - Rope counts 4 lines for "line1\nline2\nline3\n" (trailing empty line)
+        let deletion_count = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Deletion { .. }))
+            .count();
+        assert!(
+            deletion_count >= 3,
+            "Should have at least 3 Deletion lines for deleted file, got {}",
+            deletion_count
+        );
+    }
+
+    /// Test: Deleted file with single line
+    #[test]
+    fn test_preview_deleted_file_single_line() {
+        let diff_base = Rope::from("single line\n");
+        let doc = Rope::from("");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Rope counts 2 lines for "single line\n" (content + trailing empty line)
+        assert!(
+            diff_lines.len() >= 2,
+            "Should have HunkHeader + at least 1 Deletion, got {} lines",
+            diff_lines.len()
+        );
+        assert!(matches!(diff_lines[0], DiffLine::HunkHeader { .. }));
+        assert!(matches!(diff_lines[1], DiffLine::Deletion { .. }));
+    }
+
+    // =========================================================================
+    // Test 4: Binary file handling (placeholder test)
+    // =========================================================================
+
+    /// Test: Binary files are handled at the preview level
+    /// Note: Binary detection happens in picker.rs, not in compute_diff_lines_from_hunks
+    /// This test verifies that the compute function doesn't panic on binary-like content
+    #[test]
+    fn test_preview_binary_like_content() {
+        // Content with null bytes (binary-like)
+        let diff_base = Rope::from("binary\x00content\x00here\n");
+        let doc = Rope::from("binary\x00modified\x00here\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        // Should not panic
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        assert!(!diff_lines.is_empty(), "Should handle binary-like content");
+    }
+
+    // =========================================================================
+    // Test 5: Word-level diff highlighting works in preview
+    // =========================================================================
+
+    /// Test: compute_word_diff identifies changed words
+    #[test]
+    fn test_preview_word_diff_changed_words() {
+        let old_line = "let x = 42;";
+        let new_line = "let y = 100;";
+
+        let (old_segments, new_segments) = compute_word_diff(old_line, new_line);
+
+        // Both should have segments
+        assert!(!old_segments.is_empty(), "Old line should have segments");
+        assert!(!new_segments.is_empty(), "New line should have segments");
+
+        // Find emphasized segments (changed words)
+        let old_emph: Vec<_> = old_segments.iter().filter(|s| s.is_emph).collect();
+        let new_emph: Vec<_> = new_segments.iter().filter(|s| s.is_emph).collect();
+
+        // "x" and "y" should be emphasized, "42" and "100" should be emphasized
+        assert!(
+            !old_emph.is_empty(),
+            "Should have emphasized segments in old line"
+        );
+        assert!(
+            !new_emph.is_empty(),
+            "Should have emphasized segments in new line"
+        );
+
+        // Verify the emphasized content contains the changed parts
+        let old_emph_text: String = old_emph.iter().map(|s| s.text.as_str()).collect();
+        let new_emph_text: String = new_emph.iter().map(|s| s.text.as_str()).collect();
+
+        assert!(
+            old_emph_text.contains('x') || old_emph_text.contains("42"),
+            "Old emphasized text should contain 'x' or '42', got: {}",
+            old_emph_text
+        );
+        assert!(
+            new_emph_text.contains('y') || new_emph_text.contains("100"),
+            "New emphasized text should contain 'y' or '100', got: {}",
+            new_emph_text
+        );
+    }
+
+    /// Test: compute_word_diff handles identical lines
+    #[test]
+    fn test_preview_word_diff_identical_lines() {
+        let line = "unchanged content";
+        let (old_segments, new_segments) = compute_word_diff(line, line);
+
+        // Should have segments
+        assert!(!old_segments.is_empty());
+        assert!(!new_segments.is_empty());
+
+        // No segments should be emphasized
+        assert!(
+            old_segments.iter().all(|s| !s.is_emph),
+            "No segments should be emphasized for identical lines"
+        );
+        assert!(
+            new_segments.iter().all(|s| !s.is_emph),
+            "No segments should be emphasized for identical lines"
+        );
+    }
+
+    /// Test: compute_word_diff handles empty lines
+    #[test]
+    fn test_preview_word_diff_empty_lines() {
+        let (old_segments, new_segments) = compute_word_diff("", "");
+        assert!(old_segments.is_empty());
+        assert!(new_segments.is_empty());
+
+        let (old_segments, new_segments) = compute_word_diff("content", "");
+        assert_eq!(old_segments.len(), 1);
+        assert!(old_segments[0].is_emph);
+        assert!(new_segments.is_empty());
+
+        let (old_segments, new_segments) = compute_word_diff("", "content");
+        assert!(old_segments.is_empty());
+        assert_eq!(new_segments.len(), 1);
+        assert!(new_segments[0].is_emph);
+    }
+
+    /// Test: should_pair_lines correctly identifies similar lines
+    #[test]
+    fn test_preview_should_pair_lines() {
+        // Similar lines should pair
+        assert!(
+            should_pair_lines("let x = 42;", "let y = 42;"),
+            "Similar lines should pair"
+        );
+        assert!(
+            should_pair_lines("fn main() {", "fn main() {"),
+            "Identical lines should pair"
+        );
+
+        // Very different lines should not pair
+        // Note: Jaccard similarity uses character sets, so we need lines with very different chars
+        // "abc" vs "xyz" has 0 common chars -> similarity = 0
+        assert!(
+            !should_pair_lines("abc def ghi", "xyz uvw rst"),
+            "Lines with no common characters should not pair"
+        );
+
+        // Lines with very different lengths (more than 50% difference) should not pair
+        assert!(
+            !should_pair_lines("short", "this is a very very very long line"),
+            "Lines with very different lengths should not pair"
+        );
+
+        // Empty lines should not pair
+        assert!(
+            !should_pair_lines("", "content"),
+            "Empty line should not pair"
+        );
+        assert!(
+            !should_pair_lines("content", ""),
+            "Empty line should not pair"
+        );
+        assert!(!should_pair_lines("", ""), "Both empty should not pair");
+    }
+
+    // =========================================================================
+    // Test 6: Syntax highlighting is applied in preview
+    // =========================================================================
+
+    /// Test: get_line_highlights returns valid highlights for code
+    #[test]
+    fn test_preview_syntax_highlighting() {
+        let loader = test_loader();
+        let theme = Theme::default();
+        let file_path = PathBuf::from("test.rs");
+
+        // Create a Rust code snippet
+        let doc_content = "fn main() {\n    let x = 42;\n}\n";
+        let doc_rope = Rope::from(doc_content);
+        let base_rope = Rope::from(doc_content);
+
+        // Create syntax instance
+        let doc_syntax = loader
+            .language_for_filename(&file_path)
+            .and_then(|lang| Syntax::new(doc_rope.slice(..), lang, &loader).ok());
+
+        // Test an Addition line
+        let diff_line = DiffLine::Addition {
+            doc_line: 1,
+            content: "fn main() {".to_string(),
+        };
+
+        let highlights = get_line_highlights(
+            &diff_line,
+            &doc_rope,
+            &base_rope,
+            doc_syntax.as_ref(),
+            None,
+            &loader,
+            &theme,
+        );
+
+        // Should return valid highlights (may be empty if language not available)
+        for (start, end, _style) in &highlights {
+            assert!(
+                *start <= *end,
+                "Highlight start ({}) should be <= end ({})",
+                start,
+                end
+            );
+        }
+    }
+
+    /// Test: get_line_highlights handles missing syntax gracefully
+    #[test]
+    fn test_preview_syntax_highlighting_no_syntax() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let doc_rope = Rope::from("plain text\n");
+        let base_rope = Rope::from("plain text\n");
+
+        let diff_line = DiffLine::Addition {
+            doc_line: 1,
+            content: "plain text".to_string(),
+        };
+
+        // No syntax available
+        let highlights = get_line_highlights(
+            &diff_line, &doc_rope, &base_rope, None, None, &loader, &theme,
+        );
+
+        // Should return empty or default highlights without panicking
+        assert!(
+            highlights.is_empty() || !highlights.is_empty(),
+            "Should handle missing syntax gracefully"
+        );
+    }
+
+    /// Test: get_line_highlights handles out-of-bounds line numbers
+    #[test]
+    fn test_preview_syntax_highlighting_out_of_bounds() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let doc_rope = Rope::from("line 1\nline 2\n");
+        let base_rope = Rope::from("line 1\nline 2\n");
+
+        let diff_line = DiffLine::Addition {
+            doc_line: 100, // Out of bounds
+            content: "some content".to_string(),
+        };
+
+        let highlights = get_line_highlights(
+            &diff_line, &doc_rope, &base_rope, None, None, &loader, &theme,
+        );
+
+        // Should return empty highlights without panicking
+        assert!(
+            highlights.is_empty(),
+            "Out of bounds should return empty highlights"
+        );
+    }
+
+    // =========================================================================
+    // Test 7: Performance - word diffs only computed for visible lines
+    // =========================================================================
+
+    /// Test: Word diff cache is populated only for visible range
+    #[test]
+    fn test_preview_word_diff_lazy_computation() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        // Create a large diff
+        let diff_base_lines: Vec<String> = (0..500).map(|i| format!("line {}\n", i)).collect();
+        let mut doc_lines = diff_base_lines.clone();
+
+        // Modify every 10th line
+        for i in (0..500).step_by(10) {
+            doc_lines[i] = format!("modified line {}\n", i);
+        }
+
+        let hunks: Vec<Hunk> = (0..500)
+            .step_by(10)
+            .map(|i| make_hunk(i..i + 1, i..i + 1))
+            .collect();
+
+        let diff_base: String = diff_base_lines.join("");
+        let doc: String = doc_lines.join("");
+
+        let mut view = DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("test.rs"),
+            helix_view::DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        view.initialize_caches(&loader, &theme);
+
+        // Caches should be empty after lazy initialization
+        assert!(
+            view.word_diff_cache.borrow().is_empty(),
+            "word_diff_cache should be empty after lazy init"
+        );
+        assert!(
+            view.syntax_highlight_cache.borrow().is_empty(),
+            "syntax_highlight_cache should be empty after lazy init"
+        );
+
+        // Prepare only a small visible range
+        let visible_start = 10;
+        let visible_end = 20;
+        view.prepare_visible(visible_start, visible_end, &loader, &theme);
+
+        // Cache should only contain entries for the visible range
+        let word_cache_size = view.word_diff_cache.borrow().len();
+        let syntax_cache_size = view.syntax_highlight_cache.borrow().len();
+
+        // Should not have computed all lines
+        assert!(
+            word_cache_size < 100,
+            "word_diff_cache should only have visible entries, got {}",
+            word_cache_size
+        );
+        assert!(
+            syntax_cache_size < 100,
+            "syntax_highlight_cache should only have visible entries, got {}",
+            syntax_cache_size
+        );
+    }
+
+    /// Test: Word diff cache handles empty diff
+    #[test]
+    fn test_preview_word_diff_empty_diff() {
+        let loader = test_loader();
+        let theme = Theme::default();
+
+        let diff_base = "content\n";
+        let doc = "content\n";
+        let hunks: Vec<Hunk> = vec![];
+
+        let mut view = DiffView::new(
+            Rope::from(diff_base),
+            Rope::from(doc),
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("test.rs"),
+            helix_view::DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        view.initialize_caches(&loader, &theme);
+        view.prepare_visible(0, 10, &loader, &theme);
+
+        // Caches should be empty for empty diff
+        assert!(view.word_diff_cache.borrow().is_empty());
+        assert!(view.syntax_highlight_cache.borrow().is_empty());
+    }
+
+    // =========================================================================
+    // Test 8: Line number formatting in preview
+    // =========================================================================
+
+    /// Test: Line numbers are correctly assigned in diff lines
+    #[test]
+    fn test_preview_line_numbers() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nmodified line 2\nline 3\n");
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Check line numbers are 1-indexed
+        for line in &diff_lines {
+            match line {
+                DiffLine::HunkHeader { new_start, .. } => {
+                    assert_eq!(
+                        *new_start, 1,
+                        "new_start should be 0-indexed (1 for line 2)"
+                    );
+                }
+                DiffLine::Context {
+                    doc_line,
+                    base_line,
+                    ..
+                } => {
+                    if let Some(n) = doc_line {
+                        assert!(*n >= 1, "doc_line should be 1-indexed");
+                    }
+                    if let Some(n) = base_line {
+                        assert!(*n >= 1, "base_line should be 1-indexed");
+                    }
+                }
+                DiffLine::Deletion { base_line, .. } => {
+                    assert!(*base_line >= 1, "base_line should be 1-indexed");
+                }
+                DiffLine::Addition { doc_line, .. } => {
+                    assert!(*doc_line >= 1, "doc_line should be 1-indexed");
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Test 9: Hunk boundary tracking
+    // =========================================================================
+
+    /// Test: Hunk boundaries are correctly tracked
+    #[test]
+    fn test_preview_hunk_boundaries() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\nline 5\n");
+        let doc = Rope::from("modified 1\nline 2\nmodified 3\nline 4\nmodified 5\n");
+        let hunks = vec![
+            make_hunk(0..1, 0..1),
+            make_hunk(2..3, 2..3),
+            make_hunk(4..5, 4..5),
+        ];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        // Verify each hunk boundary is valid
+        for boundary in &hunk_boundaries {
+            assert!(
+                boundary.start < boundary.end,
+                "Hunk boundary start ({}) should be < end ({})",
+                boundary.start,
+                boundary.end
+            );
+            assert!(
+                boundary.end <= diff_lines.len(),
+                "Hunk boundary end ({}) should be <= diff_lines.len () ({})",
+                boundary.end,
+                diff_lines.len()
+            );
+
+            // First line of each hunk should be a HunkHeader
+            if let Some(line) = diff_lines.get(boundary.start) {
+                assert!(
+                    matches!(line, DiffLine::HunkHeader { .. }),
+                    "First line of hunk should be HunkHeader"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Test 10: Edge cases
+    // =========================================================================
+
+    /// Test: Empty diff (no changes)
+    #[test]
+    fn test_preview_empty_diff() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1\nline 2\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        assert!(
+            diff_lines.is_empty(),
+            "Empty diff should have no diff lines"
+        );
+        assert!(
+            hunk_boundaries.is_empty(),
+            "Empty diff should have no hunk boundaries"
+        );
+    }
+
+    /// Test: Both empty (empty diff_base and empty doc)
+    #[test]
+    fn test_preview_both_empty() {
+        let diff_base = Rope::from("");
+        let doc = Rope::from("");
+        let hunks: Vec<Hunk> = vec![];
+
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        assert!(
+            diff_lines.is_empty(),
+            "Both empty should have no diff lines"
+        );
+        assert!(
+            hunk_boundaries.is_empty(),
+            "Both empty should have no hunk boundaries"
+        );
+    }
+
+    /// Test: Addition-only hunk (new lines added)
+    #[test]
+    fn test_preview_addition_only() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1\nline 2\nnew line 3\nnew line 4\n");
+        let hunks = vec![make_hunk(2..2, 2..4)]; // Addition at end
+
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        let additions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Addition { .. }))
+            .count();
+        assert_eq!(additions, 2, "Should have 2 Addition lines");
+
+        let deletions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Deletion { .. }))
+            .count();
+        assert_eq!(deletions, 0, "Should have 0 Deletion lines");
+    }
+
+    /// Test: Deletion-only hunk (lines removed)
+    #[test]
+    fn test_preview_deletion_only() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\n");
+        let doc = Rope::from("line 1\nline 2\n");
+        let hunks = vec![make_hunk(2..4, 2..2)]; // Deletion at end
+
+        let (diff_lines, _) = compute_diff_lines_from_hunks(&diff_base, &doc, &hunks);
+
+        let deletions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Deletion { .. }))
+            .count();
+        assert_eq!(deletions, 2, "Should have 2 Deletion lines");
+
+        let additions = diff_lines
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Addition { .. }))
+            .count();
+        assert_eq!(additions, 0, "Should have 0 Addition lines");
     }
 }

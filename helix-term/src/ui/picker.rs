@@ -7,6 +7,10 @@ use crate::{
     ctrl, key, shift,
     ui::{
         self,
+        diff_view::{
+            compute_diff_lines_from_hunks, compute_word_diff, get_line_highlights, DiffLine,
+            should_pair_lines, WordSegment,
+        },
         document::{render_document, LinePos, TextRenderer},
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
@@ -30,6 +34,7 @@ use tui::widgets::Widget;
 
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::HashMap,
     io::Read,
     path::Path,
@@ -43,6 +48,7 @@ use crate::ui::{Prompt, PromptEvent};
 use helix_core::{
     char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
     text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
+    Rope,
 };
 use helix_view::{
     editor::Action,
@@ -51,6 +57,7 @@ use helix_view::{
     view::ViewPosition,
     Document, DocumentId, Editor,
 };
+use helix_vcs::Hunk;
 
 use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler};
 
@@ -80,6 +87,9 @@ impl From<DocumentId> for PathOrId<'_> {
 
 type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>>>;
 
+/// Callback for custom preview content. Returns a CachedPreview directly.
+type CustomPreviewCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<CachedPreview>>;
+
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
@@ -89,6 +99,22 @@ pub enum CachedPreview {
     Binary,
     LargeFile,
     NotFound,
+    /// Custom text content with optional styling (content, is_diff)
+    /// When is_diff is true, the content will be rendered with diff highlighting
+    CustomText { content: String, is_diff: bool },
+    /// Diff content with full DiffView rendering (syntax highlighting, word-level diff, etc.)
+    Diff {
+        /// Original content (from git HEAD/index)
+        diff_base: helix_core::Rope,
+        /// Current content (working copy)
+        doc: helix_core::Rope,
+        /// Diff hunks
+        hunks: Vec<helix_vcs::Hunk>,
+        /// File path for syntax highlighting
+        file_path: std::path::PathBuf,
+        /// File name for display
+        file_name: String,
+    },
 }
 
 // We don't store this enum in the cache so as to avoid lifetime constraints
@@ -124,6 +150,8 @@ impl Preview<'_, '_> {
                 CachedPreview::Binary => "<Binary file>",
                 CachedPreview::LargeFile => "<File too large to preview>",
                 CachedPreview::NotFound => "<File not found>",
+                CachedPreview::CustomText { .. } => "<No content>",
+                CachedPreview::Diff { .. } => "<No diff>",
             },
         }
     }
@@ -266,6 +294,9 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     read_buffer: Vec<u8>,
     /// Given an item in the picker, return the file path and line number to display.
     file_fn: Option<FileCallback<T>>,
+    /// Custom preview callback that returns CachedPreview directly.
+    /// Takes precedence over file_fn if set.
+    custom_preview_fn: Option<CustomPreviewCallback<T>>,
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
@@ -392,6 +423,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             preview_cache: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
+            custom_preview_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
         }
@@ -421,6 +453,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // assumption: if we have a preview we are matching paths... If this is ever
         // not true this could be a separate builder function
         self.matcher.update_config(Config::DEFAULT.match_paths());
+        self
+    }
+
+    /// Set a custom preview callback that returns CachedPreview directly.
+    /// This takes precedence over with_preview if both are set.
+    /// The callback receives the editor and the current item, and returns
+    /// an Optional CachedPreview. Use CachedPreview::CustomText for diff content.
+    pub fn with_custom_preview(
+        mut self,
+        preview_fn: impl for<'a> Fn(&'a Editor, &'a T) -> Option<CachedPreview> + 'static,
+    ) -> Self {
+        self.custom_preview_fn = Some(Box::new(preview_fn));
+        self.show_preview = true;
         self
     }
 
@@ -587,6 +632,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         editor: &'editor Editor,
     ) -> Option<(Preview<'picker, 'editor>, Option<(usize, usize)>)> {
         let current = self.selection()?;
+
+        // Check for custom preview callback first
+        if let Some(custom_fn) = &self.custom_preview_fn {
+            if let Some(preview) = custom_fn(editor, current) {
+                // Store in cache temporarily for rendering
+                // Use a special key that won't conflict with real paths
+                let cache_key: Arc<Path> = Arc::from(Path::new("__custom_preview__"));
+                self.preview_cache.insert(cache_key.clone(), preview);
+                return Some((Preview::Cached(&self.preview_cache[&cache_key]), None));
+            }
+        }
+
         let (path_or_id, range) = (self.file_fn.as_ref()?)(editor, current)?;
 
         match path_or_id {
@@ -754,7 +811,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let mut indices = Vec::new();
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;
-        if self.file_fn.is_some() {
+        if self.file_fn.is_some() || self.custom_preview_fn.is_some() {
             matcher.config.set_match_paths()
         }
 
@@ -880,6 +937,538 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
     }
 
+    /// Render custom text content in the preview pane.
+    /// If is_diff is true, applies diff-specific styling (green for +, red for -).
+    fn render_custom_text_preview_static(
+        inner: &Rect,
+        surface: &mut Surface,
+        cx: &mut Context,
+        content: &str,
+        is_diff: bool,
+    ) {
+        let text = cx.editor.theme.get("ui.text");
+        let diff_plus = cx.editor.theme.get("diff.plus");
+        let diff_minus = cx.editor.theme.get("diff.minus");
+        let diff_delta = cx.editor.theme.get("diff.delta");
+
+        // Render each line with appropriate styling
+        for (i, line) in content.lines().take(inner.height as usize).enumerate() {
+            let (styled_line, style) = if is_diff {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('+') {
+                    // Addition line - green
+                    (line, diff_plus)
+                } else if trimmed.starts_with('-') {
+                    // Deletion line - red
+                    (line, diff_minus)
+                } else if trimmed.starts_with('@') {
+                    // Hunk header - cyan/blue
+                    (line, diff_delta)
+                } else {
+                    // Context or other - default text
+                    (line, text)
+                }
+            } else {
+                (line, text)
+            };
+
+            surface.set_stringn(
+                inner.x,
+                inner.y + i as u16,
+                styled_line,
+                inner.width as usize,
+                style,
+            );
+        }
+    }
+
+    /// Render diff content with syntax highlighting and word-level diff.
+    /// This is a simplified version of DiffView's rendering for the preview pane.
+    fn render_diff_preview(
+        inner: &Rect,
+        surface: &mut Surface,
+        cx: &mut Context,
+        diff_base: &Rope,
+        doc: &Rope,
+        hunks: &[Hunk],
+        file_path: &Path,
+        file_name: &str,
+    ) {
+        use helix_core::syntax::Syntax;
+        use helix_core::unicode::width::UnicodeWidthStr;
+        use helix_view::graphics::{Modifier, UnderlineStyle};
+
+        // Get styles from theme
+        let style_plus = cx.editor.theme.get("diff.plus");
+        let style_minus = cx.editor.theme.get("diff.minus");
+        let style_delta = cx.editor.theme.get("diff.delta");
+        let style_header = cx.editor.theme.get("ui.popup.info");
+
+        // Add background colors if theme doesn't provide them
+        let style_plus = if style_plus.bg.is_none() {
+            style_plus.patch(helix_view::graphics::Style {
+                bg: Some(helix_view::graphics::Color::Rgb(40, 80, 40)),
+                ..Default::default()
+            })
+        } else {
+            style_plus
+        };
+
+        let style_minus = if style_minus.bg.is_none() {
+            style_minus.patch(helix_view::graphics::Style {
+                bg: Some(helix_view::graphics::Color::Rgb(80, 40, 40)),
+                ..Default::default()
+            })
+        } else {
+            style_minus
+        };
+
+        // Context line style
+        let style_context = {
+            let theme_style = cx.editor.theme.get("diff.delta");
+            if theme_style.fg.is_none() && theme_style.bg.is_none() {
+                helix_view::graphics::Style {
+                    fg: Some(helix_view::graphics::Color::Rgb(108, 108, 108)),
+                    ..Default::default()
+                }
+            } else {
+                theme_style
+            }
+        };
+
+        // Word emphasis styles
+        let style_minus_emph = style_minus.patch(helix_view::graphics::Style {
+            bg: Some(helix_view::graphics::Color::Rgb(140, 40, 40)),
+            underline_style: Some(UnderlineStyle::Line),
+            add_modifier: Modifier::BOLD | style_minus.add_modifier,
+            ..Default::default()
+        });
+        let style_plus_emph = style_plus.patch(helix_view::graphics::Style {
+            bg: Some(helix_view::graphics::Color::Rgb(40, 140, 40)),
+            underline_style: Some(UnderlineStyle::Line),
+            add_modifier: Modifier::BOLD | style_plus.add_modifier,
+            ..Default::default()
+        });
+
+        // Get syntax loader and theme
+        let loader = cx.editor.syn_loader.load();
+        let theme = &cx.editor.theme;
+
+        // Initialize syntax for both doc and diff_base
+        let doc_syntax: Option<Arc<Syntax>> = {
+            let doc_slice = doc.slice(..);
+            loader.language_for_filename(file_path).and_then(|lang| {
+                Syntax::new(doc_slice, lang, &loader).ok().map(Arc::new)
+            })
+        };
+
+        let base_syntax: Option<Arc<Syntax>> = {
+            let base_slice = diff_base.slice(..);
+            loader.language_for_filename(file_path).and_then(|lang| {
+                Syntax::new(base_slice, lang, &loader).ok().map(Arc::new)
+            })
+        };
+
+        let doc_syntax_ref = doc_syntax.as_ref().map(|arc| arc.as_ref());
+        let base_syntax_ref = base_syntax.as_ref().map(|arc| arc.as_ref());
+
+        // Compute diff lines using shared function
+        let (diff_lines, hunk_boundaries) = compute_diff_lines_from_hunks(diff_base, doc, hunks);
+
+        // Caches for word diffs and syntax highlights
+        let word_diff_cache: RefCell<HashMap<usize, Vec<WordSegment>>> = RefCell::new(HashMap::new());
+        let syntax_highlight_cache: RefCell<HashMap<usize, Vec<(usize, usize, helix_view::graphics::Style)>>> = 
+            RefCell::new(HashMap::new());
+
+        // Calculate visible range (account for title bar taking 1 line)
+        let visible_start = 0;
+        let visible_end = (inner.height as usize).saturating_sub(1).min(diff_lines.len());
+
+        // Prepare word diffs for VISIBLE deletion/addition pairs ONLY
+        // Use hunk boundaries for correct pairing (deletions and additions are paired within the same hunk)
+        {
+            let mut word_cache = word_diff_cache.borrow_mut();
+
+            for hunk in &hunk_boundaries {
+                // Only process hunks that overlap with the visible range
+                if hunk.end < visible_start || hunk.start > visible_end {
+                    continue;
+                }
+
+                // Collect all deletion and addition line indices within this hunk
+                let mut deletion_indices: Vec<usize> = Vec::new();
+                let mut addition_indices: Vec<usize> = Vec::new();
+
+                for line_index in hunk.start..hunk.end {
+                    match diff_lines.get(line_index) {
+                        Some(DiffLine::Deletion { .. }) => deletion_indices.push(line_index),
+                        Some(DiffLine::Addition { .. }) => addition_indices.push(line_index),
+                        _ => {}
+                    }
+                }
+
+                // Pair deletions with additions by index within this hunk
+                for (del_idx, add_idx) in deletion_indices.iter().zip(addition_indices.iter()) {
+                    // Only process if at least one of the lines is in the visible range
+                    if *del_idx < visible_start && *add_idx < visible_start {
+                        continue;
+                    }
+                    if *del_idx > visible_end && *add_idx > visible_end {
+                        continue;
+                    }
+
+                    if let (
+                        Some(DiffLine::Deletion { content: old_content, .. }),
+                        Some(DiffLine::Addition { content: new_content, .. }),
+                    ) = (diff_lines.get(*del_idx), diff_lines.get(*add_idx))
+                    {
+                        if should_pair_lines(old_content, new_content) {
+                            let (old_segments, new_segments) = compute_word_diff(old_content, new_content);
+                            word_cache.insert(*del_idx, old_segments);
+                            word_cache.insert(*add_idx, new_segments);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prepare syntax highlights for visible lines only
+        {
+            let mut highlight_cache = syntax_highlight_cache.borrow_mut();
+            for line_index in visible_start..visible_end {
+                if let Some(diff_line) = diff_lines.get(line_index) {
+                    let highlights = get_line_highlights(
+                        diff_line,
+                        doc,
+                        diff_base,
+                        doc_syntax_ref,
+                        base_syntax_ref,
+                        &loader,
+                        theme,
+                    );
+                    highlight_cache.insert(line_index, highlights);
+                }
+            }
+        }
+
+        // Calculate stats for title
+        let mut added: usize = 0;
+        let mut removed: usize = 0;
+        for hunk in hunks {
+            added += (hunk.after.end.saturating_sub(hunk.after.start)) as usize;
+            removed += (hunk.before.end.saturating_sub(hunk.before.start)) as usize;
+        }
+
+        // Render title bar
+        let title = format!(" {}: +{} -{} ", file_name, added, removed);
+        surface.set_stringn(inner.x, inner.y, title, inner.width as usize, style_header);
+
+        // Render diff lines
+        let mut y = inner.y + 1; // Start after title
+        let max_y = inner.y + inner.height;
+
+        for (line_index, diff_line) in diff_lines.iter().enumerate() {
+            if y >= max_y {
+                break;
+            }
+
+            // Get syntax highlights for this line
+            let line_highlights = syntax_highlight_cache
+                .borrow()
+                .get(&line_index)
+                .cloned()
+                .unwrap_or_default();
+
+            let spans = match diff_line {
+                DiffLine::HunkHeader { text, .. } => {
+                    // Simplified hunk header - just show the text
+                    vec![Span::styled(text.clone(), style_delta)]
+                }
+                DiffLine::Context { base_line, doc_line, content } => {
+                    let base_num = base_line
+                        .map(|n| format!("{:>4}", n))
+                        .unwrap_or_else(|| "    ".to_string());
+                    let doc_num = doc_line
+                        .map(|n| format!("{:>4}", n))
+                        .unwrap_or_else(|| "    ".to_string());
+
+                    let content_str = content.as_str();
+                    let mut content_spans = Vec::new();
+
+                    if line_highlights.is_empty() {
+                        content_spans.push(Span::styled(content_str, style_context));
+                    } else {
+                        let mut last_end = 0;
+                        for (byte_start, byte_end, segment_style) in &line_highlights {
+                            let start = (*byte_start).min(content_str.len());
+                            let end = (*byte_end).min(content_str.len());
+
+                            if start > last_end {
+                                let gap = &content_str[last_end..start];
+                                if !gap.is_empty() {
+                                    content_spans.push(Span::styled(gap, style_context));
+                                }
+                            }
+
+                            if end > start {
+                                let segment = &content_str[start..end];
+                                if !segment.is_empty() {
+                                    let mut patched_style = style_context.patch(*segment_style);
+                                    if style_context.bg.is_some() {
+                                        patched_style.bg = style_context.bg;
+                                    }
+                                    content_spans.push(Span::styled(segment, patched_style));
+                                }
+                            }
+
+                            last_end = end;
+                        }
+
+                        if last_end < content_str.len() {
+                            let trailing = &content_str[last_end..];
+                            if !trailing.is_empty() {
+                                content_spans.push(Span::styled(trailing, style_context));
+                            }
+                        }
+                    }
+
+                    let mut all_spans = vec![
+                        Span::styled(base_num, style_context),
+                        Span::styled(" ", style_context),
+                        Span::styled(doc_num, style_context),
+                        Span::styled("  │", style_context),
+                        Span::styled(" ", style_context),
+                    ];
+                    all_spans.extend(content_spans);
+                    all_spans
+                }
+                DiffLine::Deletion { base_line, content } => {
+                    let line_num_str = format!("{:>4}", base_line);
+                    let content_str = content.as_str();
+                    let mut content_spans = Vec::new();
+
+                    if let Some(word_segments) = word_diff_cache.borrow().get(&line_index) {
+                        let word_segments = word_segments.clone();
+                        if word_segments.is_empty() {
+                            content_spans.push(Span::styled(content_str, style_minus));
+                        } else {
+                            let mut byte_offset = 0;
+                            for segment in &word_segments {
+                                let segment_text = &segment.text;
+                                let segment_len = segment_text.len();
+                                let base_style = if segment.is_emph { style_minus_emph } else { style_minus };
+
+                                if line_highlights.is_empty() {
+                                    content_spans.push(Span::styled(segment_text.clone(), base_style));
+                                } else {
+                                    let seg_start = byte_offset;
+                                    let seg_end = byte_offset + segment_len;
+                                    let mut last_pos = 0;
+
+                                    for (hl_start, hl_end, hl_style) in &line_highlights {
+                                        let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                        let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+
+                                        if start > last_pos && start < segment_len {
+                                            let gap = &segment_text[last_pos..start];
+                                            if !gap.is_empty() {
+                                                content_spans.push(Span::styled(gap.to_string(), base_style));
+                                            }
+                                        }
+
+                                        if end > start && start < segment_len {
+                                            let text = &segment_text[start..end.min(segment_len)];
+                                            if !text.is_empty() {
+                                                let mut patched = base_style.patch(*hl_style);
+                                                if base_style.bg.is_some() {
+                                                    patched.bg = base_style.bg;
+                                                }
+                                                content_spans.push(Span::styled(text.to_string(), patched));
+                                            }
+                                        }
+                                        last_pos = end.min(segment_len);
+                                    }
+
+                                    if last_pos < segment_len {
+                                        let trailing = &segment_text[last_pos..];
+                                        if !trailing.is_empty() {
+                                            content_spans.push(Span::styled(trailing.to_string(), base_style));
+                                        }
+                                    }
+                                }
+                                byte_offset += segment_len;
+                            }
+                        }
+                    } else if line_highlights.is_empty() {
+                        content_spans.push(Span::styled(content_str, style_minus));
+                    } else {
+                        let mut last_end = 0;
+                        for (byte_start, byte_end, segment_style) in &line_highlights {
+                            let start = (*byte_start).min(content_str.len());
+                            let end = (*byte_end).min(content_str.len());
+
+                            if start > last_end {
+                                let gap = &content_str[last_end..start];
+                                if !gap.is_empty() {
+                                    content_spans.push(Span::styled(gap, style_minus));
+                                }
+                            }
+
+                            if end > start {
+                                let segment = &content_str[start..end];
+                                if !segment.is_empty() {
+                                    let mut patched_style = style_minus.patch(*segment_style);
+                                    if style_minus.bg.is_some() {
+                                        patched_style.bg = style_minus.bg;
+                                    }
+                                    content_spans.push(Span::styled(segment, patched_style));
+                                }
+                            }
+                            last_end = end;
+                        }
+
+                        if last_end < content_str.len() {
+                            let trailing = &content_str[last_end..];
+                            if !trailing.is_empty() {
+                                content_spans.push(Span::styled(trailing, style_minus));
+                            }
+                        }
+                    }
+
+                    let mut all_spans = vec![
+                        Span::styled("     ", style_minus),
+                        Span::styled(line_num_str, style_minus),
+                        Span::styled("-", style_minus),
+                        Span::styled(" │", style_minus),
+                        Span::styled(" ", style_minus),
+                    ];
+                    all_spans.extend(content_spans);
+                    all_spans
+                }
+                DiffLine::Addition { doc_line, content } => {
+                    let line_num_str = format!("{:>4}", doc_line);
+                    let content_str = content.as_str();
+                    let mut content_spans = Vec::new();
+
+                    if let Some(word_segments) = word_diff_cache.borrow().get(&line_index) {
+                        let word_segments = word_segments.clone();
+                        if word_segments.is_empty() {
+                            content_spans.push(Span::styled(content_str, style_plus));
+                        } else {
+                            let mut byte_offset = 0;
+                            for segment in &word_segments {
+                                let segment_text = &segment.text;
+                                let segment_len = segment_text.len();
+                                let base_style = if segment.is_emph { style_plus_emph } else { style_plus };
+
+                                if line_highlights.is_empty() {
+                                    content_spans.push(Span::styled(segment_text.clone(), base_style));
+                                } else {
+                                    let seg_start = byte_offset;
+                                    let seg_end = byte_offset + segment_len;
+                                    let mut last_pos = 0;
+
+                                    for (hl_start, hl_end, hl_style) in &line_highlights {
+                                        let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                        let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+
+                                        if start > last_pos && start < segment_len {
+                                            let gap = &segment_text[last_pos..start];
+                                            if !gap.is_empty() {
+                                                content_spans.push(Span::styled(gap.to_string(), base_style));
+                                            }
+                                        }
+
+                                        if end > start && start < segment_len {
+                                            let text = &segment_text[start..end.min(segment_len)];
+                                            if !text.is_empty() {
+                                                let mut patched = base_style.patch(*hl_style);
+                                                if base_style.bg.is_some() {
+                                                    patched.bg = base_style.bg;
+                                                }
+                                                content_spans.push(Span::styled(text.to_string(), patched));
+                                            }
+                                        }
+                                        last_pos = end.min(segment_len);
+                                    }
+
+                                    if last_pos < segment_len {
+                                        let trailing = &segment_text[last_pos..];
+                                        if !trailing.is_empty() {
+                                            content_spans.push(Span::styled(trailing.to_string(), base_style));
+                                        }
+                                    }
+                                }
+                                byte_offset += segment_len;
+                            }
+                        }
+                    } else if line_highlights.is_empty() {
+                        content_spans.push(Span::styled(content_str, style_plus));
+                    } else {
+                        let mut last_end = 0;
+                        for (byte_start, byte_end, segment_style) in &line_highlights {
+                            let start = (*byte_start).min(content_str.len());
+                            let end = (*byte_end).min(content_str.len());
+
+                            if start > last_end {
+                                let gap = &content_str[last_end..start];
+                                if !gap.is_empty() {
+                                    content_spans.push(Span::styled(gap, style_plus));
+                                }
+                            }
+
+                            if end > start {
+                                let segment = &content_str[start..end];
+                                if !segment.is_empty() {
+                                    let mut patched_style = style_plus.patch(*segment_style);
+                                    if style_plus.bg.is_some() {
+                                        patched_style.bg = style_plus.bg;
+                                    }
+                                    content_spans.push(Span::styled(segment, patched_style));
+                                }
+                            }
+                            last_end = end;
+                        }
+
+                        if last_end < content_str.len() {
+                            let trailing = &content_str[last_end..];
+                            if !trailing.is_empty() {
+                                content_spans.push(Span::styled(trailing, style_plus));
+                            }
+                        }
+                    }
+
+                    let mut all_spans = vec![
+                        Span::styled("     ", style_plus),
+                        Span::styled(line_num_str, style_plus),
+                        Span::styled("+", style_plus),
+                        Span::styled(" │", style_plus),
+                        Span::styled(" ", style_plus),
+                    ];
+                    all_spans.extend(content_spans);
+                    all_spans
+                }
+            };
+
+            // Render the line
+            let mut x_pos = inner.x;
+            for span in &spans {
+                if x_pos >= inner.x + inner.width {
+                    break;
+                }
+                let remaining_width = (inner.x + inner.width - x_pos) as usize;
+                let content_len = span.content.width().min(remaining_width);
+
+                if content_len > 0 {
+                    surface.set_stringn(x_pos, y, &span.content, content_len, span.style);
+                }
+                x_pos += span.content.width() as u16;
+            }
+
+            y += 1;
+        }
+    }
+
     fn render_preview(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         // -- Render the frame:
         // clear area
@@ -896,6 +1485,29 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let margin = Margin::horizontal(1);
         let inner = inner.inner(margin);
         BLOCK.render(area, surface);
+
+        // Check for custom preview content first (before calling get_preview)
+        // This avoids borrow checker issues with get_preview
+        if let Some(custom_fn) = &self.custom_preview_fn {
+            if let Some(current) = self.selection() {
+                if let Some(preview) = custom_fn(cx.editor, current) {
+                    match preview {
+                        CachedPreview::Diff { diff_base, doc, hunks, file_path, file_name } => {
+                            Self::render_diff_preview(
+                                &inner, surface, cx,
+                                &diff_base, &doc, &hunks, &file_path, &file_name,
+                            );
+                            return;
+                        }
+                        CachedPreview::CustomText { content, is_diff } => {
+                            Self::render_custom_text_preview_static(&inner, surface, cx, &content, is_diff);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
@@ -1034,7 +1646,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         // +---------+ +---------+
 
         let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+            self.show_preview && (self.file_fn.is_some() || self.custom_preview_fn.is_some()) && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
 
         let picker_width = if render_preview {
             area.width / 2
@@ -1174,7 +1786,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
         // prompt area
         let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+            self.show_preview && (self.file_fn.is_some() || self.custom_preview_fn.is_some()) && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
 
         let picker_width = if render_preview {
             area.width / 2

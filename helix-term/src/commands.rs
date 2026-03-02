@@ -66,7 +66,7 @@ use crate::{
     compositor::{self, Component, Compositor, Event, EventResult},
     filter_picker_entry,
     job::Callback,
-    ui::{self, overlay::overlaid, DiffView, Picker, PickerColumn, Popup, Prompt, PromptEvent},
+    ui::{self, overlay::overlaid, CachedPreview, DiffView, Picker, PickerColumn, Popup, Prompt, PromptEvent},
 };
 
 use crate::job::{self, Jobs};
@@ -3428,6 +3428,187 @@ fn changed_file_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
+/// Compute diff preview content for a file.
+/// Returns a CachedPreview::Diff with all the data needed for rich rendering.
+fn compute_diff_preview(
+    editor: &Editor,
+    entry: &StatusEntry,
+) -> Option<CachedPreview> {
+    use imara_diff::{Algorithm, Diff, InternedInput};
+    
+    /// Wrapper for RopeSlice to implement TokenSource
+    struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+    
+    impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+        type Token = helix_core::RopeSlice<'a>;
+        type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+        
+        fn tokenize(&self) -> Self::Tokenizer {
+            self.0.lines()
+        }
+        
+        fn estimate_tokens(&self) -> u32 {
+            self.0.len_lines() as u32
+        }
+    }
+    
+    let path = entry.change.path();
+    
+    // Check if file exists (handle deleted files)
+    let file_exists = path.exists();
+    
+    // Get diff base from git
+    let diff_base_bytes = editor.diff_providers.get_diff_base(path);
+    
+    // Handle different file states
+    match (&diff_base_bytes, file_exists) {
+        (None, false) => {
+            // File doesn't exist in git and on disk - shouldn't happen
+            return Some(CachedPreview::CustomText {
+                content: format!("File not found: {}", path.display()),
+                is_diff: false,
+            });
+        }
+        (None, true) => {
+            // Untracked file - show as new file
+            return compute_new_file_preview(path);
+        }
+        (Some(_), false) => {
+            // Deleted file - show as deleted
+            return compute_deleted_file_preview(&diff_base_bytes.unwrap());
+        }
+        (Some(_), true) => {
+            // Modified file - compute diff
+        }
+    }
+    
+    // Read current file content
+    let current_content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            return Some(CachedPreview::CustomText {
+                content: format!("Error reading file: {}", e),
+                is_diff: false,
+            });
+        }
+    };
+    
+    // Convert to Ropes
+    let diff_base = Rope::from(String::from_utf8_lossy(&diff_base_bytes.unwrap()));
+    let doc = Rope::from(current_content);
+    
+    // Check for binary content
+    if diff_base.len_chars() > 0 && contains_binary(&diff_base) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+    if contains_binary(&doc) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+    
+    // Compute diff using imara_diff
+    let input = InternedInput::new(RopeLines(diff_base.slice(..)), RopeLines(doc.slice(..)));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    
+    // Collect hunks
+    let hunks: Vec<Hunk> = diff.hunks().collect();
+    
+    // Get file name for display
+    let file_name = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    
+    // Return the Diff variant with all data for rich rendering
+    Some(CachedPreview::Diff {
+        diff_base,
+        doc,
+        hunks,
+        file_path: path.to_path_buf(),
+        file_name,
+    })
+}
+
+/// Compute preview for a new (untracked) file
+fn compute_new_file_preview(path: &Path) -> Option<CachedPreview> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(CachedPreview::CustomText {
+                content: format!("Error reading file: {}", e),
+                is_diff: false,
+            });
+        }
+    };
+    
+    // Check for binary content
+    if content.bytes().any(|b| b == 0) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+    
+    let doc = Rope::from(content);
+    let diff_base = Rope::new(); // Empty diff base for new files
+    
+    // Get file name for display
+    let file_name = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    
+    // Return the Diff variant - empty hunks will be handled as new file
+    Some(CachedPreview::Diff {
+        diff_base,
+        doc,
+        hunks: Vec::new(), // Empty hunks signals new file
+        file_path: path.to_path_buf(),
+        file_name,
+    })
+}
+
+/// Compute preview for a deleted file
+fn compute_deleted_file_preview(diff_base_bytes: &[u8]) -> Option<CachedPreview> {
+    let diff_base = Rope::from(String::from_utf8_lossy(diff_base_bytes));
+    
+    // Check for binary content
+    if contains_binary(&diff_base) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+    
+    let doc = Rope::new(); // Empty doc for deleted files
+    
+    // Return the Diff variant - empty hunks will be handled as deleted file
+    Some(CachedPreview::Diff {
+        diff_base,
+        doc,
+        hunks: Vec::new(), // Empty hunks signals deleted file
+        file_path: PathBuf::new(), // No path needed for deleted files
+        file_name: "(deleted)".to_string(),
+    })
+}
+
+/// Check if a Rope contains binary content
+fn contains_binary(rope: &Rope) -> bool {
+    // Check first 8KB for null bytes
+    const CHECK_SIZE: usize = 8192;
+    let check_len = rope.len_chars().min(CHECK_SIZE);
+    
+    for i in 0..check_len {
+        if rope.char(i) == '\0' {
+            return true;
+        }
+    }
+    false
+}
+
 fn git_status_picker(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
@@ -3476,7 +3657,7 @@ fn git_status_picker(cx: &mut Context) {
             // which opens the DiffView instead
         },
     )
-    .with_preview(|_editor, entry| Some((entry.change.path().into(), None)));
+    .with_custom_preview(|editor, entry| compute_diff_preview(editor, entry));
     let injector = picker.injector();
 
     // Get git status using get_status_porcelain
@@ -3571,7 +3752,7 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
                     // which opens the DiffView instead
                 },
             )
-            .with_preview(|_editor, entry| Some((entry.change.path().into(), None)));
+            .with_custom_preview(|editor, entry| compute_diff_preview(editor, entry));
 
             let injector = picker.injector();
             for entry in &files {
