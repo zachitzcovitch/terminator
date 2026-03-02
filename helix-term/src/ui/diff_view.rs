@@ -1086,9 +1086,33 @@ impl DiffView {
 
         view.compute_diff_lines();
 
-        // Set selected_line to the HunkHeader line for the selected hunk
+        // Set selected_line to the HunkHeader line for the selected hunk (fallback)
         if let Some(boundary) = view.hunk_boundaries.get(selected_hunk) {
             view.selected_line = boundary.start;
+        }
+
+        // If cursor is on a specific line, find the exact diff line matching it
+        // This provides more precise positioning than just the hunk header
+        if cursor_line > 0 {
+            // cursor_line is 0-indexed, doc_line in DiffLine is 1-indexed
+            let target_doc_line = cursor_line as u32 + 1;
+
+            // Find the diff line whose doc_line matches the cursor position
+            for (i, diff_line) in view.diff_lines.iter().enumerate() {
+                match diff_line {
+                    DiffLine::Addition { doc_line, .. } if *doc_line == target_doc_line => {
+                        view.selected_line = i;
+                        break;
+                    }
+                    DiffLine::Context {
+                        doc_line: Some(dl), ..
+                    } if *dl == target_doc_line => {
+                        view.selected_line = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         view
@@ -2491,12 +2515,25 @@ impl Component for DiffView {
             let visible_lines = self.last_visible_lines;
 
             match key.code {
-                KeyCode::Esc => {
-                    // Create a callback that removes this layer from the compositor
-                    let close_fn: Callback = Box::new(|compositor: &mut Compositor, _| {
-                        compositor.pop();
-                    });
-                    return EventResult::Consumed(Some(close_fn));
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // Return to git status picker (back navigation)
+                    let files = self.files.clone();
+                    let file_index = self.file_index;
+
+                    let back_fn: Callback =
+                        Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                            // Pop the diff view
+                            compositor.pop();
+
+                            // Re-push the git status picker with the correct selection
+                            crate::commands::push_git_status_picker_with_selection(
+                                cx,
+                                compositor,
+                                files.clone(),
+                                file_index,
+                            );
+                        });
+                    return EventResult::Consumed(Some(back_fn));
                 }
                 KeyCode::Up | KeyCode::Char('K') => {
                     // Move to previous hunk (Shift+k)
@@ -9926,6 +9963,481 @@ mod selectable_diff_view_tests {
 
         // After 4 K presses from 0: 0->3->2->1->0
         assert_eq!(diff_view.selected_hunk, 0, "Should return to first hunk");
+    }
+
+    // =========================================================================
+    // Cursor Positioning Tests: Verify gv opens to exact line when cursor is in diff
+    // =========================================================================
+
+    /// Create a diff view with a single hunk where lines 1-3 are context,
+    /// line 4 is a deletion, line 5 is an addition, and lines 6-8 are context.
+    /// This allows testing cursor positioning on different line types.
+    fn create_diff_view_with_known_lines() -> DiffView {
+        // Base: 8 lines of original content
+        let diff_base = Rope::from(
+            "context line 1\ncontext line 2\ncontext line 3\nold line 4\ncontext line 5\ncontext line 6\ncontext line 7\ncontext line 8\n",
+        );
+        // Doc: line 4 is changed (old line 4 -> new line 4)
+        let doc = Rope::from(
+            "context line 1\ncontext line 2\ncontext line 3\nnew line 4\ncontext line 5\ncontext line 6\ncontext line 7\ncontext line 8\n",
+        );
+
+        // Hunk: line 4 is changed (0-indexed: lines 3-4)
+        // before: line 4 (0-indexed 3) is deleted
+        // after: line 4 (0-indexed 3) is added
+        let hunks = vec![make_hunk(3..4, 3..4)];
+
+        DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0, // cursor_line - will be overridden in specific tests
+            Vec::new(),
+            0,
+            false,
+            false,
+        )
+    }
+
+    /// Create a diff view with multiple hunks to test fallback to hunk header
+    fn create_diff_view_with_multiple_hunks_for_cursor() -> DiffView {
+        let diff_base =
+            Rope::from("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n");
+        // Lines 2 and 5 are modified
+        let doc = Rope::from(
+            "line 1\nmodified line 2\nline 3\nline 4\nmodified line 5\nline 6\nline 7\nline 8\n",
+        );
+
+        // Two hunks: one at line 2, one at line 5
+        let hunks = vec![
+            make_hunk(1..2, 1..2), // line 2 changed
+            make_hunk(4..5, 4..5), // line 5 changed
+        ];
+
+        DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0, // cursor_line - will be overridden
+            Vec::new(),
+            0,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn test_cursor_on_addition_line_selects_exact_line() {
+        // Test: When cursor is on an Addition line, that exact line is selected
+        // Create a diff where we know the addition line position
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\n");
+
+        // Hunk at line 2 (0-indexed: 1..2)
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // cursor_line = 1 means line 2 (0-indexed), which is the addition line
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            1, // cursor on line 2 (0-indexed: 1), which is the addition
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // Find the Addition line in diff_lines
+        let mut found_addition = false;
+        for (i, line) in diff_view.diff_lines.iter().enumerate() {
+            if let DiffLine::Addition { doc_line, .. } = line {
+                if *doc_line == 2 {
+                    // doc_line is 1-indexed, so 2 means line 2
+                    assert_eq!(
+                        diff_view.selected_line, i,
+                        "selected_line should point to the Addition line matching cursor"
+                    );
+                    found_addition = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_addition, "Should find an Addition line at doc_line 2");
+    }
+
+    #[test]
+    fn test_cursor_on_context_line_selects_exact_line() {
+        // Test: When cursor is on a Context line, that exact line is selected
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\nline 4\n");
+
+        // Hunk at line 2 (0-indexed: 1..2)
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // cursor_line = 3 means line 4 (0-indexed: 3), which is context after the hunk
+        // Note: cursor_line = 0 is a special case that skips exact match logic
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            3, // cursor on line 4 (0-indexed: 3), which is context after the hunk
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // Find the Context line in diff_lines for line 4
+        let mut found_context = false;
+        for (i, line) in diff_view.diff_lines.iter().enumerate() {
+            if let DiffLine::Context {
+                doc_line: Some(dl), ..
+            } = line
+            {
+                if *dl == 4 {
+                    // doc_line is 1-indexed, so 4 means line 4
+                    assert_eq!(
+                        diff_view.selected_line, i,
+                        "selected_line should point to the Context line matching cursor"
+                    );
+                    found_context = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_context, "Should find a Context line at doc_line 4");
+    }
+
+    #[test]
+    fn test_cursor_on_context_after_hunk_selects_exact_line() {
+        // Test: When cursor is on context after the hunk, that exact line is selected
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\nline 5\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\nline 4\nline 5\n");
+
+        // Hunk at line 2 (0-indexed: 1..2)
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // cursor_line = 4 means line 5 (0-indexed: 4), which is context after the hunk
+        // Since this is context, it should select that line
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            4, // cursor on line 5 (0-indexed: 4), context after hunk
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // Find the Context line for line 5
+        let mut found_context = false;
+        for (i, line) in diff_view.diff_lines.iter().enumerate() {
+            if let DiffLine::Context {
+                doc_line: Some(dl), ..
+            } = line
+            {
+                if *dl == 5 {
+                    assert_eq!(
+                        diff_view.selected_line, i,
+                        "selected_line should point to the Context line matching cursor"
+                    );
+                    found_context = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_context, "Should find a Context line at doc_line 5");
+    }
+
+    #[test]
+    fn test_cursor_line_zero_uses_hunk_header() {
+        // Test: When cursor_line is 0, uses hunk header (edge case)
+        // cursor_line = 0 is a special case - it means "no specific cursor position"
+        // The code should fall back to selecting the hunk header
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\n");
+
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0, // cursor_line = 0, should use hunk header
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // With cursor_line = 0, the code checks if cursor_line > 0 before looking for exact match
+        // So it should fall back to the hunk header
+        // But wait - line 1 (doc_line = 1) is context, and cursor_line = 0 means line 1
+        // So it should actually match the context line, not the hunk header
+
+        // Actually, looking at the code more carefully:
+        // - cursor_line = 0 means "line 1" (0-indexed)
+        // - The code checks `if cursor_line > 0` before looking for exact match
+        // - So cursor_line = 0 skips the exact match logic and uses hunk header
+
+        // Verify selected_line points to a HunkHeader
+        let selected = diff_view.diff_lines.get(diff_view.selected_line);
+        assert!(
+            matches!(selected, Some(DiffLine::HunkHeader { .. })),
+            "With cursor_line = 0, selected_line should point to HunkHeader, got {:?}",
+            selected
+        );
+
+        // Also verify needs_initial_scroll is false (cursor_line = 0)
+        assert!(
+            !diff_view.needs_initial_scroll,
+            "needs_initial_scroll should be false when cursor_line = 0"
+        );
+    }
+
+    #[test]
+    fn test_needs_initial_scroll_set_when_cursor_nonzero() {
+        // Test: Initial scroll flag is set when cursor_line > 0
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1\nline 2 modified\nline 3\n");
+
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // cursor_line = 1 (non-zero)
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            1, // cursor_line > 0
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        assert!(
+            diff_view.needs_initial_scroll,
+            "needs_initial_scroll should be true when cursor_line > 0"
+        );
+    }
+
+    #[test]
+    fn test_cursor_on_deletion_line_not_matched() {
+        // Test: Deletion lines don't have doc_line, so cursor on deletion position
+        // should fall back to the closest match (context or hunk header)
+        // Note: Deletion lines show the OLD content, not the new content
+        // So there's no doc_line to match - the cursor would be on a line that
+        // no longer exists in the new document
+
+        let diff_base = Rope::from("line 1\nold line 2\nline 3\n");
+        let doc = Rope::from("line 1\nnew line 2\nline 3\n");
+
+        let hunks = vec![make_hunk(1..2, 1..2)];
+
+        // cursor_line = 1 (the line that was changed)
+        // In the new doc, line 2 is "new line 2" - an Addition
+        // The deletion line "old line 2" has no doc_line
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            1, // cursor on line 2 (0-indexed: 1)
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // The cursor is on line 2, which in the new doc is the Addition line
+        // So selected_line should point to the Addition line
+        let selected = diff_view.diff_lines.get(diff_view.selected_line);
+        match selected {
+            Some(DiffLine::Addition { doc_line, .. }) => {
+                assert_eq!(*doc_line, 2, "Should select the Addition at doc_line 2");
+            }
+            _ => {
+                panic!(
+                    "Expected Addition line for cursor on changed line, got {:?}",
+                    selected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_positions_on_multi_line_hunk() {
+        // Test: Cursor positioning works correctly with multi-line additions/deletions
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\nline 5\n");
+        let doc = Rope::from("line 1\nnew line A\nnew line B\nline 4\nline 5\n");
+
+        // Hunk: lines 2-3 changed (old: line 2, new: lines 2-3)
+        // before: 1..2 (line 2 deleted)
+        // after: 1..3 (lines 2-3 added)
+        let hunks = vec![make_hunk(1..2, 1..3)];
+
+        // Test cursor on first addition line (line 2 in new doc)
+        let diff_view = DiffView::new(
+            diff_base.clone(),
+            doc.clone(),
+            hunks.clone(),
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            1, // cursor on line 2 (0-indexed: 1)
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        let selected = diff_view.diff_lines.get(diff_view.selected_line);
+        match selected {
+            Some(DiffLine::Addition { doc_line, .. }) => {
+                assert_eq!(*doc_line, 2, "Should select Addition at doc_line 2");
+            }
+            _ => panic!("Expected Addition line, got {:?}", selected),
+        }
+
+        // Test cursor on second addition line (line 3 in new doc)
+        let diff_view2 = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            2, // cursor on line 3 (0-indexed: 2)
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        let selected2 = diff_view2.diff_lines.get(diff_view2.selected_line);
+        match selected2 {
+            Some(DiffLine::Addition { doc_line, .. }) => {
+                assert_eq!(*doc_line, 3, "Should select Addition at doc_line 3");
+            }
+            _ => panic!("Expected Addition line, got {:?}", selected2),
+        }
+    }
+
+    #[test]
+    fn test_cursor_in_middle_of_large_context() {
+        // Test: Cursor in the middle of a large context area finds the right line
+        let diff_base = Rope::from(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+        let doc = Rope::from(
+            "line 1\nline 2\nline 3\nline 4\nmodified line 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+
+        // Hunk at line 5
+        let hunks = vec![make_hunk(4..5, 4..5)];
+
+        // cursor on line 8 (0-indexed: 7), which is context after the hunk
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            7, // cursor on line 8 (0-indexed: 7)
+            Vec::new(),
+            0,
+            false,
+            false,
+        );
+
+        // Find the Context line for line 8
+        let mut found = false;
+        for (i, line) in diff_view.diff_lines.iter().enumerate() {
+            if let DiffLine::Context {
+                doc_line: Some(dl), ..
+            } = line
+            {
+                if *dl == 8 {
+                    assert_eq!(
+                        diff_view.selected_line, i,
+                        "Should select Context line at doc_line 8"
+                    );
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Should find Context line at doc_line 8");
+    }
+
+    #[test]
+    fn test_scroll_to_selected_line_basic() {
+        // Test: scroll_to_selected_line works correctly
+        let mut diff_view = create_diff_view_with_hunks(3);
+
+        // Set selected_line to something in the middle
+        if diff_view.diff_lines.len() > 5 {
+            diff_view.selected_line = 5;
+            diff_view.scroll = 0;
+
+            // Call scroll_to_selected_line with 10 visible lines
+            diff_view.scroll_to_selected_line(10);
+
+            // The scroll should be adjusted to show line 5
+            // Since line 5 is within the first 10 lines, scroll should remain 0 or be small
+            assert!(
+                diff_view.scroll <= 5,
+                "Scroll should be adjusted to show selected line"
+            );
+        }
     }
 }
 

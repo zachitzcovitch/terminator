@@ -3786,6 +3786,78 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
     })
 }
 
+/// Push a git status picker with a specific file list and selection.
+/// This is used when returning from DiffView to restore the picker state.
+pub fn push_git_status_picker_with_selection(
+    cx: &mut compositor::Context,
+    compositor: &mut Compositor,
+    files: Vec<StatusEntry>,
+    initial_selection: usize,
+) {
+    let cwd = helix_stdx::env::current_working_dir();
+    if !cwd.exists() {
+        cx.editor.set_error("Current working directory does not exist");
+        return;
+    }
+
+    let staged = cx.editor.theme.get("diff.plus");
+    let unstaged = cx.editor.theme.get("diff.delta");
+    let deleted = cx.editor.theme.get("diff.minus");
+    let untracked = cx.editor.theme.get("diff.delta.moved");
+    let conflict = cx.editor.theme.get("diff.delta.conflict");
+
+    // Collect paths of documents with unsaved changes
+    let modified_paths: HashSet<PathBuf> = cx
+        .editor
+        .documents
+        .values()
+        .filter(|doc| doc.is_modified())
+        .filter_map(|doc| doc.path().cloned())
+        .collect();
+
+    let picker = Picker::new(
+        [
+            PickerColumn::new("status", |entry: &StatusEntry, data: &GitStatusData| {
+                let status_text = git_status_text(entry);
+                let style = git_status_style(entry, data);
+                Span::styled(status_text, style).into()
+            }),
+            PickerColumn::new("path", |entry: &StatusEntry, data: &GitStatusData| {
+                git_status_path(entry, data).into()
+            }),
+            PickerColumn::new("stats", |entry: &StatusEntry, _data: &GitStatusData| {
+                git_status_stats(entry).into()
+            }),
+        ],
+        1, // path
+        [],
+        GitStatusData {
+            cwd: cwd.clone(),
+            style_staged: staged,
+            style_unstaged: unstaged,
+            style_deleted: deleted,
+            style_untracked: untracked,
+            style_conflict: conflict,
+            modified_paths,
+        },
+        |_cx, _entry: &StatusEntry, _action| {
+            // The actual file opening is handled by the Enter key in GitStatusPicker
+        },
+    )
+    .with_custom_preview(|editor, entry| compute_diff_preview(editor, entry))
+    .with_initial_cursor(initial_selection as u32);
+
+    let injector = picker.injector();
+    for entry in &files {
+        if injector.push(entry.clone()).is_err() {
+            break;
+        }
+    }
+
+    let git_status_picker = GitStatusPicker::new(picker, cwd, files);
+    compositor.push(Box::new(overlaid(git_status_picker)));
+}
+
 /// Custom wrapper component for the git status picker that adds staging/unstaging key handlers
 struct GitStatusPicker {
     picker: Picker<StatusEntry, GitStatusData>,
@@ -3924,6 +3996,24 @@ impl GitStatusPicker {
             // Create a callback that opens the file and then the diff view
             return Some(Box::new(
                 move |compositor: &mut Compositor, cx: &mut compositor::Context| {
+                    use imara_diff::{Algorithm, Diff, InternedInput};
+                    
+                    /// Wrapper for RopeSlice to implement TokenSource
+                    struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+                    
+                    impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+                        type Token = helix_core::RopeSlice<'a>;
+                        type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+                        
+                        fn tokenize(&self) -> Self::Tokenizer {
+                            self.0.lines()
+                        }
+                        
+                        fn estimate_tokens(&self) -> u32 {
+                            self.0.len_lines() as u32
+                        }
+                    }
+                    
                     // Open the file
                     let doc_id = match cx.editor.open(&file_path, Action::Replace) {
                         Ok(id) => id,
@@ -3950,15 +4040,24 @@ impl GitStatusPicker {
                     // Get syntax for highlighting
                     let existing_syntax = doc.syntax_arc();
 
-                    // Check if this is an untracked file (no diff handle)
-                    let (diff_base, doc_text, hunks) = match doc.diff_handle() {
-                        Some(diff_handle) => {
-                            // Normal file with diff
-                            let diff = diff_handle.load();
-                            let diff_base = diff.diff_base().clone();
-                            let doc_text = diff.doc().clone();
-                            let hunks: Vec<Hunk> =
-                                (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+                    // Compute diff directly using imara_diff instead of relying on doc.diff_handle()
+                    // This ensures the diff is always ready, even for newly opened documents
+                    let diff_base_bytes = cx.editor.diff_providers.get_diff_base(&file_path);
+                    
+                    let (diff_base, doc_text, hunks) = match diff_base_bytes {
+                        Some(base_bytes) => {
+                            // Tracked file - compute diff from git base
+                            let diff_base = Rope::from(String::from_utf8_lossy(&base_bytes));
+                            let doc_text = doc.text().clone();
+                            
+                            // Compute diff using imara_diff
+                            let input = InternedInput::new(
+                                RopeLines(diff_base.slice(..)),
+                                RopeLines(doc_text.slice(..))
+                            );
+                            let diff = Diff::compute(Algorithm::Histogram, &input);
+                            let hunks: Vec<Hunk> = diff.hunks().collect();
+                            
                             (diff_base, doc_text, hunks)
                         }
                         None => {
