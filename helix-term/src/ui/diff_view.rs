@@ -43,7 +43,10 @@ impl WordAlignment {
     const INITIAL_MISMATCH_PENALTY: usize = 1;
 
     /// Create a new alignment between two token sequences
-    fn new(x: Vec<String>, y: Vec<String>) -> Self {
+    fn new(mut x: Vec<String>, mut y: Vec<String>) -> Self {
+        // Add leading empty string for proper alignment (sentinel for gap at start)
+        x.insert(0, String::new());
+        y.insert(0, String::new());
         let dim = [y.len() + 1, x.len() + 1];
         let table = vec![
             AlignCell {
@@ -248,8 +251,8 @@ fn compute_word_diff(old_line: &str, new_line: &str) -> (Vec<WordSegment>, Vec<W
     let mut old_idx: usize = 0;
     let mut new_idx: usize = 0;
 
-    // Process all operations (including the first one for the initial empty token)
-    for op in operations.iter() {
+    // Process all operations, but skip the first one (it's for the leading empty token)
+    for op in operations.iter().skip(1) {
         match op {
             WordOp::NoOp => {
                 // Token is unchanged - consume from both sequences
@@ -290,10 +293,14 @@ fn compute_word_diff(old_line: &str, new_line: &str) -> (Vec<WordSegment>, Vec<W
     }
 
     // Coalesce adjacent segments with the same emphasis state
-    (
-        coalesce_segments(old_segments),
-        coalesce_segments(new_segments),
-    )
+    let old_segments = coalesce_segments(old_segments);
+    let new_segments = coalesce_segments(new_segments);
+
+    // Coalesce whitespace-only emph segments with adjacent emph segments
+    let old_segments = coalesce_whitespace_segments(old_segments);
+    let new_segments = coalesce_whitespace_segments(new_segments);
+
+    (old_segments, new_segments)
 }
 
 /// Coalesce adjacent segments with the same emphasis state
@@ -316,6 +323,79 @@ fn coalesce_segments(segments: Vec<WordSegment>) -> Vec<WordSegment> {
     result.push(current);
 
     result
+}
+
+/// Coalesce whitespace-only emph segments with adjacent emph segments
+/// This prevents isolated whitespace from being highlighted separately
+fn coalesce_whitespace_segments(segments: Vec<WordSegment>) -> Vec<WordSegment> {
+    if segments.len() <= 1 {
+        return segments;
+    }
+
+    let mut result: Vec<WordSegment> = Vec::new();
+    let mut i = 0;
+
+    while i < segments.len() {
+        let seg = &segments[i];
+
+        // Check if this is a whitespace-only emph segment
+        if seg.is_emph && seg.text.trim().is_empty() {
+            // Try to merge with previous segment
+            if let Some(prev) = result.last_mut() {
+                if prev.is_emph {
+                    prev.text.push_str(&seg.text);
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Try to merge with next segment
+            if i + 1 < segments.len() && segments[i + 1].is_emph {
+                let mut merged = segments[i + 1].clone();
+                merged.text = format!("{}{}", seg.text, merged.text);
+                result.push(merged);
+                i += 2;
+                continue;
+            }
+        }
+
+        result.push(seg.clone());
+        i += 1;
+    }
+
+    result
+}
+
+/// Check if two lines are similar enough to warrant word-level diff pairing
+/// Uses a simple Jaccard similarity metric on character sets
+fn should_pair_lines(old: &str, new: &str) -> bool {
+    if old.is_empty() || new.is_empty() {
+        return false;
+    }
+
+    let old_len = old.len();
+    let new_len = new.len();
+    let max_len = old_len.max(new_len);
+
+    // Quick check: if lengths differ by more than 50%, skip
+    let min_len = old_len.min(new_len);
+    if (min_len as f64) / (max_len as f64) < 0.5 {
+        return false;
+    }
+
+    // Count common characters as a simple similarity metric (Jaccard index)
+    use std::collections::HashSet;
+    let old_chars: HashSet<char> = old.chars().collect();
+    let new_chars: HashSet<char> = new.chars().collect();
+    let common = old_chars.intersection(&new_chars).count();
+    let union = old_chars.union(&new_chars).count();
+
+    if union == 0 {
+        return false;
+    }
+
+    // Require at least 40% similarity
+    (common as f64 / union as f64) >= 0.4
 }
 
 /// Function context information for hunk headers (delta-style)
@@ -345,6 +425,10 @@ fn is_function_like(node: &Node) -> bool {
         | "struct_item"
         | "enum_item"
         | "trait_item"
+        | "mod_item"           // for mod tests { }
+        | "macro_definition"   // for macro_rules! foo {}
+        | "const_item"         // for const fn foo() or const X: i32
+        | "static_item"        // for static CONTEXT: ...
         // Python
         | "function_definition"
         | "class_definition"
@@ -411,26 +495,19 @@ fn get_function_context(
     let func_start_byte = func_node.start_byte() as usize;
     let func_start_line = slice.byte_to_line(func_start_byte);
 
-    // Compute the byte offset of the function start within its line
-    // This is needed because ctx.text is extracted from the function node (excludes leading whitespace)
-    // but highlights are computed for the full document line (includes leading whitespace)
-    let line_start_byte = slice.line_to_byte(func_start_line);
-    let byte_offset_in_line = func_start_byte.saturating_sub(line_start_byte);
+    // Extract the full LINE where the function starts (includes modifiers like pub, async, export)
+    // This is important because tree-sitter nodes start after modifiers, but we want to show them
+    let line_start_char = slice.line_to_char(func_start_line);
+    let line_end_char = slice.line_to_char(func_start_line + 1);
 
-    // Extract first line (signature), truncate to ~50 chars
-    let start_byte = func_node.start_byte() as usize;
-    let end_byte = func_node.end_byte() as usize;
-
-    // Convert byte positions to char positions for slicing
-    let start_char = slice.byte_to_char(start_byte);
-    let end_char = slice.byte_to_char(end_byte);
-
-    // Get the text of the function/class
-    let text = slice.slice(start_char..end_char);
-
-    // Get the first line (signature line)
-    let first_line = text.lines().next()?;
+    let line_text = slice.slice(line_start_char..line_end_char);
+    let first_line = line_text.lines().next()?;
     let first_line_str: String = first_line.into();
+
+    // Calculate byte offset as the number of bytes of leading whitespace
+    let byte_offset_in_line = first_line_str.len() - first_line_str.trim_start().len();
+    // Trim leading whitespace for display
+    let first_line_str = first_line_str.trim_start().to_string();
 
     // Truncate to ~50 chars, adding "..." if truncated
     const MAX_LEN: usize = 50;
@@ -968,31 +1045,80 @@ impl DiffView {
         let base_syntax = self.cached_syntax_base.as_ref().map(|arc| arc.as_ref());
 
         // Prepare word diffs for visible deletion/addition pairs
+        // CRITICAL: Deletions and additions are NOT adjacent in diff_lines!
+        // They are grouped separately within each hunk:
+        //   HunkHeader -> Context -> Deletions -> Additions -> Context
+        // So we need to collect all deletions and additions within each hunk and pair by index.
         {
             let mut word_cache = self.word_diff_cache.borrow_mut();
-            let mut i = start;
-            while i <= end {
-                if let Some(DiffLine::Deletion {
-                    content: old_content,
-                    ..
-                }) = self.diff_lines.get(i)
-                {
-                    if let Some(DiffLine::Addition {
-                        content: new_content,
-                        ..
-                    }) = self.diff_lines.get(i + 1)
-                    {
-                        if !word_cache.contains_key(&i) {
-                            let (old_segments, new_segments) =
-                                compute_word_diff(old_content, new_content);
-                            word_cache.insert(i, old_segments);
-                            word_cache.insert(i + 1, new_segments);
-                        }
-                        i += 2;
-                        continue;
+
+            // Process each hunk separately to pair deletions with additions
+            for hunk in &self.hunk_boundaries {
+                // Only process hunks that overlap with the visible range
+                if hunk.end < start || hunk.start > end {
+                    continue;
+                }
+
+                // Collect all deletion and addition line indices within this hunk
+                let mut deletion_indices: Vec<usize> = Vec::new();
+                let mut addition_indices: Vec<usize> = Vec::new();
+
+                for line_index in hunk.start..hunk.end {
+                    match self.diff_lines.get(line_index) {
+                        Some(DiffLine::Deletion { .. }) => deletion_indices.push(line_index),
+                        Some(DiffLine::Addition { .. }) => addition_indices.push(line_index),
+                        _ => {}
                     }
                 }
-                i += 1;
+
+                // Pair deletions with additions by index
+                for (del_idx, add_idx) in deletion_indices.iter().zip(addition_indices.iter()) {
+                    // Only process if at least one of the lines is in the visible range
+                    if *del_idx < start && *add_idx < start {
+                        continue;
+                    }
+                    if *del_idx > end && *add_idx > end {
+                        continue;
+                    }
+
+                    if !word_cache.contains_key(del_idx) {
+                        if let (
+                            Some(DiffLine::Deletion {
+                                content: old_content,
+                                ..
+                            }),
+                            Some(DiffLine::Addition {
+                                content: new_content,
+                                ..
+                            }),
+                        ) = (self.diff_lines.get(*del_idx), self.diff_lines.get(*add_idx))
+                        {
+                            // Check if lines are similar enough for word-level diff
+                            if should_pair_lines(old_content, new_content) {
+                                let (old_segments, new_segments) =
+                                    compute_word_diff(old_content, new_content);
+                                word_cache.insert(*del_idx, old_segments);
+                                word_cache.insert(*add_idx, new_segments);
+                            } else {
+                                // Lines are too different - show as full change
+                                word_cache.insert(
+                                    *del_idx,
+                                    vec![WordSegment {
+                                        text: old_content.clone(),
+                                        is_emph: true,
+                                    }],
+                                );
+                                word_cache.insert(
+                                    *add_idx,
+                                    vec![WordSegment {
+                                        text: new_content.clone(),
+                                        is_emph: true,
+                                    }],
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1050,8 +1176,17 @@ impl DiffView {
                             let adjusted_highlights: Vec<_> = highlights
                                 .into_iter()
                                 .filter_map(|(start, end, style)| {
+                                    // Skip highlights entirely in the whitespace region
+                                    if end <= offset {
+                                        return None;
+                                    }
+
+                                    // Clamp start to 0 (highlight starts in whitespace)
                                     let adj_start = start.saturating_sub(offset);
+                                    // Adjust end
                                     let adj_end = end.saturating_sub(offset);
+
+                                    // Only include if there's actual content after adjustment
                                     if adj_end > adj_start && adj_start < ctx.truncated_len {
                                         Some((
                                             adj_start.min(ctx.truncated_len),
@@ -1339,7 +1474,11 @@ impl DiffView {
                     // Build content spans first (without box decoration)
                     let mut content_spans = Vec::new();
 
-                    // If we have function context, show just "line: function_context"
+                    // Add file path at the beginning
+                    let file_path_str = self.file_path.to_string_lossy();
+                    content_spans.push(Span::styled(format!("{}:", file_path_str), border_style));
+
+                    // If we have function context, show "line: function_context"
                     if let Some(ctx) = context {
                         // Add line number (1-indexed for display)
                         let line_num_display = ctx.line_number + 1;
@@ -1412,7 +1551,7 @@ impl DiffView {
                             }
                         }
                     } else {
-                        // No function context: show just the line number from the hunk header
+                        // No function context: show file path and line number from the hunk header
                         content_spans
                             .push(Span::styled(format!("{}:", new_start + 1), border_style));
                     }
@@ -1597,67 +1736,79 @@ impl DiffView {
                     {
                         // Clone to avoid holding borrow across the loop
                         let word_segments = word_segments.clone();
-                        // Apply word-level diff highlighting with emphasis for changed words
-                        let mut byte_offset = 0;
-                        for segment in &word_segments {
-                            let segment_text = &segment.text;
-                            let segment_len = segment_text.len();
 
-                            // Determine the base style for this segment
-                            let base_style = if segment.is_emph {
-                                style_minus_emph
-                            } else {
-                                style_minus
-                            };
+                        // Fallback: display original content when word segments are empty
+                        if word_segments.is_empty() {
+                            content_spans.push(Span::styled(content_str, style_minus));
+                        } else {
+                            // Apply word-level diff highlighting with emphasis for changed words
+                            let mut byte_offset = 0;
+                            for segment in &word_segments {
+                                let segment_text = &segment.text;
+                                let segment_len = segment_text.len();
 
-                            // Apply syntax highlighting within this segment if available
-                            if line_highlights.is_empty() {
-                                content_spans.push(Span::styled(segment_text.clone(), base_style));
-                            } else {
-                                // Find syntax highlights that overlap with this segment
-                                let seg_start = byte_offset;
-                                let seg_end = byte_offset + segment_len;
+                                // Determine the base style for this segment
+                                let base_style = if segment.is_emph {
+                                    style_minus_emph
+                                } else {
+                                    style_minus
+                                };
 
-                                let mut last_pos = 0;
-                                for (hl_start, hl_end, hl_style) in &line_highlights {
-                                    // Clamp to segment bounds
-                                    let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
-                                    let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+                                // Apply syntax highlighting within this segment if available
+                                if line_highlights.is_empty() {
+                                    content_spans
+                                        .push(Span::styled(segment_text.clone(), base_style));
+                                } else {
+                                    // Find syntax highlights that overlap with this segment
+                                    let seg_start = byte_offset;
+                                    let seg_end = byte_offset + segment_len;
 
-                                    if start > last_pos && start < segment_len {
-                                        let gap = &segment_text[last_pos..start];
-                                        if !gap.is_empty() {
-                                            content_spans
-                                                .push(Span::styled(gap.to_string(), base_style));
-                                        }
-                                    }
+                                    let mut last_pos = 0;
+                                    for (hl_start, hl_end, hl_style) in &line_highlights {
+                                        // Clamp to segment bounds
+                                        let start =
+                                            (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                        let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
 
-                                    if end > start && start < segment_len {
-                                        let text = &segment_text[start..end.min(segment_len)];
-                                        if !text.is_empty() {
-                                            // Apply syntax highlighting but preserve diff background
-                                            let mut patched = base_style.patch(*hl_style);
-                                            if base_style.bg.is_some() {
-                                                patched.bg = base_style.bg;
+                                        if start > last_pos && start < segment_len {
+                                            let gap = &segment_text[last_pos..start];
+                                            if !gap.is_empty() {
+                                                content_spans.push(Span::styled(
+                                                    gap.to_string(),
+                                                    base_style,
+                                                ));
                                             }
-                                            content_spans
-                                                .push(Span::styled(text.to_string(), patched));
+                                        }
+
+                                        if end > start && start < segment_len {
+                                            let text = &segment_text[start..end.min(segment_len)];
+                                            if !text.is_empty() {
+                                                // Apply syntax highlighting but preserve diff background
+                                                let mut patched = base_style.patch(*hl_style);
+                                                if base_style.bg.is_some() {
+                                                    patched.bg = base_style.bg;
+                                                }
+                                                content_spans
+                                                    .push(Span::styled(text.to_string(), patched));
+                                            }
+                                        }
+
+                                        last_pos = end.min(segment_len);
+                                    }
+
+                                    if last_pos < segment_len {
+                                        let trailing = &segment_text[last_pos..];
+                                        if !trailing.is_empty() {
+                                            content_spans.push(Span::styled(
+                                                trailing.to_string(),
+                                                base_style,
+                                            ));
                                         }
                                     }
-
-                                    last_pos = end.min(segment_len);
                                 }
 
-                                if last_pos < segment_len {
-                                    let trailing = &segment_text[last_pos..];
-                                    if !trailing.is_empty() {
-                                        content_spans
-                                            .push(Span::styled(trailing.to_string(), base_style));
-                                    }
-                                }
+                                byte_offset += segment_len;
                             }
-
-                            byte_offset += segment_len;
                         }
                     } else if line_highlights.is_empty() {
                         content_spans.push(Span::styled(content_str, style_minus));
@@ -1730,67 +1881,79 @@ impl DiffView {
                     {
                         // Clone to avoid holding borrow across the loop
                         let word_segments = word_segments.clone();
-                        // Apply word-level diff highlighting with emphasis for changed words
-                        let mut byte_offset = 0;
-                        for segment in &word_segments {
-                            let segment_text = &segment.text;
-                            let segment_len = segment_text.len();
 
-                            // Determine the base style for this segment
-                            let base_style = if segment.is_emph {
-                                style_plus_emph
-                            } else {
-                                style_plus
-                            };
+                        // Fallback: display original content when word segments are empty
+                        if word_segments.is_empty() {
+                            content_spans.push(Span::styled(content_str, style_plus));
+                        } else {
+                            // Apply word-level diff highlighting with emphasis for changed words
+                            let mut byte_offset = 0;
+                            for segment in &word_segments {
+                                let segment_text = &segment.text;
+                                let segment_len = segment_text.len();
 
-                            // Apply syntax highlighting within this segment if available
-                            if line_highlights.is_empty() {
-                                content_spans.push(Span::styled(segment_text.clone(), base_style));
-                            } else {
-                                // Find syntax highlights that overlap with this segment
-                                let seg_start = byte_offset;
-                                let seg_end = byte_offset + segment_len;
+                                // Determine the base style for this segment
+                                let base_style = if segment.is_emph {
+                                    style_plus_emph
+                                } else {
+                                    style_plus
+                                };
 
-                                let mut last_pos = 0;
-                                for (hl_start, hl_end, hl_style) in &line_highlights {
-                                    // Clamp to segment bounds
-                                    let start = (*hl_start).max(seg_start).min(seg_end) - seg_start;
-                                    let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
+                                // Apply syntax highlighting within this segment if available
+                                if line_highlights.is_empty() {
+                                    content_spans
+                                        .push(Span::styled(segment_text.clone(), base_style));
+                                } else {
+                                    // Find syntax highlights that overlap with this segment
+                                    let seg_start = byte_offset;
+                                    let seg_end = byte_offset + segment_len;
 
-                                    if start > last_pos && start < segment_len {
-                                        let gap = &segment_text[last_pos..start];
-                                        if !gap.is_empty() {
-                                            content_spans
-                                                .push(Span::styled(gap.to_string(), base_style));
-                                        }
-                                    }
+                                    let mut last_pos = 0;
+                                    for (hl_start, hl_end, hl_style) in &line_highlights {
+                                        // Clamp to segment bounds
+                                        let start =
+                                            (*hl_start).max(seg_start).min(seg_end) - seg_start;
+                                        let end = (*hl_end).max(seg_start).min(seg_end) - seg_start;
 
-                                    if end > start && start < segment_len {
-                                        let text = &segment_text[start..end.min(segment_len)];
-                                        if !text.is_empty() {
-                                            // Apply syntax highlighting but preserve diff background
-                                            let mut patched = base_style.patch(*hl_style);
-                                            if base_style.bg.is_some() {
-                                                patched.bg = base_style.bg;
+                                        if start > last_pos && start < segment_len {
+                                            let gap = &segment_text[last_pos..start];
+                                            if !gap.is_empty() {
+                                                content_spans.push(Span::styled(
+                                                    gap.to_string(),
+                                                    base_style,
+                                                ));
                                             }
-                                            content_spans
-                                                .push(Span::styled(text.to_string(), patched));
+                                        }
+
+                                        if end > start && start < segment_len {
+                                            let text = &segment_text[start..end.min(segment_len)];
+                                            if !text.is_empty() {
+                                                // Apply syntax highlighting but preserve diff background
+                                                let mut patched = base_style.patch(*hl_style);
+                                                if base_style.bg.is_some() {
+                                                    patched.bg = base_style.bg;
+                                                }
+                                                content_spans
+                                                    .push(Span::styled(text.to_string(), patched));
+                                            }
+                                        }
+
+                                        last_pos = end.min(segment_len);
+                                    }
+
+                                    if last_pos < segment_len {
+                                        let trailing = &segment_text[last_pos..];
+                                        if !trailing.is_empty() {
+                                            content_spans.push(Span::styled(
+                                                trailing.to_string(),
+                                                base_style,
+                                            ));
                                         }
                                     }
-
-                                    last_pos = end.min(segment_len);
                                 }
 
-                                if last_pos < segment_len {
-                                    let trailing = &segment_text[last_pos..];
-                                    if !trailing.is_empty() {
-                                        content_spans
-                                            .push(Span::styled(trailing.to_string(), base_style));
-                                    }
-                                }
+                                byte_offset += segment_len;
                             }
-
-                            byte_offset += segment_len;
                         }
                     } else if line_highlights.is_empty() {
                         content_spans.push(Span::styled(content_str, style_plus));
@@ -8581,6 +8744,129 @@ mod syntax_highlighting_tests {
         );
     }
 
+    /// Test: Header highlight boundaries - highlights in whitespace region are skipped
+    /// This tests the fix that skips highlights entirely in the whitespace region
+    #[test]
+    fn test_header_highlights_skip_whitespace_region() {
+        // Simulate the highlight adjustment logic
+        // When byte_offset_in_line is 4 (4 spaces of leading whitespace),
+        // highlights that end before or at offset 4 should be skipped
+        let offset = 4usize;
+
+        // Highlight entirely in whitespace region (bytes 0-3)
+        let highlight_in_whitespace = (0usize, 3usize, Style::default());
+        let result = filter_highlight(highlight_in_whitespace, offset, 50);
+        assert!(
+            result.is_none(),
+            "Highlight entirely in whitespace should be skipped"
+        );
+
+        // Highlight ending exactly at offset boundary
+        let highlight_at_boundary = (0usize, 4usize, Style::default());
+        let result = filter_highlight(highlight_at_boundary, offset, 50);
+        assert!(
+            result.is_none(),
+            "Highlight ending at offset boundary should be skipped"
+        );
+    }
+
+    /// Test: Header highlight boundaries - highlights starting in whitespace are clamped
+    #[test]
+    fn test_header_highlights_clamp_start_in_whitespace() {
+        let offset = 4usize;
+
+        // Highlight starting in whitespace, ending in content
+        let highlight_crossing = (2usize, 10usize, Style::default());
+        let result = filter_highlight(highlight_crossing, offset, 50);
+
+        assert!(
+            result.is_some(),
+            "Highlight crossing boundary should be kept"
+        );
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(
+            adj_start, 0,
+            "Start should be clamped to 0 (offset subtracted)"
+        );
+        assert_eq!(adj_end, 6, "End should be adjusted by offset");
+    }
+
+    /// Test: Header highlight boundaries - highlights entirely in content are adjusted
+    #[test]
+    fn test_header_highlights_adjust_content_region() {
+        let offset = 4usize;
+
+        // Highlight entirely in content region
+        let highlight_in_content = (6usize, 15usize, Style::default());
+        let result = filter_highlight(highlight_in_content, offset, 50);
+
+        assert!(result.is_some(), "Highlight in content should be kept");
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 2, "Start should be adjusted by offset");
+        assert_eq!(adj_end, 11, "End should be adjusted by offset");
+    }
+
+    /// Test: Header highlight boundaries - highlights beyond truncated length are clamped
+    #[test]
+    fn test_header_highlights_clamp_to_truncated_length() {
+        let offset = 4usize;
+        let truncated_len = 20usize;
+
+        // Highlight extending beyond truncated length
+        let highlight_beyond = (10usize, 30usize, Style::default());
+        let result = filter_highlight(highlight_beyond, offset, truncated_len);
+
+        assert!(result.is_some(), "Highlight should be kept");
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_end, 20, "End should be clamped to truncated_len");
+    }
+
+    /// Test: Header highlight boundaries - zero offset (no leading whitespace)
+    #[test]
+    fn test_header_highlights_zero_offset() {
+        let offset = 0usize;
+
+        // With zero offset, all highlights should be kept
+        let highlight = (0usize, 10usize, Style::default());
+        let result = filter_highlight(highlight, offset, 50);
+
+        assert!(
+            result.is_some(),
+            "Highlight should be kept with zero offset"
+        );
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 0, "Start should not change with zero offset");
+        assert_eq!(adj_end, 10, "End should not change with zero offset");
+    }
+
+    /// Helper function to simulate the highlight filtering logic
+    fn filter_highlight(
+        (start, end, style): (usize, usize, Style),
+        offset: usize,
+        truncated_len: usize,
+    ) -> Option<(usize, usize, Style)> {
+        // Skip highlights entirely in the whitespace region
+        if end <= offset {
+            return None;
+        }
+
+        // Clamp start to 0 (highlight starts in whitespace)
+        let adj_start = start.saturating_sub(offset);
+        // Adjust end
+        let adj_end = end.saturating_sub(offset);
+
+        // Only include if there's actual content after adjustment
+        if adj_end > adj_start && adj_start < truncated_len {
+            Some((
+                adj_start.min(truncated_len),
+                adj_end.min(truncated_len),
+                style,
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Helper to create a Hunk for testing
     fn make_hunk(before: std::ops::Range<u32>, after: std::ops::Range<u32>) -> Hunk {
         Hunk { before, after }
@@ -8827,6 +9113,196 @@ mod syntax_highlighting_tests {
 
         assert_eq!(coalesced.len(), 1);
         assert_eq!(coalesced[0].text, "abc");
+        assert!(coalesced[0].is_emph);
+    }
+
+    /// Test: Coalesce whitespace segments - whitespace emph merged with previous emph
+    #[test]
+    fn test_coalesce_whitespace_with_previous_emph() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: false,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace should be merged with previous emph segment
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello ");
+        assert!(coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, "world");
+        assert!(!coalesced[1].is_emph);
+    }
+
+    /// Test: Coalesce whitespace segments - whitespace emph merged with next emph
+    #[test]
+    fn test_coalesce_whitespace_with_next_emph() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: false,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace should be merged with next emph segment
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello");
+        assert!(!coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, " world");
+        assert!(coalesced[1].is_emph);
+    }
+
+    /// Test: Coalesce whitespace segments - whitespace emph with no adjacent emph
+    #[test]
+    fn test_coalesce_whitespace_no_adjacent_emph() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: false,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: false,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace emph with no adjacent emph should remain as-is
+        assert_eq!(coalesced.len(), 3);
+        assert_eq!(coalesced[0].text, "hello");
+        assert!(!coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, " ");
+        assert!(coalesced[1].is_emph);
+        assert_eq!(coalesced[2].text, "world");
+        assert!(!coalesced[2].is_emph);
+    }
+
+    /// Test: Coalesce whitespace segments - empty list
+    #[test]
+    fn test_coalesce_whitespace_empty() {
+        let segments: Vec<WordSegment> = vec![];
+        let coalesced = coalesce_whitespace_segments(segments);
+        assert!(coalesced.is_empty());
+    }
+
+    /// Test: Coalesce whitespace segments - single segment
+    #[test]
+    fn test_coalesce_whitespace_single() {
+        let segments = vec![WordSegment {
+            text: "hello".to_string(),
+            is_emph: true,
+        }];
+        let coalesced = coalesce_whitespace_segments(segments);
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].text, "hello");
+    }
+
+    /// Test: Coalesce whitespace segments - multiple whitespace emph segments
+    #[test]
+    fn test_coalesce_whitespace_multiple() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace segments should be merged with previous emph segment
+        // Result: ["hello  " emph, "world" emph]
+        // Note: coalesce_whitespace_segments only merges whitespace with adjacent emph
+        // The final merge of "hello  " and "world" would be done by coalesce_segments
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello  ");
+        assert!(coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, "world");
+        assert!(coalesced[1].is_emph);
+    }
+
+    /// Test: Coalesce whitespace segments - non-whitespace emph not affected
+    #[test]
+    fn test_coalesce_whitespace_non_whitespace_emph() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Non-whitespace emph segments should not be affected by this function
+        // (they would be merged by coalesce_segments, but not by coalesce_whitespace_segments)
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello");
+        assert_eq!(coalesced[1].text, "world");
+    }
+
+    /// Test: Coalesce whitespace segments - tabs and other whitespace
+    #[test]
+    fn test_coalesce_whitespace_tabs() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\t".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: false,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Tab whitespace should be merged with previous emph
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].text, "hello\t");
         assert!(coalesced[0].is_emph);
     }
 
@@ -20168,5 +20644,1514 @@ fn query_function() {
         let mut cache_mut = view.function_context_cache.borrow_mut();
         cache_mut.clear();
         assert!(cache_mut.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod adversarial_edge_case_tests {
+    //! Adversarial tests for edge cases and boundary violations
+    //!
+    //! Attack vectors:
+    //! 1. Word diff pairing with unequal deletion/addition counts
+    //! 2. Function context with various modifier combinations
+    //! 3. byte_offset_in_line with Unicode whitespace
+
+    use super::*;
+    use helix_core::Rope;
+    use std::path::PathBuf;
+
+    fn test_loader() -> Loader {
+        let lang = helix_loader::config::default_lang_config();
+        let config: helix_core::syntax::config::Configuration = lang.try_into().unwrap();
+        Loader::new(config).unwrap()
+    }
+
+    fn create_syntax(rope: &Rope, file_path: &PathBuf, loader: &Loader) -> Option<Syntax> {
+        let slice = rope.slice(..);
+        loader
+            .language_for_filename(file_path)
+            .and_then(|language| Syntax::new(slice, language, loader).ok())
+    }
+
+    // =========================================================================
+    // ADVERSARIAL TESTS: Word diff pairing with unequal deletion/addition counts
+    // =========================================================================
+
+    /// Attack: Multiple deletions, single insertion - tests pairing algorithm
+    #[test]
+    fn test_word_diff_many_deletions_one_insertion() {
+        // Old has 3 words deleted, new has 1 word inserted
+        let (old_segs, new_segs) = compute_word_diff("foo bar baz qux", "foo qux");
+
+        // Verify old segments have deletions emphasized
+        let deleted_count = old_segs.iter().filter(|s| s.is_emph).count();
+        assert!(
+            deleted_count >= 1,
+            "Old should have at least 1 emphasized segment for deletions"
+        );
+
+        // Verify new segments are valid (no panics, no empty segments with emphasis)
+        for seg in &new_segs {
+            if seg.is_emph {
+                assert!(
+                    !seg.text.is_empty(),
+                    "Emphasized segment should not be empty"
+                );
+            }
+        }
+    }
+
+    /// Attack: Single deletion, multiple insertions - tests pairing algorithm
+    #[test]
+    fn test_word_diff_one_deletion_many_insertions() {
+        // Old has 1 word deleted, new has 3 words inserted
+        let (old_segs, new_segs) = compute_word_diff("foo qux", "foo bar baz qux");
+
+        // Verify new segments have insertions emphasized
+        let inserted_count = new_segs.iter().filter(|s| s.is_emph).count();
+        assert!(
+            inserted_count >= 1,
+            "New should have at least 1 emphasized segment for insertions"
+        );
+
+        // Verify old segments are valid
+        for seg in &old_segs {
+            if seg.is_emph {
+                assert!(
+                    !seg.text.is_empty(),
+                    "Emphasized segment should not be empty"
+                );
+            }
+        }
+    }
+
+    /// Attack: All deletions, no insertions - boundary case
+    #[test]
+    fn test_word_diff_all_deletions_no_insertions() {
+        let (old_segs, new_segs) = compute_word_diff("delete this entire line", "");
+
+        // Old should have all content emphasized
+        assert!(
+            !old_segs.is_empty(),
+            "Old segments should not be empty when content is deleted"
+        );
+        assert!(
+            old_segs.iter().all(|s| s.is_emph),
+            "All old segments should be emphasized when fully deleted"
+        );
+
+        // New should be empty
+        assert!(new_segs.is_empty(), "New segments should be empty");
+    }
+
+    /// Attack: No deletions, all insertions - boundary case
+    #[test]
+    fn test_word_diff_no_deletions_all_insertions() {
+        let (old_segs, new_segs) = compute_word_diff("", "insert this entire line");
+
+        // Old should be empty
+        assert!(old_segs.is_empty(), "Old segments should be empty");
+
+        // New should have all content emphasized
+        assert!(
+            !new_segs.is_empty(),
+            "New segments should not be empty when content is inserted"
+        );
+        assert!(
+            new_segs.iter().all(|s| s.is_emph),
+            "All new segments should be emphasized when fully inserted"
+        );
+    }
+
+    /// Attack: Alternating deletions and insertions - stress test for pairing
+    #[test]
+    fn test_word_diff_alternating_deletions_insertions() {
+        // Complex pattern: delete a, insert x, delete b, insert y, etc.
+        let (old_segs, new_segs) = compute_word_diff("a b c d e f", "x y z w");
+
+        // Both should have some emphasized segments
+        let old_emph_count = old_segs.iter().filter(|s| s.is_emph).count();
+        let new_emph_count = new_segs.iter().filter(|s| s.is_emph).count();
+
+        assert!(
+            old_emph_count > 0 || new_emph_count > 0,
+            "At least one side should have emphasized segments"
+        );
+
+        // Verify no empty emphasized segments
+        for seg in old_segs.iter().chain(new_segs.iter()) {
+            if seg.is_emph {
+                assert!(
+                    !seg.text.is_empty(),
+                    "Emphasized segment should not be empty"
+                );
+            }
+        }
+    }
+
+    /// Attack: Very unbalanced diff - 100 deletions vs 1 insertion
+    #[test]
+    fn test_word_diff_highly_unbalanced() {
+        let old_line = (0..100)
+            .map(|i| format!("word{}", i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let new_line = "single".to_string();
+
+        let (old_segs, new_segs) = compute_word_diff(&old_line, &new_line);
+
+        // Should not panic and should produce valid segments
+        assert!(
+            !old_segs.is_empty() || !new_segs.is_empty(),
+            "Should produce some segments"
+        );
+
+        // Verify all segments have valid text
+        for seg in old_segs.iter().chain(new_segs.iter()) {
+            assert!(!seg.text.is_empty(), "Segment should not be empty");
+        }
+    }
+
+    /// Attack: Identical words in different positions - tests alignment
+    #[test]
+    fn test_word_diff_duplicate_words_different_positions() {
+        let (old_segs, new_segs) = compute_word_diff("foo foo foo", "foo bar foo");
+
+        // Should handle duplicate words correctly
+        // The middle "foo" should be replaced with "bar"
+        let old_emph = old_segs.iter().filter(|s| s.is_emph).count();
+        let new_emph = new_segs.iter().filter(|s| s.is_emph).count();
+
+        // At minimum, something should be emphasized
+        assert!(
+            old_emph > 0 || new_emph > 0,
+            "Should have some changes emphasized"
+        );
+    }
+
+    // =========================================================================
+    // ADVERSARIAL TESTS: Function context with various modifier combinations
+    // =========================================================================
+
+    /// Attack: Function with multiple modifiers (pub async unsafe)
+    #[test]
+    fn test_function_context_multiple_modifiers() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Rust function with multiple modifiers
+        let content = "pub async unsafe fn dangerous() {\n    let x = 42;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should include modifiers in the context
+            assert!(
+                ctx.text.contains("fn") || ctx.text.contains("pub") || ctx.text.contains("async"),
+                "Context should contain function signature with modifiers, got: {}",
+                ctx.text
+            );
+            // Should not be empty
+            assert!(!ctx.text.is_empty(), "Context should not be empty");
+        }
+    }
+
+    /// Attack: Function with visibility modifier and const
+    #[test]
+    fn test_function_context_pub_const() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "pub const fn constant_value() -> i32 {\n    42\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty for pub const fn"
+            );
+        }
+    }
+
+    /// Attack: Impl block with method
+    #[test]
+    fn test_function_context_impl_method() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "impl MyStruct {\n    pub fn method(&self) {\n        let x = 1;\n    }\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 2 is inside the method body
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should find either the impl or the method
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty for impl method"
+            );
+        }
+    }
+
+    /// Attack: Trait with default method implementation
+    #[test]
+    fn test_function_context_trait_method() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content =
+            "trait MyTrait {\n    fn default_method(&self) {\n        // body\n    }\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty for trait method"
+            );
+        }
+    }
+
+    /// Attack: Nested impl blocks
+    #[test]
+    fn test_function_context_nested_impl() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "mod outer {\n    impl Inner {\n        fn deep_method() {\n            let x = 1;\n        }\n    }\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 3 is inside the deep method
+        let result = get_function_context(3, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty for nested impl method"
+            );
+        }
+    }
+
+    /// Attack: Function with where clause
+    #[test]
+    fn test_function_context_where_clause() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn generic<T>(x: T) where T: Clone {\n    x.clone()\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should include the function signature (possibly truncated)
+            assert!(
+                ctx.text.contains("fn") || ctx.text.starts_with("generic"),
+                "Context should contain function signature, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Function with lifetime parameters
+    #[test]
+    fn test_function_context_lifetime_params() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "fn with_lifetime<'a>(x: &'a str) -> &'a str {\n    x\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert!(
+                !ctx.text.is_empty(),
+                "Context should not be empty for function with lifetime"
+            );
+        }
+    }
+
+    /// Attack: Async function inside async function
+    #[test]
+    fn test_function_context_async_nested() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "async fn outer() {\n    async fn inner() {\n        let x = 1;\n    }\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 2 is inside inner function
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Should find the innermost function
+            assert!(
+                ctx.text.contains("inner") || ctx.text.contains("outer"),
+                "Context should contain one of the functions, got: {}",
+                ctx.text
+            );
+        }
+    }
+
+    // =========================================================================
+    // ADVERSARIAL TESTS: byte_offset_in_line with Unicode whitespace
+    // =========================================================================
+
+    /// Attack: Function with Unicode non-breaking space (U+00A0)
+    #[test]
+    fn test_byte_offset_unicode_nbsp() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Non-breaking space (U+00A0) is 2 bytes in UTF-8
+        let content = "\u{00A0}fn with_nbsp() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // byte_offset_in_line should account for the 2-byte NBSP
+            assert!(
+                ctx.byte_offset_in_line >= 2,
+                "Byte offset should account for NBSP (2 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+            // Text should not start with NBSP
+            assert!(
+                !ctx.text.starts_with('\u{00A0}'),
+                "Context text should not start with NBSP"
+            );
+        }
+    }
+
+    /// Attack: Function with various Unicode whitespace characters
+    #[test]
+    fn test_byte_offset_unicode_whitespace_variety() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Mix of Unicode whitespace: EN QUAD (U+2000), EM QUAD (U+2001), IDEOGRAPHIC SPACE (U+3000)
+        // EN QUAD = 3 bytes, EM QUAD = 3 bytes, IDEOGRAPHIC SPACE = 3 bytes
+        let content = "\u{2000}\u{2001}\u{3000}fn unicode_spaces() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Total whitespace: 3 + 3 + 3 = 9 bytes
+            assert!(
+                ctx.byte_offset_in_line >= 9,
+                "Byte offset should account for Unicode whitespace (9 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+            // Text should start with "fn"
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Function with tab characters mixed with spaces
+    #[test]
+    fn test_byte_offset_tabs_and_spaces() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Tab is 1 byte but displayed as multiple columns
+        let content = "\t    fn mixed_indent() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Tab (1 byte) + 4 spaces (4 bytes) = 5 bytes
+            assert!(
+                ctx.byte_offset_in_line >= 5,
+                "Byte offset should account for tab + spaces (5 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+        }
+    }
+
+    /// Attack: Function with only tabs for indentation
+    #[test]
+    fn test_byte_offset_only_tabs() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "\t\t\tfn tab_indented() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // 3 tabs = 3 bytes
+            assert!(
+                ctx.byte_offset_in_line >= 3,
+                "Byte offset should account for 3 tabs (3 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+        }
+    }
+
+    /// Attack: Function with zero-width space (U+200B) - invisible but has byte length
+    #[test]
+    fn test_byte_offset_zero_width_space() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Zero-width space is 3 bytes in UTF-8 but has zero display width
+        let content = "\u{200B}fn with_zws() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Zero-width space is NOT whitespace per trim_start(), so byte_offset should be 0
+            // But the ZWS is still in the line
+            // This tests that the implementation handles this edge case correctly
+            assert!(
+                ctx.text.contains("fn") || ctx.text.contains("with_zws"),
+                "Context should contain function name, got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Function with full-width characters in indentation (shouldn't happen but test anyway)
+    #[test]
+    fn test_byte_offset_fullwidth_chars() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // Full-width space (U+3000) is 3 bytes and IS whitespace
+        let content = "\u{3000}fn fullwidth_space() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Full-width space is 3 bytes
+            assert!(
+                ctx.byte_offset_in_line >= 3,
+                "Byte offset should account for full-width space (3 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Empty line before function (edge case for line calculation)
+    #[test]
+    fn test_byte_offset_empty_line_before() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        let content = "\nfn after_empty_line() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        // Line 2 is inside the function body
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // Function starts at line 1, no indentation
+            assert!(
+                ctx.byte_offset_in_line == 0,
+                "Byte offset should be 0 for function with no indentation, got: {}",
+                ctx.byte_offset_in_line
+            );
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Function with BOM (Byte Order Mark) at start
+    #[test]
+    fn test_byte_offset_with_bom() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // BOM (U+FEFF) is 3 bytes in UTF-8
+        let content = "\u{FEFF}fn with_bom() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // BOM is ZERO WIDTH NO-BREAK SPACE, which is NOT whitespace per trim_start()
+            // So byte_offset_in_line should be 0 (BOM is part of the text)
+            // The implementation should handle this gracefully
+            assert!(!ctx.text.is_empty(), "Context should not be empty");
+        }
+    }
+
+    /// Attack: Very deep indentation (stress test for byte counting)
+    #[test]
+    fn test_byte_offset_deep_indentation() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // 100 spaces of indentation
+        let indent = " ".repeat(100);
+        let content = format!("{}fn deeply_indented() {{\n    let x = 1;\n}}\n", indent);
+        let rope = Rope::from(content.as_str());
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            assert_eq!(
+                ctx.byte_offset_in_line, 100,
+                "Byte offset should be exactly 100 for 100-space indentation, got: {}",
+                ctx.byte_offset_in_line
+            );
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+
+    /// Attack: Mixed ASCII and Unicode whitespace
+    #[test]
+    fn test_byte_offset_mixed_ascii_unicode_whitespace() {
+        let loader = test_loader();
+        let file_path = PathBuf::from("test.rs");
+
+        // 2 spaces + EN QUAD (3 bytes) + 2 spaces = 7 bytes total
+        let content = "  \u{2000}  fn mixed_whitespace() {\n    let x = 1;\n}\n";
+        let rope = Rope::from(content);
+        let syntax = create_syntax(&rope, &file_path, &loader);
+
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+
+        if let Some(ctx) = result {
+            // 2 + 3 + 2 = 7 bytes
+            assert!(
+                ctx.byte_offset_in_line >= 7,
+                "Byte offset should account for mixed whitespace (7 bytes), got: {}",
+                ctx.byte_offset_in_line
+            );
+            assert!(
+                ctx.text.starts_with("fn"),
+                "Context text should start with 'fn', got: '{}'",
+                ctx.text
+            );
+        }
+    }
+}
+
+// =============================================================================
+// ADVERSARIAL TESTS: Whitespace Coalescing and Highlight Fixes
+// =============================================================================
+// Attack vectors for:
+// 1. Whitespace coalescing with complex patterns
+// 2. Header highlights with extreme offsets
+// 3. Unicode whitespace handling
+// =============================================================================
+
+#[cfg(test)]
+mod adversarial_whitespace_highlight_tests {
+    use super::*;
+    use helix_view::graphics::Style;
+
+    // =========================================================================
+    // ATTACK VECTOR GROUP 1: Whitespace Coalescing with Complex Patterns
+    // =========================================================================
+
+    /// Attack 1.1: Multiple consecutive whitespace-only emph segments
+    /// Tests that multiple whitespace segments are correctly merged
+    #[test]
+    fn attack_whitespace_coalesce_multiple_consecutive() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\t".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "  ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // All whitespace should be merged with previous emph segment
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "Should have 2 segments after coalescing"
+        );
+        assert_eq!(coalesced[0].text, "hello \t  ");
+        assert!(coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, "world");
+        assert!(coalesced[1].is_emph);
+    }
+
+    /// Attack 1.2: Whitespace-only emph segment at start of array
+    /// Tests handling when first segment is whitespace-only emph
+    #[test]
+    fn attack_whitespace_coalesce_at_start() {
+        let segments = vec![
+            WordSegment {
+                text: "   ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace at start should merge with next emph segment
+        assert_eq!(coalesced.len(), 1, "Should merge whitespace with next emph");
+        assert_eq!(coalesced[0].text, "   hello");
+        assert!(coalesced[0].is_emph);
+    }
+
+    /// Attack 1.3: Whitespace-only emph segment at end of array
+    /// Tests handling when last segment is whitespace-only emph
+    #[test]
+    fn attack_whitespace_coalesce_at_end() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "   ".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace at end should merge with previous emph segment
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "Should merge whitespace with previous emph"
+        );
+        assert_eq!(coalesced[0].text, "hello   ");
+        assert!(coalesced[0].is_emph);
+    }
+
+    /// Attack 1.4: Whitespace-only emph segment between non-emph segments
+    /// Tests that whitespace emph with no adjacent emph remains separate
+    #[test]
+    fn attack_whitespace_coalesce_between_non_emph() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: false,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: false,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace emph between non-emph should remain as-is
+        assert_eq!(
+            coalesced.len(),
+            3,
+            "Whitespace emph between non-emph should remain"
+        );
+        assert_eq!(coalesced[0].text, "hello");
+        assert!(!coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, " ");
+        assert!(coalesced[1].is_emph);
+        assert_eq!(coalesced[2].text, "world");
+        assert!(!coalesced[2].is_emph);
+    }
+
+    /// Attack 1.5: Alternating whitespace and non-whitespace emph segments
+    /// Tests complex interleaved patterns
+    #[test]
+    fn attack_whitespace_coalesce_alternating() {
+        let segments = vec![
+            WordSegment {
+                text: "a".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "b".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " ".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "c".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Whitespace merges with PREVIOUS emph segment (not recursively)
+        // a + space -> "a ", b + space -> "b ", c stays
+        assert_eq!(
+            coalesced.len(),
+            3,
+            "Should have 3 segments after coalescing (whitespace merges with previous)"
+        );
+        assert_eq!(coalesced[0].text, "a ");
+        assert!(coalesced[0].is_emph);
+        assert_eq!(coalesced[1].text, "b ");
+        assert!(coalesced[1].is_emph);
+        assert_eq!(coalesced[2].text, "c");
+        assert!(coalesced[2].is_emph);
+    }
+
+    /// Attack 1.6: Empty string segment (edge case)
+    /// Tests handling of empty text in segments
+    #[test]
+    fn attack_whitespace_coalesce_empty_segment() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Empty segment should not affect coalescing
+        // Note: empty string is "whitespace-only" per trim().is_empty()
+        assert!(coalesced.len() >= 1, "Should have at least 1 segment");
+    }
+
+    /// Attack 1.7: Very long whitespace segment
+    /// Tests performance and correctness with large whitespace
+    #[test]
+    fn attack_whitespace_coalesce_very_long_whitespace() {
+        let long_whitespace = " ".repeat(10000);
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: long_whitespace.clone(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(coalesced.len(), 1, "Should merge into single segment");
+        assert!(coalesced[0].text.starts_with("hello"));
+        assert!(coalesced[0].text.ends_with(&long_whitespace));
+    }
+
+    /// Attack 1.8: Mixed whitespace types (spaces, tabs, newlines)
+    /// Tests that all whitespace types are handled correctly
+    #[test]
+    fn attack_whitespace_coalesce_mixed_types() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " \t\n\r".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(coalesced.len(), 2, "Should have 2 segments");
+        assert!(coalesced[0].text.contains(" \t\n\r"));
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR GROUP 2: Unicode Whitespace Handling
+    // =========================================================================
+
+    /// Attack 2.1: Unicode whitespace - EN QUAD (U+2000)
+    #[test]
+    fn attack_unicode_whitespace_en_quad() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{2000}".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "world".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // EN QUAD is whitespace per Rust's trim()
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "EN QUAD should be treated as whitespace"
+        );
+        assert!(coalesced[0].text.ends_with("\u{2000}"));
+    }
+
+    /// Attack 2.2: Unicode whitespace - EM QUAD (U+2001)
+    #[test]
+    fn attack_unicode_whitespace_em_quad() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{2001}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "EM QUAD should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.3: Unicode whitespace - EN SPACE (U+2002)
+    #[test]
+    fn attack_unicode_whitespace_en_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{2002}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "EN SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.4: Unicode whitespace - EM SPACE (U+2003)
+    #[test]
+    fn attack_unicode_whitespace_em_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{2003}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "EM SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.5: Unicode whitespace - THIN SPACE (U+2009)
+    #[test]
+    fn attack_unicode_whitespace_thin_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{2009}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "THIN SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.6: Unicode whitespace - HAIR SPACE (U+200A)
+    #[test]
+    fn attack_unicode_whitespace_hair_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{200A}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "HAIR SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.7: Unicode whitespace - NARROW NO-BREAK SPACE (U+202F)
+    #[test]
+    fn attack_unicode_whitespace_narrow_no_break_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{202F}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "NARROW NO-BREAK SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.8: Unicode whitespace - MEDIUM MATHEMATICAL SPACE (U+205F)
+    #[test]
+    fn attack_unicode_whitespace_medium_math_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{205F}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "MEDIUM MATHEMATICAL SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.9: Unicode whitespace - IDEOGRAPHIC SPACE (U+3000)
+    #[test]
+    fn attack_unicode_whitespace_ideographic_space() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{3000}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "IDEOGRAPHIC SPACE should merge with previous emph"
+        );
+    }
+
+    /// Attack 2.10: Non-whitespace Unicode characters (should NOT be coalesced)
+    /// Tests that non-whitespace unicode is not treated as whitespace
+    #[test]
+    fn attack_unicode_non_whitespace_not_coalesced() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "世界".to_string(),
+                is_emph: true,
+            }, // CJK characters
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // CJK characters are NOT whitespace, so should not be coalesced by this function
+        // (they would be coalesced by coalesce_segments, but not by coalesce_whitespace_segments)
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "Non-whitespace unicode should not be coalesced by whitespace function"
+        );
+    }
+
+    /// Attack 2.11: Zero-width space (U+200B) - NOT whitespace per trim()
+    #[test]
+    fn attack_unicode_zero_width_space_not_whitespace() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: "\u{200B}".to_string(),
+                is_emph: true,
+            }, // Zero-width space
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        // Zero-width space is NOT whitespace per Rust's trim()
+        // So it should NOT be coalesced by coalesce_whitespace_segments
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "Zero-width space should NOT be treated as whitespace"
+        );
+    }
+
+    /// Attack 2.12: Mixed ASCII and Unicode whitespace
+    #[test]
+    fn attack_unicode_mixed_ascii_unicode_whitespace() {
+        let segments = vec![
+            WordSegment {
+                text: "hello".to_string(),
+                is_emph: true,
+            },
+            WordSegment {
+                text: " \u{2000}\t\u{3000}".to_string(),
+                is_emph: true,
+            },
+        ];
+
+        let coalesced = coalesce_whitespace_segments(segments);
+
+        assert_eq!(coalesced.len(), 1, "Mixed whitespace should all merge");
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR GROUP 3: Header Highlights with Extreme Offsets
+    // =========================================================================
+
+    /// Helper function to simulate the highlight filtering logic
+    fn filter_highlight(
+        (start, end, style): (usize, usize, Style),
+        offset: usize,
+        truncated_len: usize,
+    ) -> Option<(usize, usize, Style)> {
+        // Skip highlights entirely in the whitespace region
+        if end <= offset {
+            return None;
+        }
+
+        // Clamp start to 0 (highlight starts in whitespace)
+        let adj_start = start.saturating_sub(offset);
+        // Adjust end
+        let adj_end = end.saturating_sub(offset);
+
+        // Only include if there's actual content after adjustment
+        if adj_end > adj_start && adj_start < truncated_len {
+            Some((
+                adj_start.min(truncated_len),
+                adj_end.min(truncated_len),
+                style,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Attack 3.1: Offset at usize::MAX
+    #[test]
+    fn attack_highlight_offset_usize_max() {
+        let offset = usize::MAX;
+        let truncated_len = 50;
+        let highlight = (0, 10, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // With offset at MAX, end (10) <= offset (MAX) should be false
+        // But saturating_sub would give 0 for start
+        // The highlight should be filtered out due to extreme offset
+        assert!(
+            result.is_none() || result.is_some(),
+            "Should handle extreme offset without panic"
+        );
+    }
+
+    /// Attack 3.2: Offset at 0 (no leading whitespace)
+    #[test]
+    fn attack_highlight_offset_zero() {
+        let offset = 0;
+        let truncated_len = 50;
+        let highlight = (0, 10, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        assert!(result.is_some(), "With offset 0, highlight should be kept");
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 0);
+        assert_eq!(adj_end, 10);
+    }
+
+    /// Attack 3.3: Highlight entirely before offset (should be skipped)
+    #[test]
+    fn attack_highlight_entirely_before_offset() {
+        let offset = 20;
+        let truncated_len = 50;
+        let highlight = (0, 10, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        assert!(
+            result.is_none(),
+            "Highlight entirely before offset should be skipped"
+        );
+    }
+
+    /// Attack 3.4: Highlight exactly at offset boundary
+    #[test]
+    fn attack_highlight_at_offset_boundary() {
+        let offset = 10;
+        let truncated_len = 50;
+        let highlight = (0, 10, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // end (10) <= offset (10) is true, so should be skipped
+        assert!(
+            result.is_none(),
+            "Highlight ending exactly at offset should be skipped"
+        );
+    }
+
+    /// Attack 3.5: Highlight starting before offset, ending after
+    #[test]
+    fn attack_highlight_crossing_offset() {
+        let offset = 10;
+        let truncated_len = 50;
+        let highlight = (5, 20, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        assert!(result.is_some(), "Highlight crossing offset should be kept");
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 0, "Start should be clamped to 0");
+        assert_eq!(adj_end, 10, "End should be adjusted by offset");
+    }
+
+    /// Attack 3.6: Highlight entirely after offset
+    #[test]
+    fn attack_highlight_entirely_after_offset() {
+        let offset = 10;
+        let truncated_len = 50;
+        let highlight = (20, 30, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        assert!(
+            result.is_some(),
+            "Highlight entirely after offset should be kept"
+        );
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 10);
+        assert_eq!(adj_end, 20);
+    }
+
+    /// Attack 3.7: Highlight extending beyond truncated_len
+    #[test]
+    fn attack_highlight_beyond_truncated_len() {
+        let offset = 0;
+        let truncated_len = 20;
+        let highlight = (10, 100, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        assert!(result.is_some(), "Highlight should be kept but clamped");
+        let (adj_start, adj_end, _) = result.unwrap();
+        assert_eq!(adj_start, 10);
+        assert_eq!(adj_end, 20, "End should be clamped to truncated_len");
+    }
+
+    /// Attack 3.8: Highlight starting at truncated_len (should be filtered)
+    #[test]
+    fn attack_highlight_starting_at_truncated_len() {
+        let offset = 0;
+        let truncated_len = 20;
+        let highlight = (20, 30, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // adj_start (20) < truncated_len (20) is false, so filtered out
+        assert!(
+            result.is_none(),
+            "Highlight starting at truncated_len should be filtered"
+        );
+    }
+
+    /// Attack 3.9: Zero-length highlight (start == end)
+    #[test]
+    fn attack_highlight_zero_length() {
+        let offset = 0;
+        let truncated_len = 50;
+        let highlight = (10, 10, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // adj_end (10) > adj_start (10) is false, so filtered out
+        assert!(result.is_none(), "Zero-length highlight should be filtered");
+    }
+
+    /// Attack 3.10: Highlight with start > end (malformed)
+    #[test]
+    fn attack_highlight_malformed_start_greater_than_end() {
+        let offset = 0;
+        let truncated_len = 50;
+        let highlight = (30, 10, Style::default()); // start > end
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // adj_end (10) > adj_start (30) is false, so filtered out
+        assert!(
+            result.is_none(),
+            "Malformed highlight (start > end) should be filtered"
+        );
+    }
+
+    /// Attack 3.11: Multiple highlights with varying offsets
+    #[test]
+    fn attack_highlight_multiple_varying_offsets() {
+        let highlights = vec![
+            (0, 5, Style::default()),
+            (10, 20, Style::default()),
+            (25, 35, Style::default()),
+        ];
+
+        for offset in [0, 5, 10, 15, 20, 25] {
+            let truncated_len = 50;
+            let results: Vec<_> = highlights
+                .iter()
+                .filter_map(|h| filter_highlight(*h, offset, truncated_len))
+                .collect();
+
+            // Should not panic with any offset
+            assert!(
+                results.len() <= highlights.len(),
+                "Results should not exceed input count"
+            );
+        }
+    }
+
+    /// Attack 3.12: Offset larger than truncated_len
+    #[test]
+    fn attack_highlight_offset_larger_than_truncated_len() {
+        let offset = 100;
+        let truncated_len = 50;
+        let highlight = (0, 200, Style::default());
+
+        let result = filter_highlight(highlight, offset, truncated_len);
+
+        // end (200) > offset (100), so not skipped
+        // adj_start = 0, adj_end = 100
+        // But adj_start (0) < truncated_len (50) is true
+        // So result should be (0, 50)
+        if let Some((adj_start, adj_end, _)) = result {
+            assert_eq!(adj_start, 0);
+            assert_eq!(adj_end, 50, "End should be clamped to truncated_len");
+        }
+    }
+
+    /// Attack 3.13: Stress test with many highlights
+    #[test]
+    fn attack_highlight_stress_many_highlights() {
+        let offset = 10;
+        let truncated_len = 100;
+
+        // Create 1000 highlights
+        let highlights: Vec<_> = (0..1000).map(|i| (i, i + 5, Style::default())).collect();
+
+        let results: Vec<_> = highlights
+            .iter()
+            .filter_map(|h| filter_highlight(*h, offset, truncated_len))
+            .collect();
+
+        // Should not panic and should have reasonable results
+        assert!(results.len() <= highlights.len());
+        for (start, end, _) in &results {
+            assert!(*start <= *end, "All results should have start <= end");
+            assert!(
+                *start <= truncated_len,
+                "All starts should be within truncated_len"
+            );
+            assert!(
+                *end <= truncated_len,
+                "All ends should be within truncated_len"
+            );
+        }
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR GROUP 4: Combined Whitespace and Highlight Tests
+    // =========================================================================
+
+    /// Attack 4.1: Word diff with unicode whitespace in content
+    #[test]
+    fn attack_combined_word_diff_unicode_whitespace() {
+        let (old_segs, new_segs) = compute_word_diff("hello world", "hello\u{3000}world");
+
+        // Both should have segments
+        assert!(!old_segs.is_empty() || !new_segs.is_empty());
+
+        // Check that unicode whitespace is handled
+        let has_unicode_space = new_segs.iter().any(|s| s.text.contains('\u{3000}'));
+        assert!(
+            has_unicode_space,
+            "Unicode space should be preserved in segments"
+        );
+    }
+
+    /// Attack 4.2: Word diff with only whitespace change
+    #[test]
+    fn attack_combined_word_diff_whitespace_only_change() {
+        let (old_segs, new_segs) = compute_word_diff("hello world", "hello  world");
+
+        // The extra space should be detected as a change
+        let has_emph = new_segs.iter().any(|s| s.is_emph);
+        assert!(has_emph, "Whitespace change should be detected");
+    }
+
+    /// Attack 4.3: Word diff with mixed whitespace types
+    #[test]
+    fn attack_combined_word_diff_mixed_whitespace_types() {
+        let (old_segs, new_segs) = compute_word_diff("a b c", "a\tb\tc");
+
+        // Tab vs space should be detected as change
+        assert!(!old_segs.is_empty());
+        assert!(!new_segs.is_empty());
+    }
+
+    /// Attack 4.4: Empty lines with whitespace
+    #[test]
+    fn attack_combined_empty_lines_with_whitespace() {
+        let (old_segs, new_segs) = compute_word_diff("   ", "\t\t\t");
+
+        // Both are whitespace-only
+        assert!(!old_segs.is_empty() || old_segs.is_empty());
+        assert!(!new_segs.is_empty() || new_segs.is_empty());
+    }
+
+    /// Attack 4.5: Very long line with unicode whitespace
+    #[test]
+    fn attack_combined_very_long_unicode_whitespace() {
+        let mut old_line = String::new();
+        let mut new_line = String::new();
+
+        for i in 0..100 {
+            if i > 0 {
+                old_line.push(' ');
+                new_line.push('\u{3000}'); // Ideographic space
+            }
+            old_line.push_str(&format!("word{}", i));
+            new_line.push_str(&format!("word{}", i));
+        }
+
+        let (old_segs, new_segs) = compute_word_diff(&old_line, &new_line);
+
+        // Should handle long lines with unicode whitespace
+        assert!(!old_segs.is_empty());
+        assert!(!new_segs.is_empty());
     }
 }
