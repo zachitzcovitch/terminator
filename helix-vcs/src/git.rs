@@ -260,7 +260,12 @@ pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool)
 /// - Y = unstaged status (worktree status)
 ///
 /// A file can appear twice if it has both staged and unstaged changes (e.g., `MM`).
-pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
+///
+/// # Arguments
+/// * `cwd` - The working directory to run git status from
+/// * `populate_stats` - If true, fetch diff stats (additions/deletions) for each file.
+///   Note: This can be slow for many files as it runs `git diff --numstat` for each.
+pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<StatusEntry>> {
     let output = Command::new("git")
         .arg("status")
         .arg("--porcelain=v1")
@@ -283,6 +288,17 @@ pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
         .workdir()
         .context("working tree not found")?
         .to_path_buf();
+
+    // Helper to get diff stats for a file if populate_stats is true
+    let get_stats = |file_path: &Path, staged: bool| -> (Option<usize>, Option<usize>) {
+        if !populate_stats {
+            return (None, None);
+        }
+        match get_diff_stats(cwd, file_path, staged) {
+            Ok(Some((adds, dels))) => (Some(adds), Some(dels)),
+            _ => (None, None),
+        }
+    };
 
     for line in stdout.lines() {
         if line.is_empty() {
@@ -319,13 +335,13 @@ pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
 
         // Check for untracked files first (special case: ??)
         if x == '?' && y == '?' {
+            let file_path = work_dir.join(&path);
+            let (additions, deletions) = get_stats(&file_path, false);
             entries.push(StatusEntry {
-                change: FileChange::Untracked {
-                    path: work_dir.join(&path),
-                },
+                change: FileChange::Untracked { path: file_path },
                 staged: false,
-                additions: None,
-                deletions: None,
+                additions,
+                deletions,
             });
             continue;
         }
@@ -343,13 +359,13 @@ pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
                 | ('U', 'D')
         );
         if is_conflict {
+            let file_path = work_dir.join(&path);
+            let (additions, deletions) = get_stats(&file_path, true);
             entries.push(StatusEntry {
-                change: FileChange::Conflict {
-                    path: work_dir.join(&path),
-                },
+                change: FileChange::Conflict { path: file_path },
                 staged: true,
-                additions: None,
-                deletions: None,
+                additions,
+                deletions,
             });
             continue;
         }
@@ -387,11 +403,13 @@ pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
                 &path
             };
             if let Some(change) = make_change(x, staged_path, from_path.as_deref()) {
+                let file_path = change.path();
+                let (additions, deletions) = get_stats(file_path, true);
                 entries.push(StatusEntry {
                     change,
                     staged: true,
-                    additions: None,
-                    deletions: None,
+                    additions,
+                    deletions,
                 });
             }
         }
@@ -399,11 +417,13 @@ pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
         // Handle unstaged changes (Y status)
         if y != ' ' {
             if let Some(change) = make_change(y, &path, from_path.as_deref()) {
+                let file_path = change.path();
+                let (additions, deletions) = get_stats(file_path, false);
                 entries.push(StatusEntry {
                     change,
                     staged: false,
-                    additions: None,
-                    deletions: None,
+                    additions,
+                    deletions,
                 });
             }
         }
@@ -562,6 +582,75 @@ pub fn get_relative_path(file_path: &Path) -> Option<std::path::PathBuf> {
     let rel_path = abs_path.strip_prefix(repo_root).ok()?;
 
     Some(rel_path.to_path_buf())
+}
+
+/// Get diff stats (additions/deletions) for a file.
+/// Returns (additions, deletions) or None if binary/unavailable.
+///
+/// Uses `git diff --numstat` which outputs: `additions\tdeletions\tfilename`
+/// - Normal files: parse additions/deletions
+/// - Binary files: `- - filename` → returns None
+/// - New files: `0 0 filename` → returns Some((0, 0))
+///
+/// # Arguments
+/// * `cwd` - Working directory to run git command in
+/// * `file` - File path to get diff stats for
+/// * `staged` - If true, get stats for staged changes (HEAD → index).
+///              If false, get stats for unstaged changes (index → working directory).
+pub fn get_diff_stats(cwd: &Path, file: &Path, staged: bool) -> Result<Option<(usize, usize)>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--numstat");
+
+    if staged {
+        // Staged: compare HEAD to index (what's staged for commit)
+        cmd.arg("--cached").arg("HEAD");
+    }
+    // Unstaged: compare index to working directory (no HEAD argument needed)
+
+    cmd.arg("--").arg(file);
+    cmd.current_dir(cwd);
+
+    let output = cmd
+        .output()
+        .context("failed to execute git diff --numstat")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff --numstat failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = match stdout.lines().next() {
+        Some(l) => l,
+        None => return Ok(None), // No output means no changes
+    };
+
+    if line.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse: additions\tdeletions\tfilename
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 2 {
+        return Ok(None);
+    }
+
+    let additions_str = parts[0];
+    let deletions_str = parts[1];
+
+    // Binary files show `- - filename`
+    if additions_str == "-" || deletions_str == "-" {
+        return Ok(None);
+    }
+
+    let additions = additions_str
+        .parse::<usize>()
+        .context("failed to parse additions count")?;
+    let deletions = deletions_str
+        .parse::<usize>()
+        .context("failed to parse deletions count")?;
+
+    Ok(Some((additions, deletions)))
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.

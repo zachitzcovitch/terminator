@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 /// States for a file having been changed.
+#[derive(Clone)]
 pub enum FileChange {
     /// Not tracked by the VCS.
     Untracked { path: PathBuf },
@@ -31,6 +32,7 @@ impl FileChange {
 
 /// Represents a file change with staged/unstaged status information.
 /// Used for porcelain-style git status output.
+#[derive(Clone)]
 pub struct StatusEntry {
     /// The file change (path and type of change)
     pub change: FileChange,

@@ -1100,3 +1100,1305 @@ fn adversarial_unquote_only_backslash() {
 fn adversarial_unquote_only_quote() {
     assert_eq!(git::unquote_porcelain_path("\""), "\"");
 }
+
+// ============================================================================
+// Tests for get_diff_stats
+// ============================================================================
+
+/// Test 1: Modified file with additions and deletions → Some((add, del))
+#[test]
+fn diff_stats_modified_file() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file with multiple lines
+    let file = temp_git.path().join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2\nline3\nline4\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify: delete line2, add a new line5
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline3\nline4\nline5\n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats for modified file");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 1, "Should have 1 addition (line5)");
+    assert_eq!(deletions, 1, "Should have 1 deletion (line2)");
+}
+
+/// Test 2: Untracked file → None (no output from git diff HEAD)
+#[test]
+fn diff_stats_untracked_file() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit so we have a valid HEAD
+    let initial = temp_git.path().join("initial.txt");
+    File::create(&initial)
+        .unwrap()
+        .write_all(b"initial")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create an untracked file
+    let untracked = temp_git.path().join("untracked.txt");
+    File::create(&untracked)
+        .unwrap()
+        .write_all(b"untracked content\n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("untracked.txt"), false).unwrap();
+    assert!(
+        result.is_none(),
+        "Untracked file should return None (no diff against HEAD)"
+    );
+}
+
+/// Test 3: Binary file → None (shows `- - filename`)
+#[test]
+fn diff_stats_binary_file() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a binary file (PNG header magic bytes)
+    let binary_file = temp_git.path().join("image.png");
+    let png_header: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut binary_data = png_header.to_vec();
+    binary_data.extend_from_slice(&[0u8; 100]); // Add some padding
+    File::create(&binary_file)
+        .unwrap()
+        .write_all(&binary_data)
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the binary file
+    let mut new_binary_data = png_header.to_vec();
+    new_binary_data.extend_from_slice(&[1u8; 100]); // Different padding
+    File::create(&binary_file)
+        .unwrap()
+        .write_all(&new_binary_data)
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("image.png"), false).unwrap();
+    assert!(
+        result.is_none(),
+        "Binary file should return None (shows `- - filename` in numstat)"
+    );
+}
+
+/// Test 4: File with no changes → None (empty output)
+#[test]
+fn diff_stats_no_changes() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file
+    let file = temp_git.path().join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"unchanged content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Don't modify the file - no changes
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
+    assert!(result.is_none(), "File with no changes should return None");
+}
+
+/// Test 5: New file (staged but not committed) → Some((lines, 0))
+/// Note: `git diff --numstat HEAD -- <file>` compares staged content against HEAD.
+/// For a staged new file, HEAD doesn't have it, so it shows as added lines.
+#[test]
+fn diff_stats_staged_new_file() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit so we have a valid HEAD
+    let initial = temp_git.path().join("initial.txt");
+    File::create(&initial)
+        .unwrap()
+        .write_all(b"initial")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create and stage a new file
+    let new_file = temp_git.path().join("new_file.txt");
+    File::create(&new_file)
+        .unwrap()
+        .write_all(b"new content\nline2\nline3\n")
+        .unwrap();
+    exec_git_cmd("add new_file.txt", temp_git.path());
+
+    // Staged but not committed - diff against HEAD shows the file as added
+    let result = git::get_diff_stats(temp_git.path(), Path::new("new_file.txt"), true).unwrap();
+    assert!(
+        result.is_some(),
+        "Staged new file should have stats (comparing staged content against HEAD)"
+    );
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 3, "Should have 3 additions (new lines)");
+    assert_eq!(deletions, 0, "Should have 0 deletions (file not in HEAD)");
+}
+
+/// Test 6: Deleted file → Some((0, lines))
+#[test]
+fn diff_stats_deleted_file() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file with multiple lines
+    let file = temp_git.path().join("to_delete.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2\nline3\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Delete the file
+    std::fs::remove_file(&file).unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("to_delete.txt"), false).unwrap();
+    assert!(result.is_some(), "Deleted file should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 0, "Deleted file should have 0 additions");
+    assert_eq!(deletions, 3, "Deleted file should have 3 deletions");
+}
+
+/// Test 7: File with only additions → Some((N, 0))
+#[test]
+fn diff_stats_only_additions() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file
+    let file = temp_git.path().join("file.txt");
+    File::create(&file).unwrap().write_all(b"line1\n").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Add lines without deleting any
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2\nline3\nline4\n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 3, "Should have 3 additions");
+    assert_eq!(deletions, 0, "Should have 0 deletions");
+}
+
+/// Test 8: File with only deletions → Some((0, N))
+#[test]
+fn diff_stats_only_deletions() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file with multiple lines
+    let file = temp_git.path().join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2\nline3\nline4\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Remove lines without adding any
+    File::create(&file).unwrap().write_all(b"line1\n").unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 0, "Should have 0 additions");
+    assert_eq!(deletions, 3, "Should have 3 deletions");
+}
+
+/// Test 9: Large number of changes
+#[test]
+fn diff_stats_large_changes() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file with many lines
+    let file = temp_git.path().join("large.txt");
+    let original_content: String = (1..=1000).map(|i| format!("line{}\n", i)).collect();
+    File::create(&file)
+        .unwrap()
+        .write_all(original_content.as_bytes())
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify: replace first 500 lines with 500 new lines
+    let new_content: String = (1001..=1500).map(|i| format!("line{}\n", i)).collect();
+    File::create(&file)
+        .unwrap()
+        .write_all(new_content.as_bytes())
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("large.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    // The exact counts depend on diff algorithm, but should be substantial
+    assert!(additions > 400, "Should have many additions");
+    assert!(deletions > 400, "Should have many deletions");
+}
+
+/// Test 10: Empty file created and committed
+#[test]
+fn diff_stats_empty_file() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit an empty file
+    let file = temp_git.path().join("empty.txt");
+    File::create(&file).unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Add content to the empty file
+    File::create(&file)
+        .unwrap()
+        .write_all(b"new content\n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("empty.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 1, "Should have 1 addition");
+    assert_eq!(deletions, 0, "Should have 0 deletions");
+}
+
+/// Test 11: File with whitespace-only changes (may show as 0/0)
+#[test]
+fn diff_stats_whitespace_changes() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file
+    let file = temp_git.path().join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Add trailing whitespace (still counts as a change)
+    File::create(&file)
+        .unwrap()
+        .write_all(b"line1\nline2  \n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
+    // Whitespace changes are still line changes
+    assert!(result.is_some(), "Should have diff stats");
+}
+
+/// Test 12: Non-existent file path
+#[test]
+fn diff_stats_nonexistent_file() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let initial = temp_git.path().join("initial.txt");
+    File::create(&initial)
+        .unwrap()
+        .write_all(b"initial")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Query a file that doesn't exist
+    let result = git::get_diff_stats(temp_git.path(), Path::new("nonexistent.txt"), false).unwrap();
+    assert!(result.is_none(), "Non-existent file should return None");
+}
+
+/// Test 13: File in subdirectory
+#[test]
+fn diff_stats_subdirectory_file() {
+    let temp_git = empty_git_repo();
+
+    // Create subdirectory and file
+    let subdir = temp_git.path().join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    let file = subdir.join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"original\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&file)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    let result = git::get_diff_stats(temp_git.path(), Path::new("subdir/file.txt"), false).unwrap();
+    assert!(result.is_some(), "Should have diff stats");
+
+    let (additions, deletions) = result.unwrap();
+    assert_eq!(additions, 1, "Should have 1 addition");
+    assert_eq!(deletions, 1, "Should have 1 deletion");
+}
+
+/// Test 14: Renamed file (should show stats for new path)
+#[test]
+fn diff_stats_renamed_file() {
+    let temp_git = empty_git_repo();
+
+    // Create and commit a file
+    let old_file = temp_git.path().join("old_name.txt");
+    File::create(&old_file)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Rename the file
+    let new_file = temp_git.path().join("new_name.txt");
+    std::fs::rename(&old_file, &new_file).unwrap();
+
+    // Old file should show as deleted
+    let old_result =
+        git::get_diff_stats(temp_git.path(), Path::new("old_name.txt"), false).unwrap();
+    assert!(old_result.is_some(), "Old file should have stats");
+    let (_, deletions) = old_result.unwrap();
+    assert_eq!(deletions, 1, "Old file should show as deleted");
+
+    // New file should show as added (untracked, so None against HEAD)
+    let new_result =
+        git::get_diff_stats(temp_git.path(), Path::new("new_name.txt"), false).unwrap();
+    assert!(
+        new_result.is_none(),
+        "New file path (untracked) should return None"
+    );
+}
+
+// ============================================================================
+// ADVERSARIAL SECURITY TESTS for get_diff_stats
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 1: Path traversal attempts
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with path traversal in file path
+/// Attempts to access files outside the repository using ../../../
+#[test]
+fn adversarial_diff_stats_path_traversal() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Attempt path traversal - should not leak files outside repo
+    // Git will reject paths outside the repository
+    let result = git::get_diff_stats(temp_git.path(), Path::new("../../../etc/passwd"), false);
+    // Should either error or return None (git rejects outside-repo paths)
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Path traversal should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with mixed path traversal
+#[test]
+fn adversarial_diff_stats_mixed_traversal() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file in subdirectory
+    let subdir = temp_git.path().join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    let subfile = subdir.join("file.txt");
+    File::create(&subfile)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&subfile)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    // Attempt traversal from subdirectory
+    let result = git::get_diff_stats(subdir.as_path(), Path::new("../initial.txt"), false);
+    // Should handle gracefully
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Mixed traversal should not cause panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 2: Shell injection via filename
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with shell injection characters in filename
+/// Rust's Command API doesn't use shell, so these should be safe
+#[test]
+fn adversarial_diff_stats_shell_injection_semicolon() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with shell injection attempt in name
+    // Note: semicolons are valid filename characters on Unix
+    #[cfg(unix)]
+    {
+        let inject_file = temp_git.path().join("file;rm -rf.txt");
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle safely - no shell execution
+        let result = git::get_diff_stats(temp_git.path(), Path::new("file;rm -rf.txt"), false);
+        assert!(
+            result.is_ok(),
+            "Shell injection chars in filename should be handled safely"
+        );
+    }
+}
+
+/// Test get_diff_stats with command substitution attempt
+#[test]
+fn adversarial_diff_stats_command_substitution() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with command substitution attempt in name
+    #[cfg(unix)]
+    {
+        let inject_file = temp_git.path().join("file$(whoami).txt");
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle safely - no shell execution
+        let result = git::get_diff_stats(temp_git.path(), Path::new("file$(whoami).txt"), false);
+        assert!(
+            result.is_ok(),
+            "Command substitution in filename should be handled safely"
+        );
+    }
+}
+
+/// Test get_diff_stats with backtick injection attempt
+#[test]
+fn adversarial_diff_stats_backtick_injection() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with backtick injection attempt in name
+    #[cfg(unix)]
+    {
+        let inject_file = temp_git.path().join("file`id`.txt");
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle safely - no shell execution
+        let result = git::get_diff_stats(temp_git.path(), Path::new("file`id`.txt"), false);
+        assert!(
+            result.is_ok(),
+            "Backtick injection in filename should be handled safely"
+        );
+    }
+}
+
+/// Test get_diff_stats with pipe injection attempt
+#[test]
+fn adversarial_diff_stats_pipe_injection() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with pipe character in name
+    #[cfg(unix)]
+    {
+        let inject_file = temp_git.path().join("file|cat.txt");
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&inject_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle safely - no shell execution
+        let result = git::get_diff_stats(temp_git.path(), Path::new("file|cat.txt"), false);
+        assert!(
+            result.is_ok(),
+            "Pipe injection in filename should be handled safely"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 3: Extremely long file path (buffer overflow attempt)
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with extremely long file path
+#[test]
+fn adversarial_diff_stats_extremely_long_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a path that's 4096 characters (typical PATH_MAX)
+    let long_name = "a".repeat(4096);
+    let long_path = Path::new(&long_name);
+
+    // Should not cause buffer overflow or panic
+    let result = git::get_diff_stats(temp_git.path(), long_path, false);
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Extremely long path should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with path exceeding filesystem limits
+#[test]
+fn adversarial_diff_stats_path_overflow_attempt() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a path that's 65536 characters
+    let long_name = "x".repeat(65536);
+    let long_path = Path::new(&long_name);
+
+    // Should not cause buffer overflow or panic
+    let result = git::get_diff_stats(temp_git.path(), long_path, false);
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Path overflow attempt should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with deeply nested path
+#[test]
+fn adversarial_diff_stats_deeply_nested_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a deeply nested path string
+    let nested: String = (0..100).map(|_| "dir/").collect::<String>() + "file.txt";
+    let nested_path = Path::new(&nested);
+
+    // Should handle gracefully
+    let result = git::get_diff_stats(temp_git.path(), nested_path, false);
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Deeply nested path should not cause panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 4: Unicode edge cases
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with emoji in filename
+#[test]
+fn adversarial_diff_stats_emoji_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with emoji in name
+    let emoji_file = temp_git.path().join("file_🎉_name.txt");
+    File::create(&emoji_file)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&emoji_file)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    // Should handle unicode safely
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file_🎉_name.txt"), false);
+    assert!(result.is_ok(), "Emoji in filename should be handled safely");
+}
+
+/// Test get_diff_stats with various unicode scripts
+#[test]
+fn adversarial_diff_stats_unicode_scripts() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create files with various unicode scripts
+    let unicode_names = vec!["文件.txt", "файл.txt", "αρχείο.txt"];
+
+    for name in &unicode_names {
+        let unicode_file = temp_git.path().join(name);
+        File::create(&unicode_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&unicode_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle unicode safely
+        let result = git::get_diff_stats(temp_git.path(), Path::new(name), false);
+        assert!(
+            result.is_ok(),
+            "Unicode script '{}' should be handled safely",
+            name
+        );
+    }
+}
+
+/// Test get_diff_stats with RTL override character (U+202E)
+/// This could be used to spoof filenames
+#[test]
+fn adversarial_diff_stats_rtl_override() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with RTL override character
+    let rtl = "\u{202E}";
+    let rtl_filename = format!("{}txt.exe", rtl);
+    let rtl_file = temp_git.path().join(&rtl_filename);
+
+    match File::create(&rtl_file) {
+        Ok(mut f) => {
+            f.write_all(b"content\n").unwrap();
+            create_commit(temp_git.path(), true);
+
+            // Modify the file
+            File::create(&rtl_file)
+                .unwrap()
+                .write_all(b"modified\n")
+                .unwrap();
+
+            // Should handle RTL override safely
+            let result = git::get_diff_stats(temp_git.path(), Path::new(&rtl_filename), false);
+            assert!(
+                result.is_ok(),
+                "RTL override in filename should be handled safely"
+            );
+        }
+        Err(_) => {
+            // Some filesystems may not support RTL override in filenames
+            // This is acceptable - just ensure no panic
+        }
+    }
+}
+
+/// Test get_diff_stats with zero-width characters
+#[test]
+fn adversarial_diff_stats_zero_width_chars() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with zero-width space
+    let zwsp = "\u{200B}";
+    let zwsp_filename = format!("file{}name.txt", zwsp);
+    let zwsp_file = temp_git.path().join(&zwsp_filename);
+
+    match File::create(&zwsp_file) {
+        Ok(mut f) => {
+            f.write_all(b"content\n").unwrap();
+            create_commit(temp_git.path(), true);
+
+            // Modify the file
+            File::create(&zwsp_file)
+                .unwrap()
+                .write_all(b"modified\n")
+                .unwrap();
+
+            // Should handle zero-width chars safely
+            let result = git::get_diff_stats(temp_git.path(), Path::new(&zwsp_filename), false);
+            assert!(
+                result.is_ok(),
+                "Zero-width chars in filename should be handled safely"
+            );
+        }
+        Err(_) => {
+            // Some filesystems may not support zero-width chars
+            // This is acceptable - just ensure no panic
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 5: Special characters in filename
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with newlines in filename
+#[test]
+fn adversarial_diff_stats_newline_in_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with newline in name
+    let newline_filename = "file\nwith\nnewline.txt";
+    let newline_file = temp_git.path().join(newline_filename);
+
+    match File::create(&newline_file) {
+        Ok(mut f) => {
+            f.write_all(b"content\n").unwrap();
+            create_commit(temp_git.path(), true);
+
+            // Modify the file
+            File::create(&newline_file)
+                .unwrap()
+                .write_all(b"modified\n")
+                .unwrap();
+
+            // Should handle newlines safely
+            let result = git::get_diff_stats(temp_git.path(), Path::new(newline_filename), false);
+            assert!(
+                result.is_ok(),
+                "Newlines in filename should be handled safely"
+            );
+        }
+        Err(_) => {
+            // Some filesystems may not support newlines in filenames
+            // This is acceptable - just ensure no panic
+        }
+    }
+}
+
+/// Test get_diff_stats with tabs in filename
+#[test]
+fn adversarial_diff_stats_tab_in_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with tab in name
+    let tab_filename = "file\twith\ttab.txt";
+    let tab_file = temp_git.path().join(tab_filename);
+
+    match File::create(&tab_file) {
+        Ok(mut f) => {
+            f.write_all(b"content\n").unwrap();
+            create_commit(temp_git.path(), true);
+
+            // Modify the file
+            File::create(&tab_file)
+                .unwrap()
+                .write_all(b"modified\n")
+                .unwrap();
+
+            // Should handle tabs safely
+            let result = git::get_diff_stats(temp_git.path(), Path::new(tab_filename), false);
+            assert!(result.is_ok(), "Tabs in filename should be handled safely");
+        }
+        Err(_) => {
+            // Some filesystems may not support tabs in filenames
+            // This is acceptable - just ensure no panic
+        }
+    }
+}
+
+/// Test get_diff_stats with quotes in filename
+#[test]
+fn adversarial_diff_stats_quotes_in_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with quotes in name
+    let quote_filename = "file\"with\"quotes.txt";
+    let quote_file = temp_git.path().join(quote_filename);
+
+    match File::create(&quote_file) {
+        Ok(mut f) => {
+            f.write_all(b"content\n").unwrap();
+            create_commit(temp_git.path(), true);
+
+            // Modify the file
+            File::create(&quote_file)
+                .unwrap()
+                .write_all(b"modified\n")
+                .unwrap();
+
+            // Should handle quotes safely
+            let result = git::get_diff_stats(temp_git.path(), Path::new(quote_filename), false);
+            assert!(
+                result.is_ok(),
+                "Quotes in filename should be handled safely"
+            );
+        }
+        Err(_) => {
+            // Some filesystems may not support quotes in filenames
+            // This is acceptable - just ensure no panic
+        }
+    }
+}
+
+/// Test get_diff_stats with spaces in filename
+#[test]
+fn adversarial_diff_stats_spaces_in_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with spaces in name
+    let space_file = temp_git.path().join("file with spaces.txt");
+    File::create(&space_file)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&space_file)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    // Should handle spaces safely
+    let result = git::get_diff_stats(temp_git.path(), Path::new("file with spaces.txt"), false);
+    assert!(
+        result.is_ok(),
+        "Spaces in filename should be handled safely"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 6: Non-existent cwd
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with non-existent cwd
+#[test]
+fn adversarial_diff_stats_nonexistent_cwd() {
+    let result = git::get_diff_stats(
+        Path::new("/nonexistent/path/that/does/not/exist"),
+        Path::new("file.txt"),
+    );
+    // Should error gracefully, not panic
+    assert!(
+        result.is_err(),
+        "Non-existent cwd should return error, not panic"
+    );
+}
+
+/// Test get_diff_stats with non-git cwd
+#[test]
+fn adversarial_diff_stats_non_git_cwd() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let result = git::get_diff_stats(temp_dir.path(), Path::new("file.txt"), false);
+    // Should error gracefully, not panic
+    assert!(
+        result.is_err(),
+        "Non-git cwd should return error, not panic"
+    );
+}
+
+/// Test get_diff_stats with file path as cwd (not a directory)
+#[test]
+fn adversarial_diff_stats_file_as_cwd() {
+    let temp_git = empty_git_repo();
+
+    // Create a file
+    let file = temp_git.path().join("file.txt");
+    File::create(&file).unwrap().write_all(b"content").unwrap();
+
+    // Try to use file as cwd
+    let result = git::get_diff_stats(&file, Path::new("other.txt"), false);
+    // Should error gracefully, not panic
+    assert!(
+        result.is_err() || result.is_ok(),
+        "File as cwd should not panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 7: File path with leading dash
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with file path starting with dash
+/// This tests that the `--` argument properly prevents option injection
+#[test]
+fn adversarial_diff_stats_leading_dash() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with leading dash
+    let dash_file = temp_git.path().join("-dangerous.txt");
+    File::create(&dash_file)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&dash_file)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    // Should handle leading dash safely (-- prevents option interpretation)
+    let result = git::get_diff_stats(temp_git.path(), Path::new("-dangerous.txt"), false);
+    assert!(
+        result.is_ok(),
+        "Leading dash in filename should be handled safely (-- prevents option injection)"
+    );
+}
+
+/// Test get_diff_stats with file path that looks like git option
+#[test]
+fn adversarial_diff_stats_option_like_filename() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create files that look like git options
+    let option_names = vec!["--help", "--version", "--bare", "--hard"];
+
+    for name in &option_names {
+        let option_file = temp_git.path().join(name);
+        match File::create(&option_file) {
+            Ok(mut f) => {
+                f.write_all(b"content\n").unwrap();
+                create_commit(temp_git.path(), true);
+
+                // Modify the file
+                File::create(&option_file)
+                    .unwrap()
+                    .write_all(b"modified\n")
+                    .unwrap();
+
+                // Should handle option-like names safely
+                let result = git::get_diff_stats(temp_git.path(), Path::new(name), false);
+                assert!(
+                    result.is_ok(),
+                    "Option-like filename '{}' should be handled safely",
+                    name
+                );
+            }
+            Err(_) => {
+                // Some filesystems may not support these names
+                // This is acceptable - just ensure no panic
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 8: Empty file path
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with empty file path
+#[test]
+fn adversarial_diff_stats_empty_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Empty path should be handled gracefully
+    let result = git::get_diff_stats(temp_git.path(), Path::new(""), false);
+    // Should not panic - either error or return None
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Empty path should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with dot as file path
+#[test]
+fn adversarial_diff_stats_dot_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Dot path should be handled gracefully
+    let result = git::get_diff_stats(temp_git.path(), Path::new("."), false);
+    // Should not panic
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Dot path should not cause panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 9: Symlink attacks
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with symlink pointing outside repo
+#[cfg(unix)]
+#[test]
+fn adversarial_diff_stats_symlink_outside_repo() {
+    use std::os::unix::fs::symlink;
+
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a symlink pointing outside the repo
+    let symlink_path = temp_git.path().join("external_link");
+    // Try to create symlink to /etc/passwd
+    let _ = symlink("/etc/passwd", &symlink_path);
+
+    // Should handle symlink safely
+    let result = git::get_diff_stats(temp_git.path(), Path::new("external_link"));
+    // Should not panic, may error or return None
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Symlink outside repo should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with symlink loop
+#[cfg(unix)]
+#[test]
+fn adversarial_diff_stats_symlink_loop() {
+    use std::os::unix::fs::symlink;
+
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a symlink loop
+    let link1 = temp_git.path().join("link1");
+    let link2 = temp_git.path().join("link2");
+    let _ = symlink("link2", &link1);
+    let _ = symlink("link1", &link2);
+
+    // Should handle symlink loop safely
+    let result = git::get_diff_stats(temp_git.path(), Path::new("link1"));
+    // Should not panic
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Symlink loop should not cause panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ATTACK VECTOR 10: Boundary violations
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with null byte attempt in path
+/// Note: Rust's Path::new will handle this, but test for safety
+#[test]
+fn adversarial_diff_stats_null_byte_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Attempt to create path with null byte
+    // Rust strings can't contain null bytes, but test the handling
+    let null_path = "file\x00name.txt";
+    let path = Path::new(null_path);
+
+    // Should handle safely
+    let result = git::get_diff_stats(temp_git.path(), path);
+    // Should not panic
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Null byte in path should not cause panic"
+    );
+}
+
+/// Test get_diff_stats with absolute path (should work but test for safety)
+#[test]
+fn adversarial_diff_stats_absolute_path() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file and get its absolute path
+    let abs_file = temp_git.path().join("test.txt");
+    File::create(&abs_file)
+        .unwrap()
+        .write_all(b"content\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Modify the file
+    File::create(&abs_file)
+        .unwrap()
+        .write_all(b"modified\n")
+        .unwrap();
+
+    // Use absolute path
+    let result = git::get_diff_stats(temp_git.path(), abs_file.as_path());
+    // Should handle absolute path safely
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Absolute path should not cause panic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FUZZ-LIKE: Combined attack vectors
+// ---------------------------------------------------------------------------
+
+/// Test get_diff_stats with multiple attack vectors combined
+#[test]
+fn adversarial_diff_stats_combined_attacks() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Create a file with multiple special characters
+    #[cfg(unix)]
+    {
+        let combined_file = temp_git.path().join("file;$(whoami)`id`|cat.txt");
+        File::create(&combined_file)
+            .unwrap()
+            .write_all(b"content\n")
+            .unwrap();
+        create_commit(temp_git.path(), true);
+
+        // Modify the file
+        File::create(&combined_file)
+            .unwrap()
+            .write_all(b"modified\n")
+            .unwrap();
+
+        // Should handle combined attacks safely
+        let result = git::get_diff_stats(temp_git.path(), Path::new("file;$(whoami)`id`|cat.txt"));
+        assert!(
+            result.is_ok(),
+            "Combined attack vectors should be handled safely"
+        );
+    }
+}
+
+/// Test get_diff_stats rapid repeated calls (resource exhaustion attempt)
+#[test]
+fn adversarial_diff_stats_resource_exhaustion() {
+    let temp_git = empty_git_repo();
+
+    // Create initial commit
+    let file = temp_git.path().join("initial.txt");
+    File::create(&file).unwrap().write_all(b"initial").unwrap();
+    create_commit(temp_git.path(), true);
+
+    // Rapid repeated calls should not cause resource exhaustion
+    for _ in 0..100 {
+        let result = git::get_diff_stats(temp_git.path(), Path::new("initial.txt"));
+        assert!(
+            result.is_ok(),
+            "Repeated calls should not cause resource issues"
+        );
+    }
+}

@@ -1,8 +1,9 @@
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
+use crate::ui::overlay::overlaid;
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::tree_sitter::Node;
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
-use helix_vcs::git;
+use helix_vcs::{git, StatusEntry};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -853,6 +854,11 @@ pub struct DiffView {
 
     /// Flag to track if we need to scroll to the selected hunk on first render
     needs_initial_scroll: bool,
+
+    /// List of all files in the git status (for n/p navigation)
+    files: Vec<StatusEntry>,
+    /// Current file index in the files list
+    file_index: usize,
 }
 
 impl DiffView {
@@ -866,6 +872,8 @@ impl DiffView {
         doc_id: DocumentId,
         existing_syntax: Option<Arc<Syntax>>, // Reuse editor's syntax for performance
         cursor_line: usize,                   // 0-indexed line to position selection near
+        files: Vec<StatusEntry>,              // List of all files for n/p navigation
+        file_index: usize,                    // Current file index in the files list
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -902,6 +910,8 @@ impl DiffView {
             function_context_highlight_cache: RefCell::new(HashMap::new()),
             caches_initialized: false,
             needs_initial_scroll: cursor_line > 0,
+            files,
+            file_index,
         };
 
         view.compute_diff_lines();
@@ -2627,6 +2637,162 @@ impl Component for DiffView {
                         return EventResult::Consumed(Some(stage_fn));
                     }
                 }
+                KeyCode::Char('n') => {
+                    // Next file in the file list
+                    if self.file_index + 1 < self.files.len() {
+                        let next_index = self.file_index + 1;
+                        let next_entry = self.files[next_index].clone();
+                        let file_path = next_entry.change.path().to_path_buf();
+                        let files = self.files.clone();
+
+                        // Create a callback that closes current diff and opens next file's diff
+                        let next_fn: Callback =
+                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                                // Pop the current diff view
+                                compositor.pop();
+
+                                // Open the next file
+                                let doc_id = match cx.editor.open(&file_path, Action::Replace) {
+                                    Ok(id) => id,
+                                    Err(_) => {
+                                        cx.editor.set_error(format!(
+                                            "Failed to open {}",
+                                            file_path.display()
+                                        ));
+                                        return;
+                                    }
+                                };
+                                let doc = helix_view::doc_mut!(cx.editor, &doc_id);
+
+                                // Get diff handle
+                                let diff_handle = match doc.diff_handle() {
+                                    Some(h) => h,
+                                    None => {
+                                        cx.editor.set_error("No diff available");
+                                        return;
+                                    }
+                                };
+
+                                // Get diff data
+                                let diff = diff_handle.load();
+                                let diff_base = diff.diff_base().clone();
+                                let doc_text = diff.doc().clone();
+                                let hunks: Vec<Hunk> =
+                                    (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+
+                                // Get file name and path info
+                                let file_name = file_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "untitled".to_string());
+                                let absolute_path = file_path.clone();
+
+                                // Get syntax for highlighting
+                                let existing_syntax = doc.syntax_arc();
+
+                                // Create new DiffView
+                                let diff_view = DiffView::new(
+                                    diff_base,
+                                    doc_text,
+                                    hunks,
+                                    file_name,
+                                    file_path.clone(),
+                                    absolute_path,
+                                    doc_id,
+                                    existing_syntax,
+                                    0, // cursor_line
+                                    files,
+                                    next_index,
+                                );
+
+                                // Push new diff view
+                                compositor.push(Box::new(overlaid(diff_view)));
+                            });
+
+                        return EventResult::Consumed(Some(next_fn));
+                    } else if !self.files.is_empty() {
+                        // At the last file, show a message
+                        cx.editor.set_status("Already at last file");
+                    }
+                }
+                KeyCode::Char('p') => {
+                    // Previous file in the file list
+                    if self.file_index > 0 && !self.files.is_empty() {
+                        let prev_index = self.file_index - 1;
+                        let prev_entry = self.files[prev_index].clone();
+                        let file_path = prev_entry.change.path().to_path_buf();
+                        let files = self.files.clone();
+
+                        // Create a callback that closes current diff and opens prev file's diff
+                        let prev_fn: Callback =
+                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                                // Pop the current diff view
+                                compositor.pop();
+
+                                // Open the previous file
+                                let doc_id = match cx.editor.open(&file_path, Action::Replace) {
+                                    Ok(id) => id,
+                                    Err(_) => {
+                                        cx.editor.set_error(format!(
+                                            "Failed to open {}",
+                                            file_path.display()
+                                        ));
+                                        return;
+                                    }
+                                };
+                                let doc = helix_view::doc_mut!(cx.editor, &doc_id);
+
+                                // Get diff handle
+                                let diff_handle = match doc.diff_handle() {
+                                    Some(h) => h,
+                                    None => {
+                                        cx.editor.set_error("No diff available");
+                                        return;
+                                    }
+                                };
+
+                                // Get diff data
+                                let diff = diff_handle.load();
+                                let diff_base = diff.diff_base().clone();
+                                let doc_text = diff.doc().clone();
+                                let hunks: Vec<Hunk> =
+                                    (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+
+                                // Get file name and path info
+                                let file_name = file_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "untitled".to_string());
+                                let absolute_path = file_path.clone();
+
+                                // Get syntax for highlighting
+                                let existing_syntax = doc.syntax_arc();
+
+                                // Create new DiffView
+                                let diff_view = DiffView::new(
+                                    diff_base,
+                                    doc_text,
+                                    hunks,
+                                    file_name,
+                                    file_path.clone(),
+                                    absolute_path,
+                                    doc_id,
+                                    existing_syntax,
+                                    0, // cursor_line
+                                    files,
+                                    prev_index,
+                                );
+
+                                // Push new diff view
+                                compositor.push(Box::new(overlaid(diff_view)));
+                            });
+
+                        return EventResult::Consumed(Some(prev_fn));
+                    } else if !self.files.is_empty() {
+                        // At the first file, show a message
+                        cx.editor.set_status("Already at first file");
+                    }
+                }
                 _ => {}
             }
         }
@@ -3028,6 +3194,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3075,6 +3243,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3110,6 +3280,8 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3147,6 +3319,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3178,6 +3352,8 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3220,6 +3396,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3249,6 +3427,8 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3310,6 +3490,8 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3387,6 +3569,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let esc_event = Event::Key(helix_view::input::KeyEvent {
@@ -3432,6 +3616,8 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3500,6 +3686,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Send Enter key
@@ -3552,6 +3740,8 @@ mod diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // The hunk's after.start should be 5 (0-indexed line number in working copy)
@@ -3602,6 +3792,8 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3657,6 +3849,8 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3794,6 +3988,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
     }
 
@@ -3813,6 +4009,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3836,6 +4034,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3857,6 +4057,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3883,6 +4085,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic - test passes if we reach here
@@ -3906,6 +4110,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic - test passes if we reach here
@@ -3928,6 +4134,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -3954,6 +4162,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -3976,6 +4186,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4004,6 +4216,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -4025,6 +4239,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4054,6 +4270,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         diff_view.scroll = 100;
@@ -4078,6 +4296,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4105,6 +4325,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let content_area = Rect::new(0, 0, 0, 10)
@@ -4129,6 +4351,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4155,6 +4379,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let content_area = Rect::new(0, 0, 80, 0)
@@ -4180,6 +4406,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let inner_height = 1u16;
@@ -4203,6 +4431,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4229,6 +4459,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(true);
@@ -4249,6 +4481,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4272,6 +4506,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -4293,6 +4529,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -4313,6 +4551,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4345,6 +4585,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4763,6 +5005,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // First line should be at screen row 0
@@ -4790,6 +5034,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4823,6 +5069,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic with usize::MAX
@@ -4853,6 +5101,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Screen row 0 should map to diff line 0
@@ -4880,6 +5130,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4913,6 +5165,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic with usize::MAX
@@ -4942,6 +5196,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -4995,6 +5251,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Count HunkHeaders
@@ -5039,6 +5297,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5088,6 +5348,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Find HunkHeader and verify it handles long text
@@ -5126,6 +5388,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/测试文件.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5172,6 +5436,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Set scroll to exactly max_scroll
@@ -5212,6 +5478,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5268,6 +5536,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // For each diff line, convert to screen row and verify it maps back
@@ -5300,6 +5570,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5347,6 +5619,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5406,6 +5680,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle wide unicode without issues
@@ -5447,6 +5723,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Set scroll to some value
@@ -5483,6 +5761,8 @@ mod adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle extreme line numbers without panic
@@ -5513,6 +5793,8 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5584,6 +5866,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -5715,6 +5999,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Navigate to second hunk using J (Shift+j)
@@ -5803,6 +6089,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // With 1 hunk, indicator should be [1/1]
@@ -5857,6 +6145,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -5950,6 +6240,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "Should start at hunk 0");
@@ -5975,6 +6267,8 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
+                Vec::new(),
                 0,
             )
         };
@@ -6003,6 +6297,8 @@ mod selectable_diff_view_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             )
         };
 
@@ -6029,6 +6325,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -6058,6 +6356,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "selected_hunk should be 0");
@@ -6082,6 +6382,8 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
+                Vec::new(),
                 0,
             )
         };
@@ -6115,6 +6417,8 @@ mod selectable_diff_view_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             )
         };
 
@@ -6147,6 +6451,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // For no hunks, indicator should show [0/0]
@@ -6170,6 +6476,8 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
+                Vec::new(),
                 0,
             )
         };
@@ -6278,6 +6586,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Verify hunk_boundaries is empty
@@ -6322,6 +6632,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/large.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -6711,6 +7023,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Verify diff_lines is empty
@@ -6758,6 +7072,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -6852,6 +7168,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -6963,6 +7281,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
@@ -7006,6 +7326,8 @@ mod selectable_diff_view_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Verify the path is stored as-is (no sanitization, but also no execution)
@@ -7044,6 +7366,8 @@ mod selectable_diff_view_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Navigate - should not panic with unicode content
@@ -7076,6 +7400,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/large.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -7517,6 +7843,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let hunk_start = diff_view.hunk_boundaries[0].start;
@@ -7668,6 +7996,8 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -7866,6 +8196,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Verify empty state
@@ -8003,6 +8335,8 @@ mod selectable_diff_view_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Rapidly navigate through all adjacent hunks
@@ -8070,6 +8404,8 @@ mod stage_hunk_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // WorkingCopy context: should use doc for context lines
@@ -8130,6 +8466,8 @@ mod stage_hunk_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // This is how stage operation generates the patch (line 659)
@@ -8175,6 +8513,8 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -8224,6 +8564,8 @@ mod stage_hunk_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Stage uses Index context
@@ -8269,6 +8611,8 @@ mod stage_hunk_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Stage uses Index context
@@ -8309,6 +8653,8 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -8352,6 +8698,8 @@ mod stage_hunk_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let patch_working =
@@ -8391,6 +8739,8 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -9065,6 +9415,8 @@ mod syntax_highlighting_tests {
             PathBuf::from("/tmp/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -10364,6 +10716,8 @@ mod performance_caching_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         )
     }
 
@@ -10963,6 +11317,8 @@ mod function_context_styling_tests {
             helix_view::DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         )
     }
 
@@ -11428,6 +11784,8 @@ mod box_decoration_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -12295,6 +12653,8 @@ mod phase7_adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Count hunk headers
@@ -12460,6 +12820,8 @@ mod phase7_adversarial_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle Unicode content without panicking
@@ -12489,6 +12851,8 @@ mod phase7_adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -12567,6 +12931,8 @@ mod screen_row_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         )
     }
 
@@ -12599,6 +12965,8 @@ mod screen_row_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         )
     }
 
@@ -12621,6 +12989,8 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -12869,6 +13239,8 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -14847,6 +15219,8 @@ mod phase7_ux_refinement_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Initial state: first hunk selected
@@ -14883,6 +15257,8 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -14927,6 +15303,8 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -15274,6 +15652,8 @@ mod phase7_ux_refinement_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Verify initial state: first line should be HunkHeader
@@ -15445,6 +15825,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Set scroll to 0
@@ -15475,6 +15857,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -15512,6 +15896,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Set scroll way beyond total
@@ -15543,6 +15929,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -15666,6 +16054,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Count HunkHeaders
@@ -15713,6 +16103,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -15758,6 +16150,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16032,6 +16426,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Set extreme scroll
@@ -16074,6 +16470,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic with extreme line numbers
@@ -16101,6 +16499,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16135,6 +16535,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16181,6 +16583,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16260,6 +16664,8 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16454,6 +16860,8 @@ mod adversarial_diff_view_fixes {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Test scroll behavior
@@ -16556,6 +16964,8 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // ATTACK: Set scroll to 0
@@ -16607,6 +17017,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16664,6 +17076,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16725,6 +17139,8 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Find the first HunkHeader
@@ -16784,6 +17200,8 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         diff_view.scroll = 0;
@@ -16820,6 +17238,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16860,6 +17280,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16909,6 +17331,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -16965,6 +17389,8 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // ATTACK: Rapidly change scroll and navigate
@@ -17016,6 +17442,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -17096,6 +17524,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -17191,6 +17621,8 @@ mod adversarial_scroll_indentation_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Navigate - should not panic with unicode content
@@ -17241,6 +17673,8 @@ mod adversarial_scroll_indentation_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Verify file_name is stored correctly
@@ -17285,6 +17719,8 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from(format!("/fake/path/wide_{}.txt", width)),
                 DocumentId::default(),
                 None,
+                0,
+                Vec::new(),
                 0,
             );
 
@@ -17351,6 +17787,8 @@ mod adversarial_scroll_indentation_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Navigate through all hunks
@@ -17404,6 +17842,8 @@ mod adversarial_scroll_indentation_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Verify diff_lines are created
@@ -17452,6 +17892,8 @@ mod adversarial_scroll_indentation_tests {
                 DocumentId::default(),
                 None,
                 0,
+                Vec::new(),
+                0,
             );
 
             // Verify no panic occurs
@@ -17483,6 +17925,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/测试🎉.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -17526,6 +17970,8 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/多言語.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -17585,6 +18031,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -17982,6 +18430,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should have context lines
@@ -18012,6 +18462,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18086,6 +18538,8 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -18222,6 +18676,8 @@ mod adversarial_scroll_selection_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Find the HunkHeader
@@ -18274,6 +18730,8 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18400,6 +18858,8 @@ mod adversarial_scroll_selection_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Find a context line at the start
@@ -18438,6 +18898,8 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18604,6 +19066,8 @@ mod adversarial_scroll_selection_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // All scroll operations should be safe
@@ -18634,6 +19098,8 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/single.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18746,6 +19212,8 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18865,6 +19333,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             shared_syntax,
             0,
+            Vec::new(),
+            0,
         );
 
         // Verify the DiffView was created successfully
@@ -18899,6 +19369,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             syntax_ref,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle None gracefully
@@ -18928,6 +19400,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let view2 = DiffView::new(
@@ -18940,6 +19414,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         let view3 = DiffView::new(
@@ -18951,6 +19427,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -18981,6 +19459,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             shared_syntax.clone(),
             0,
+            Vec::new(),
+            0,
         );
 
         let view2 = DiffView::new(
@@ -18992,6 +19472,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             shared_syntax,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19021,6 +19503,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not have cached syntax
@@ -19048,6 +19532,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(diff_view.diff_lines.is_empty());
@@ -19071,6 +19557,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/binary.bin"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19101,6 +19589,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle gracefully
@@ -19124,6 +19614,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19161,6 +19653,8 @@ mod adversarial_performance_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle large documents
@@ -19187,6 +19681,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/longlines.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19219,6 +19715,8 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/manyhunks.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19268,6 +19766,8 @@ impl Foo {
             PathBuf::from("/fake/path/complex.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19325,6 +19825,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Word diff cache should be empty for empty diff
@@ -19348,6 +19850,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Syntax highlight cache should be empty before initialization
@@ -19370,6 +19874,8 @@ impl Foo {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19398,6 +19904,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Caches should not be initialized on creation
@@ -19420,6 +19928,8 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19454,6 +19964,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -19476,6 +19988,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -19497,6 +20011,8 @@ impl Foo {
             PathBuf::from("/fake/path/mixed.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19524,6 +20040,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should handle hunks at boundaries
@@ -19549,6 +20067,8 @@ impl Foo {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Should not panic
@@ -19573,6 +20093,8 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
@@ -19631,6 +20153,8 @@ mod lazy_evaluation_adversarial_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -20534,6 +21058,8 @@ mod adversarial_function_context_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         )
     }
@@ -22980,6 +23506,8 @@ mod adversarial_whitespace_highlight_tests {
             DocumentId::default(),
             None,
             0,
+            Vec::new(),
+            0,
         );
 
         // Get the actual length of diff_lines
@@ -23144,6 +23672,8 @@ mod adversarial_whitespace_highlight_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
+            Vec::new(),
             0,
         );
 
