@@ -18,10 +18,58 @@ use gix::status::{
 };
 use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
 
-use crate::FileChange;
+use crate::{FileChange, StatusEntry};
 
 #[cfg(test)]
 mod test;
+
+/// Unquote a path from git porcelain v1 format.
+/// Git quotes paths containing special characters (spaces, tabs, newlines, etc.)
+/// using C-style escaping with surrounding double quotes.
+fn unquote_porcelain_path(s: &str) -> String {
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        // Unescape C-style: \n, \t, \r, \", \\
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    match next {
+                        'n' => {
+                            result.push('\n');
+                            chars.next();
+                        }
+                        't' => {
+                            result.push('\t');
+                            chars.next();
+                        }
+                        'r' => {
+                            result.push('\r');
+                            chars.next();
+                        }
+                        '"' => {
+                            result.push('"');
+                            chars.next();
+                        }
+                        '\\' => {
+                            result.push('\\');
+                            chars.next();
+                        }
+                        _ => result.push(c),
+                    }
+                } else {
+                    result.push(c);
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    } else {
+        s.to_string()
+    }
+}
 
 #[inline]
 fn get_repo_dir(file: &Path) -> Result<&Path> {
@@ -202,6 +250,166 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
+}
+
+/// Get git status using porcelain format.
+/// Returns a vector of StatusEntry with staged/unstaged info.
+///
+/// Uses `git status --porcelain=v1` which outputs `XY PATH` format where:
+/// - X = staged status (index status)
+/// - Y = unstaged status (worktree status)
+///
+/// A file can appear twice if it has both staged and unstaged changes (e.g., `MM`).
+pub fn get_status_porcelain(cwd: &Path) -> Result<Vec<StatusEntry>> {
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git status --porcelain=v1")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git status --porcelain=v1 failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    // Get the repository root to construct absolute paths
+    let repo = open_repo(cwd)?;
+    let repo_local = repo.to_thread_local();
+    let work_dir = repo_local
+        .workdir()
+        .context("working tree not found")?
+        .to_path_buf();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse the porcelain format: XY PATH or XY OLD_PATH -> NEW_PATH
+        // X = index status (staged), Y = worktree status (unstaged)
+        if line.len() < 3 {
+            continue;
+        }
+
+        let x = line.chars().next().unwrap_or(' '); // staged status
+        let y = line.chars().nth(1).unwrap_or(' '); // unstaged status
+        let path_part = &line[3..]; // Skip "XY "
+
+        // Handle renamed/copied files: "R  OLD -> NEW" or "C  OLD -> NEW" format
+        // Note: When Y='R' or Y='C', the staged changes (X status) are at OLD path,
+        // not NEW path. E.g., "MR OLD -> NEW" means staged modification at OLD,
+        // unstaged rename to NEW.
+        let (path, from_path) = if x == 'R' || y == 'R' || x == 'C' || y == 'C' {
+            if let Some((old_path, new_path)) = path_part.split_once(" -> ") {
+                (
+                    unquote_porcelain_path(new_path),
+                    Some(unquote_porcelain_path(old_path)),
+                )
+            } else {
+                // Malformed rename entry, skip
+                continue;
+            }
+        } else {
+            (unquote_porcelain_path(path_part), None)
+        };
+
+        // Check for untracked files first (special case: ??)
+        if x == '?' && y == '?' {
+            entries.push(StatusEntry {
+                change: FileChange::Untracked {
+                    path: work_dir.join(&path),
+                },
+                staged: false,
+                additions: None,
+                deletions: None,
+            });
+            continue;
+        }
+
+        // Check for conflict states BEFORE individual status codes
+        // Conflicts: UU, AA, DD, AU, UA, DU, UD (all unmerged states)
+        let is_conflict = matches!(
+            (x, y),
+            ('U', 'U')
+                | ('A', 'A')
+                | ('D', 'D')
+                | ('A', 'U')
+                | ('U', 'A')
+                | ('D', 'U')
+                | ('U', 'D')
+        );
+        if is_conflict {
+            entries.push(StatusEntry {
+                change: FileChange::Conflict {
+                    path: work_dir.join(&path),
+                },
+                staged: true,
+                additions: None,
+                deletions: None,
+            });
+            continue;
+        }
+
+        // Helper to create FileChange from status code
+        let make_change = |code: char, path: &str, from_path: Option<&str>| -> Option<FileChange> {
+            match code {
+                'M' => Some(FileChange::Modified {
+                    path: work_dir.join(path),
+                }),
+                'A' => Some(FileChange::Modified {
+                    path: work_dir.join(path),
+                }), // Added files treated as modified
+                'D' => Some(FileChange::Deleted {
+                    path: work_dir.join(path),
+                }),
+                'R' => Some(FileChange::Renamed {
+                    from_path: work_dir.join(from_path.unwrap_or_default()),
+                    to_path: work_dir.join(path),
+                }),
+                'C' => Some(FileChange::Renamed {
+                    from_path: work_dir.join(from_path.unwrap_or_default()),
+                    to_path: work_dir.join(path),
+                }),
+                _ => None,
+            }
+        };
+
+        // Handle staged changes (X status)
+        // When Y='R' or Y='C', staged changes are at OLD path (from_path), not NEW path
+        if x != ' ' {
+            let staged_path = if (y == 'R' || y == 'C') && from_path.is_some() {
+                from_path.as_deref().unwrap_or(&path)
+            } else {
+                &path
+            };
+            if let Some(change) = make_change(x, staged_path, from_path.as_deref()) {
+                entries.push(StatusEntry {
+                    change,
+                    staged: true,
+                    additions: None,
+                    deletions: None,
+                });
+            }
+        }
+
+        // Handle unstaged changes (Y status)
+        if y != ' ' {
+            if let Some(change) = make_change(y, &path, from_path.as_deref()) {
+                entries.push(StatusEntry {
+                    change,
+                    staged: false,
+                    additions: None,
+                    deletions: None,
+                });
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {

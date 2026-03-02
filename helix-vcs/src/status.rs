@@ -28,3 +28,16 @@ impl FileChange {
         }
     }
 }
+
+/// Represents a file change with staged/unstaged status information.
+/// Used for porcelain-style git status output.
+pub struct StatusEntry {
+    /// The file change (path and type of change)
+    pub change: FileChange,
+    /// Whether this change is staged (in the index)
+    pub staged: bool,
+    /// Number of additions (from git diff --numstat), if available
+    pub additions: Option<usize>,
+    /// Number of deletions (from git diff --numstat), if available
+    pub deletions: Option<usize>,
+}
