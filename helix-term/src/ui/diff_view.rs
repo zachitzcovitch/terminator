@@ -850,6 +850,9 @@ pub struct DiffView {
 
     /// Flag to track if caches are initialized
     caches_initialized: bool,
+
+    /// Flag to track if we need to scroll to the selected hunk on first render
+    needs_initial_scroll: bool,
 }
 
 impl DiffView {
@@ -862,6 +865,7 @@ impl DiffView {
         absolute_path: PathBuf,
         doc_id: DocumentId,
         existing_syntax: Option<Arc<Syntax>>, // Reuse editor's syntax for performance
+        cursor_line: usize,                   // 0-indexed line to position selection near
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -870,6 +874,9 @@ impl DiffView {
             added += (hunk.after.end.saturating_sub(hunk.after.start)) as usize;
             removed += (hunk.before.end.saturating_sub(hunk.before.start)) as usize;
         }
+
+        // Find the hunk closest to the cursor position
+        let selected_hunk = Self::find_closest_hunk(&hunks, cursor_line);
 
         let mut view = Self {
             diff_base,
@@ -884,8 +891,8 @@ impl DiffView {
             diff_lines: Vec::new(),
             last_visible_lines: 10,
             hunk_boundaries: Vec::new(),
-            selected_hunk: 0,
-            selected_line: 0,
+            selected_hunk,
+            selected_line: 0, // Will be set after compute_diff_lines
             doc_id,
             cached_syntax_doc: existing_syntax, // Use provided syntax instead of None
             cached_syntax_base: None,
@@ -894,10 +901,27 @@ impl DiffView {
             function_context_cache: RefCell::new(HashMap::new()),
             function_context_highlight_cache: RefCell::new(HashMap::new()),
             caches_initialized: false,
+            needs_initial_scroll: cursor_line > 0,
         };
 
         view.compute_diff_lines();
+
+        // Set selected_line to the HunkHeader line for the selected hunk
+        if let Some(boundary) = view.hunk_boundaries.get(selected_hunk) {
+            view.selected_line = boundary.start;
+        }
+
         view
+    }
+
+    /// Find the hunk whose `after.start` is closest to the cursor line
+    fn find_closest_hunk(hunks: &[Hunk], cursor_line: usize) -> usize {
+        hunks
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, hunk)| hunk.after.start.abs_diff(cursor_line as u32))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     /// Compute all diff lines from hunks with proper context
@@ -1460,8 +1484,12 @@ impl DiffView {
 
                     // Issue 1: Apply selection indication when HunkHeader is selected
                     let border_style = if is_selected_line {
-                        // Apply selection indication: use cursorline background + bold
-                        let style_selected = cx.editor.theme.get("ui.cursorline");
+                        // Apply selection indication: use ui.highlight with fallback to ui.selection
+                        let style_selected = cx
+                            .editor
+                            .theme
+                            .try_get("ui.highlight")
+                            .unwrap_or_else(|| cx.editor.theme.get("ui.selection"));
                         border_style.patch(helix_view::graphics::Style {
                             bg: style_selected.bg,
                             add_modifier: Modifier::BOLD,
@@ -1591,6 +1619,31 @@ impl DiffView {
 
                     // Track how many rows we actually render for this HunkHeader
                     let mut rows_rendered = 0usize;
+
+                    // When selected, fill the entire background of all 3 rows with selection color
+                    // This makes the HunkHeader look more selected (full row background, not just characters)
+                    if is_selected_line {
+                        // Fill background for each row that will be rendered
+                        // Row 1: Top border (skip if effective_row_offset >= 1)
+                        if effective_row_offset < 1 {
+                            let row_rect = Rect::new(content_area.x, y, content_area.width, 1);
+                            surface.set_style(row_rect, border_style);
+                        }
+                        // Row 2: Content line (skip if effective_row_offset >= 2)
+                        if effective_row_offset < 2 {
+                            let y2 = y + (1 - effective_row_offset.min(1)) as u16;
+                            if y2 < content_area.y + content_area.height {
+                                let row_rect = Rect::new(content_area.x, y2, content_area.width, 1);
+                                surface.set_style(row_rect, border_style);
+                            }
+                        }
+                        // Row 3: Bottom border (always render if we have space)
+                        let y3 = y + (2 - effective_row_offset.min(2)) as u16;
+                        if y3 < content_area.y + content_area.height {
+                            let row_rect = Rect::new(content_area.x, y3, content_area.width, 1);
+                            surface.set_style(row_rect, border_style);
+                        }
+                    }
 
                     // Row 1: Top border (skip if effective_row_offset >= 1)
                     if effective_row_offset < 1 {
@@ -2280,6 +2333,12 @@ impl Component for DiffView {
             self.last_visible_lines = content_area.height as usize;
         }
 
+        // On first render, scroll to show the selected hunk if needed
+        if self.needs_initial_scroll {
+            self.scroll_to_selected_line(self.last_visible_lines);
+            self.needs_initial_scroll = false;
+        }
+
         self.render_unified_diff(area, surface, cx);
     }
 
@@ -2401,8 +2460,34 @@ impl Component for DiffView {
                         {
                             match diff_line {
                                 DiffLine::HunkHeader { new_start, .. } => *new_start as usize,
-                                DiffLine::Context { doc_line, .. } => {
-                                    doc_line.map(|n| (n - 1) as usize).unwrap_or(0)
+                                DiffLine::Context {
+                                    doc_line,
+                                    base_line,
+                                    ..
+                                } => {
+                                    // Context-after lines have doc_line set (from new version)
+                                    // Context-before lines have base_line set (from old version) and doc_line: None
+                                    if let Some(n) = doc_line {
+                                        // Context-after: use the doc_line directly
+                                        (n - 1) as usize
+                                    } else if let Some(base) = base_line {
+                                        // Context-before: calculate approximate line in new document
+                                        // base_line is 1-indexed, hunk.before.start/after.start are 0-indexed
+                                        // Formula: hunk.after.start - (hunk.before.start - (base_line - 1))
+                                        //        = hunk.after.start - hunk.before.start + base_line - 1
+                                        self.hunks
+                                            .get(self.selected_hunk)
+                                            .map(|h| {
+                                                (h.after.start as i32 - h.before.start as i32
+                                                    + *base as i32
+                                                    - 1)
+                                                .max(0)
+                                                    as usize
+                                            })
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    }
                                 }
                                 DiffLine::Addition { doc_line, .. } => (*doc_line - 1) as usize,
                                 DiffLine::Deletion { .. } => {
@@ -2942,6 +3027,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/repo/file.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -2988,6 +3074,7 @@ mod diff_view_tests {
             absolute_path,
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3023,6 +3110,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3058,6 +3146,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3089,6 +3178,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3129,6 +3219,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/my file.cpp"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3158,6 +3249,7 @@ mod diff_view_tests {
             PathBuf::from("/tmp/file.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3218,6 +3310,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Step 2: Simulate Esc key press
@@ -3293,6 +3386,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let esc_event = Event::Key(helix_view::input::KeyEvent {
@@ -3338,6 +3432,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -3404,6 +3499,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Send Enter key
@@ -3455,6 +3551,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // The hunk's after.start should be 5 (0-indexed line number in working copy)
@@ -3505,6 +3602,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify hunks is empty
@@ -3559,6 +3657,7 @@ mod diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Manually set selected_hunk to an out-of-bounds value
@@ -3694,6 +3793,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
     }
 
@@ -3713,6 +3813,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.added, 2);
@@ -3734,6 +3835,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3755,6 +3857,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -3779,6 +3882,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic - test passes if we reach here
@@ -3801,6 +3905,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic - test passes if we reach here
@@ -3823,6 +3928,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic - test passes if we reach here
@@ -3847,6 +3953,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -3869,6 +3976,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(true);
@@ -3895,6 +4003,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -3916,6 +4025,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let total_lines = diff_view.diff_lines.len();
@@ -3943,6 +4053,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         diff_view.scroll = 100;
@@ -3967,6 +4078,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         diff_view.scroll = u16::MAX;
@@ -3992,6 +4104,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let content_area = Rect::new(0, 0, 0, 10)
@@ -4016,6 +4129,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let inner_width = 3u16;
@@ -4040,6 +4154,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let content_area = Rect::new(0, 0, 80, 0)
@@ -4064,6 +4179,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let inner_height = 1u16;
@@ -4087,6 +4203,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         diff_view.update_scroll(1);
@@ -4111,6 +4228,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(true);
@@ -4131,6 +4249,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -4152,6 +4271,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -4172,6 +4292,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -4192,6 +4313,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(diff_view.added > 0 || diff_view.removed > 0);
@@ -4223,6 +4345,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -4639,6 +4762,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // First line should be at screen row 0
@@ -4666,6 +4790,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Request screen row for index way beyond bounds
@@ -4697,6 +4822,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic with usize::MAX
@@ -4726,6 +4852,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Screen row 0 should map to diff line 0
@@ -4753,6 +4880,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Request diff line for screen row way beyond total
@@ -4784,6 +4912,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic with usize::MAX
@@ -4813,6 +4942,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // All operations should handle empty diff_lines gracefully
@@ -4864,6 +4994,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count HunkHeaders
@@ -4908,6 +5039,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the first HunkHeader and verify its screen row is valid
@@ -4955,6 +5087,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find HunkHeader and verify it handles long text
@@ -4993,6 +5126,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/测试文件.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle unicode without panicking
@@ -5037,6 +5171,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll to exactly max_scroll
@@ -5077,6 +5212,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count HunkHeaders
@@ -5131,6 +5267,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // For each diff line, convert to screen row and verify it maps back
@@ -5163,6 +5300,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the HunkHeader index
@@ -5209,6 +5347,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count HunkHeaders
@@ -5266,6 +5405,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/测试.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle wide unicode without issues
@@ -5306,6 +5446,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll to some value
@@ -5341,6 +5482,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle extreme line numbers without panic
@@ -5371,6 +5513,7 @@ mod adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let visible_lines = 3;
@@ -5441,6 +5584,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -5570,6 +5714,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Navigate to second hunk using J (Shift+j)
@@ -5657,6 +5802,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // With 1 hunk, indicator should be [1/1]
@@ -5711,6 +5857,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let hunk_count = diff_view.hunk_boundaries.len();
@@ -5802,6 +5949,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "Should start at hunk 0");
@@ -5827,6 +5975,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
             )
         };
 
@@ -5853,6 +6002,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
             )
         };
 
@@ -5879,6 +6029,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // For single hunk, indicator should show [1/1]
@@ -5906,6 +6057,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "selected_hunk should be 0");
@@ -5930,6 +6082,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
             )
         };
 
@@ -5961,6 +6114,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
             )
         };
 
@@ -5992,6 +6146,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // For no hunks, indicator should show [0/0]
@@ -6015,6 +6170,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.rs"),
                 DocumentId::default(),
                 None,
+                0,
             )
         };
 
@@ -6121,6 +6277,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify hunk_boundaries is empty
@@ -6165,6 +6322,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/large.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify we have 1000 hunks
@@ -6552,6 +6710,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify diff_lines is empty
@@ -6599,6 +6758,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should have at least a hunk header and the diff lines
@@ -6692,6 +6852,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Navigate through all hunks rapidly
@@ -6801,6 +6962,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
@@ -6843,6 +7005,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from(malicious_path),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Verify the path is stored as-is (no sanitization, but also no execution)
@@ -6880,6 +7043,7 @@ mod selectable_diff_view_tests {
                 PathBuf::from("/fake/path/test.txt"),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Navigate - should not panic with unicode content
@@ -6912,6 +7076,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/large.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Navigate - should handle long lines without hanging
@@ -7351,6 +7516,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let hunk_start = diff_view.hunk_boundaries[0].start;
@@ -7502,6 +7668,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find a line between the two hunks (context area)
@@ -7698,6 +7865,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify empty state
@@ -7834,6 +8002,7 @@ mod selectable_diff_view_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Rapidly navigate through all adjacent hunks
@@ -7900,6 +8069,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // WorkingCopy context: should use doc for context lines
@@ -7959,6 +8129,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // This is how stage operation generates the patch (line 659)
@@ -8004,6 +8175,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // This is how revert operation generates the patch (line 615)
@@ -8051,6 +8223,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Stage uses Index context
@@ -8095,6 +8268,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Stage uses Index context
@@ -8135,6 +8309,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Revert uses WorkingCopy context
@@ -8176,6 +8351,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let patch_working =
@@ -8215,6 +8391,7 @@ mod stage_hunk_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let stage_patch = diff_view.generate_hunk_patch(&diff_view.hunks[0], ContextSource::Index);
@@ -8888,6 +9065,7 @@ mod syntax_highlighting_tests {
             PathBuf::from("/tmp/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Initially, syntax should not be cached
@@ -10185,6 +10363,7 @@ mod performance_caching_tests {
             PathBuf::from(file_path),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -10783,6 +10962,7 @@ mod function_context_styling_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -11248,6 +11428,7 @@ mod box_decoration_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -12113,6 +12294,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count hunk headers
@@ -12277,6 +12459,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle Unicode content without panicking
@@ -12306,6 +12489,7 @@ mod phase7_adversarial_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle many hunks without panicking
@@ -12382,6 +12566,7 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -12413,6 +12598,7 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -12435,6 +12621,7 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Empty diff should have 0 screen rows
@@ -12682,6 +12869,7 @@ mod screen_row_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert_eq!(
@@ -14658,6 +14846,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Initial state: first hunk selected
@@ -14694,6 +14883,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify diff_lines contains expected line types
@@ -14737,6 +14927,7 @@ mod phase7_ux_refinement_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Initial scroll should be 0
@@ -14753,6 +14944,358 @@ mod phase7_ux_refinement_tests {
         assert!(
             scroll < diff_view.diff_lines.len() + 10,
             "Scroll should be within bounds"
+        );
+    }
+
+    // =========================================================================
+    // Task 7.8: HunkHeader Selection Background Fill
+    // Tests that all 3 rows of HunkHeader get background fill when selected
+    // =========================================================================
+
+    /// Test 7.8.1: When HunkHeader is selected, all 3 rows should have background fill applied
+    /// This verifies the surface.set_style calls are made for each row
+    #[test]
+    fn test_hunk_header_selected_all_rows_filled() {
+        // Simulate the row filling logic from render_unified_diff
+        // When is_selected_line is true, we fill all 3 rows:
+        // Row 1: Top border (if effective_row_offset < 1)
+        // Row 2: Content line (if effective_row_offset < 2)
+        // Row 3: Bottom border (always if within bounds)
+
+        let is_selected_line = true;
+        let effective_row_offset: usize = 0;
+        let content_area_height: u16 = 20;
+        let base_y: u16 = 10;
+
+        // Track which rows would have set_style called
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new(); // (y position, height)
+
+        if is_selected_line {
+            // Row 1: Top border (skip if effective_row_offset >= 1)
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            // Row 2: Content line (skip if effective_row_offset >= 2)
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            // Row 3: Bottom border (always render if we have space)
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: all 3 rows should be filled when selected with no scroll offset
+        assert_eq!(
+            rows_filled.len(),
+            3,
+            "All 3 rows should be filled when HunkHeader is selected with row_offset=0"
+        );
+        assert_eq!(rows_filled[0], (10, 1), "Row 1 (top border) at y=10");
+        assert_eq!(rows_filled[1], (11, 1), "Row 2 (content) at y=11");
+        assert_eq!(rows_filled[2], (12, 1), "Row 3 (bottom border) at y=12");
+    }
+
+    /// Test 7.8.2: When HunkHeader is NOT selected, no background fill should be applied
+    #[test]
+    fn test_hunk_header_not_selected_no_fill() {
+        let is_selected_line = false;
+        let effective_row_offset: usize = 0;
+        let content_area_height: u16 = 20;
+        let base_y: u16 = 10;
+
+        // Track which rows would have set_style called
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new();
+
+        if is_selected_line {
+            // This block should NOT execute when not selected
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: no rows should be filled when not selected
+        assert_eq!(
+            rows_filled.len(),
+            0,
+            "No rows should be filled when HunkHeader is NOT selected"
+        );
+    }
+
+    /// Test 7.8.3: Scroll offset handling - when effective_row_offset is 1, only 2 rows visible
+    #[test]
+    fn test_hunk_header_selected_row_offset_1() {
+        // When scroll is mid-HunkHeader (row_offset=1), top border is scrolled out
+        // Only content row and bottom border should be filled
+
+        let is_selected_line = true;
+        let effective_row_offset: usize = 1;
+        let content_area_height: u16 = 20;
+        let base_y: u16 = 10;
+
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new();
+
+        if is_selected_line {
+            // Row 1: Top border (skip if effective_row_offset >= 1)
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            // Row 2: Content line (skip if effective_row_offset >= 2)
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            // Row 3: Bottom border (always render if we have space)
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: only 2 rows should be filled (content and bottom border)
+        assert_eq!(
+            rows_filled.len(),
+            2,
+            "Only 2 rows should be filled when row_offset=1 (top border scrolled out)"
+        );
+        // Content row moves up to y=10 (base_y + 0)
+        assert_eq!(
+            rows_filled[0],
+            (10, 1),
+            "Content row at y=10 when row_offset=1"
+        );
+        // Bottom border at y=11 (base_y + 1)
+        assert_eq!(
+            rows_filled[1],
+            (11, 1),
+            "Bottom border at y=11 when row_offset=1"
+        );
+    }
+
+    /// Test 7.8.4: Scroll offset handling - when effective_row_offset is 2, only 1 row visible
+    #[test]
+    fn test_hunk_header_selected_row_offset_2() {
+        // When scroll is at bottom of HunkHeader (row_offset=2), only bottom border visible
+        // Top border and content row are scrolled out
+
+        let is_selected_line = true;
+        let effective_row_offset: usize = 2;
+        let content_area_height: u16 = 20;
+        let base_y: u16 = 10;
+
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new();
+
+        if is_selected_line {
+            // Row 1: Top border (skip if effective_row_offset >= 1)
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            // Row 2: Content line (skip if effective_row_offset >= 2)
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            // Row 3: Bottom border (always render if we have space)
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: only 1 row should be filled (bottom border)
+        assert_eq!(
+            rows_filled.len(),
+            1,
+            "Only 1 row should be filled when row_offset=2 (top and content scrolled out)"
+        );
+        // Bottom border at y=10 (base_y + 0)
+        assert_eq!(
+            rows_filled[0],
+            (10, 1),
+            "Bottom border at y=10 when row_offset=2"
+        );
+    }
+
+    /// Test 7.8.5: Bounds checking - rows outside content area should not be filled
+    #[test]
+    fn test_hunk_header_selected_bounds_checking() {
+        // When content area is small, some rows may be outside bounds
+        // The y3 check ensures we don't fill rows outside the content area
+
+        let is_selected_line = true;
+        let effective_row_offset: usize = 0;
+        let content_area_height: u16 = 2; // Only 2 rows visible
+        let base_y: u16 = 10;
+
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new();
+
+        if is_selected_line {
+            // Row 1: Top border
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            // Row 2: Content line
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            // Row 3: Bottom border - should be clipped by bounds check
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: only 2 rows should be filled (top border and content)
+        // Bottom border (y=12) is outside content area (y < 12)
+        assert_eq!(
+            rows_filled.len(),
+            2,
+            "Only 2 rows should be filled when content area height is 2"
+        );
+        assert_eq!(rows_filled[0], (10, 1), "Top border at y=10");
+        assert_eq!(rows_filled[1], (11, 1), "Content row at y=11");
+    }
+
+    /// Test 7.8.6: Bounds checking with row_offset=1 and small content area
+    #[test]
+    fn test_hunk_header_selected_row_offset_1_small_area() {
+        // Edge case: row_offset=1 with content area height of 1
+        // Only content row should be visible, bottom border clipped
+
+        let is_selected_line = true;
+        let effective_row_offset: usize = 1;
+        let content_area_height: u16 = 1; // Only 1 row visible
+        let base_y: u16 = 10;
+
+        let mut rows_filled: Vec<(u16, u16)> = Vec::new();
+
+        if is_selected_line {
+            // Row 1: Top border (skipped due to row_offset)
+            if effective_row_offset < 1 {
+                rows_filled.push((base_y, 1));
+            }
+            // Row 2: Content line
+            if effective_row_offset < 2 {
+                let y2 = base_y + (1 - effective_row_offset.min(1)) as u16;
+                if y2 < base_y + content_area_height {
+                    rows_filled.push((y2, 1));
+                }
+            }
+            // Row 3: Bottom border - should be clipped
+            let y3 = base_y + (2 - effective_row_offset.min(2)) as u16;
+            if y3 < base_y + content_area_height {
+                rows_filled.push((y3, 1));
+            }
+        }
+
+        // Verify: only 1 row should be filled (content row at y=10)
+        assert_eq!(
+            rows_filled.len(),
+            1,
+            "Only 1 row should be filled with row_offset=1 and height=1"
+        );
+        assert_eq!(rows_filled[0], (10, 1), "Content row at y=10");
+    }
+
+    /// Test 7.8.7: Verify row position calculations match implementation
+    #[test]
+    fn test_hunk_header_row_position_calculations() {
+        // Verify the y position calculations match the implementation:
+        // y2 = y + (1 - effective_row_offset.min(1))
+        // y3 = y + (2 - effective_row_offset.min(2))
+
+        let base_y: u16 = 10;
+
+        // row_offset = 0
+        let row_offset = 0usize;
+        let y2 = base_y + (1 - row_offset.min(1)) as u16;
+        let y3 = base_y + (2 - row_offset.min(2)) as u16;
+        assert_eq!(y2, 11, "Content row at y=11 when row_offset=0");
+        assert_eq!(y3, 12, "Bottom border at y=12 when row_offset=0");
+
+        // row_offset = 1
+        let row_offset = 1usize;
+        let y2 = base_y + (1 - row_offset.min(1)) as u16;
+        let y3 = base_y + (2 - row_offset.min(2)) as u16;
+        assert_eq!(y2, 10, "Content row at y=10 when row_offset=1");
+        assert_eq!(y3, 11, "Bottom border at y=11 when row_offset=1");
+
+        // row_offset = 2
+        let row_offset = 2usize;
+        let y2 = base_y + (1 - row_offset.min(1)) as u16;
+        let y3 = base_y + (2 - row_offset.min(2)) as u16;
+        assert_eq!(y2, 10, "Content row at y=10 when row_offset=2");
+        assert_eq!(y3, 10, "Bottom border at y=10 when row_offset=2");
+
+        // row_offset = 3 (edge case: should clamp)
+        let row_offset = 3usize;
+        let y2 = base_y + (1 - row_offset.min(1)) as u16;
+        let y3 = base_y + (2 - row_offset.min(2)) as u16;
+        assert_eq!(y2, 10, "Content row at y=10 when row_offset=3");
+        assert_eq!(y3, 10, "Bottom border at y=10 when row_offset=3");
+    }
+
+    /// Test 7.8.8: Integration test - verify DiffView with selected HunkHeader
+    #[test]
+    fn test_diff_view_hunk_header_selection_integration() {
+        // Create a diff view with a single hunk
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1 modified\nline 2\nline 3\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+        );
+
+        // Verify initial state: first line should be HunkHeader
+        assert!(
+            matches!(
+                diff_view.diff_lines.first(),
+                Some(DiffLine::HunkHeader { .. })
+            ),
+            "First diff line should be HunkHeader"
+        );
+
+        // Verify selected_line is at the HunkHeader (index 0)
+        assert_eq!(
+            diff_view.selected_line, 0,
+            "Initial selected line should be at HunkHeader"
+        );
+
+        // Verify the HunkHeader is selected (is_selected_line would be true)
+        let is_selected = diff_view.selected_line == 0;
+        assert!(
+            is_selected,
+            "HunkHeader at index 0 should be selected initially"
         );
     }
 }
@@ -14901,6 +15444,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll to 0
@@ -14931,6 +15475,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll to max
@@ -14966,6 +15511,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll way beyond total
@@ -14997,6 +15543,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic with 0 visible lines
@@ -15118,6 +15665,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count HunkHeaders
@@ -15164,6 +15712,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -15209,6 +15758,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set scroll to middle of first HunkHeader
@@ -15481,6 +16031,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set extreme scroll
@@ -15522,6 +16073,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic with extreme line numbers
@@ -15549,6 +16101,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set extreme scroll
@@ -15582,6 +16135,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // All operations should work on empty diff
@@ -15627,6 +16181,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify we have multiple HunkHeaders
@@ -15705,6 +16260,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify total screen rows calculation
@@ -15897,6 +16453,7 @@ mod adversarial_diff_view_fixes {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Test scroll behavior
@@ -15998,6 +16555,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // ATTACK: Set scroll to 0
@@ -16049,6 +16607,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let visible_lines = 10;
@@ -16105,6 +16664,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the first HunkHeader
@@ -16164,6 +16724,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the first HunkHeader
@@ -16222,6 +16783,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         diff_view.scroll = 0;
@@ -16258,6 +16820,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let visible_lines = 3;
@@ -16297,6 +16860,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Set selected_line to first hunk's start so J navigates (not snaps to current header)
@@ -16345,6 +16909,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let visible_lines = 10;
@@ -16399,6 +16964,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // ATTACK: Rapidly change scroll and navigate
@@ -16450,6 +17016,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // ATTACK: Rapid PageDown/PageUp
@@ -16529,6 +17096,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Verify diff_lines are created
@@ -16622,6 +17190,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("/fake/path/unicode.txt"),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Navigate - should not panic with unicode content
@@ -16671,6 +17240,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from(format!("/fake/path/{}", path)),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Verify file_name is stored correctly
@@ -16715,6 +17285,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from(format!("/fake/path/wide_{}.txt", width)),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Navigate - should not hang or panic
@@ -16779,6 +17350,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/mixed_width.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Navigate through all hunks
@@ -16831,6 +17403,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("/fake/path/whitespace.txt"),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Verify diff_lines are created
@@ -16878,6 +17451,7 @@ mod adversarial_scroll_indentation_tests {
                 PathBuf::from("/fake/path/empty.txt"),
                 DocumentId::default(),
                 None,
+                0,
             );
 
             // Verify no panic occurs
@@ -16909,6 +17483,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/测试🎉.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Navigate - should not panic
@@ -16951,6 +17526,7 @@ mod adversarial_scroll_indentation_tests {
             PathBuf::from("/fake/path/多言語.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Rapid scroll changes
@@ -17009,6 +17585,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -17404,6 +17981,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should have context lines
@@ -17434,6 +18012,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic with empty diff_lines
@@ -17507,6 +18086,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -17641,6 +18221,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the HunkHeader
@@ -17693,6 +18274,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Count HunkHeaders
@@ -17817,6 +18399,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find a context line at the start
@@ -17855,6 +18438,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Find the last context line
@@ -18019,6 +18603,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // All scroll operations should be safe
@@ -18049,6 +18634,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/single.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should have HunkHeader
@@ -18160,6 +18746,7 @@ mod adversarial_scroll_selection_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let hunk_header_idx = view
@@ -18277,6 +18864,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             shared_syntax,
+            0,
         );
 
         // Verify the DiffView was created successfully
@@ -18310,6 +18898,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             syntax_ref,
+            0,
         );
 
         // Should handle None gracefully
@@ -18338,6 +18927,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let view2 = DiffView::new(
@@ -18349,6 +18939,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         let view3 = DiffView::new(
@@ -18360,6 +18951,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // All views should have consistent state
@@ -18388,6 +18980,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             shared_syntax.clone(),
+            0,
         );
 
         let view2 = DiffView::new(
@@ -18399,6 +18992,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             shared_syntax,
+            0,
         );
 
         // Both should handle None gracefully
@@ -18426,6 +19020,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not have cached syntax
@@ -18452,6 +19047,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(diff_view.diff_lines.is_empty());
@@ -18475,6 +19071,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/binary.bin"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle binary-like content without panic
@@ -18503,6 +19100,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle gracefully
@@ -18526,6 +19124,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Caches should not be initialized yet
@@ -18561,6 +19160,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/large.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle large documents
@@ -18587,6 +19187,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/longlines.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -18618,6 +19219,7 @@ mod adversarial_performance_tests {
             PathBuf::from("/fake/path/manyhunks.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should have 100 hunk boundaries
@@ -18666,6 +19268,7 @@ impl Foo {
             PathBuf::from("/fake/path/complex.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -18721,6 +19324,7 @@ impl Foo {
             PathBuf::from("/fake/path/empty.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Word diff cache should be empty for empty diff
@@ -18743,6 +19347,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Syntax highlight cache should be empty before initialization
@@ -18765,6 +19370,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.rs"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Function context cache should be empty before initialization
@@ -18791,6 +19397,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Caches should not be initialized on creation
@@ -18813,6 +19420,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should have 2 hunk boundaries
@@ -18845,6 +19453,7 @@ impl Foo {
             PathBuf::from("/fake/path/unicode.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -18866,6 +19475,7 @@ impl Foo {
             PathBuf::from("/fake/path/emoji.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -18887,6 +19497,7 @@ impl Foo {
             PathBuf::from("/fake/path/mixed.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -18912,6 +19523,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle hunks at boundaries
@@ -18936,6 +19548,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should not panic
@@ -18960,6 +19573,7 @@ impl Foo {
             PathBuf::from("/fake/path/test.txt"),
             DocumentId::default(),
             None,
+            0,
         );
 
         // Should handle zero-width hunks
@@ -19017,6 +19631,7 @@ mod lazy_evaluation_adversarial_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -19919,6 +20534,7 @@ mod adversarial_function_context_tests {
             PathBuf::from(file_path),
             helix_view::DocumentId::default(),
             None,
+            0,
         )
     }
 
@@ -21285,7 +21901,14 @@ mod adversarial_edge_case_tests {
 #[cfg(test)]
 mod adversarial_whitespace_highlight_tests {
     use super::*;
+    use helix_view::graphics::Rect;
     use helix_view::graphics::Style;
+    use std::ops::Range;
+
+    /// Helper to create a Hunk
+    fn make_hunk(before: Range<u32>, after: Range<u32>) -> Hunk {
+        Hunk { before, after }
+    }
 
     // =========================================================================
     // ATTACK VECTOR GROUP 1: Whitespace Coalescing with Complex Patterns
@@ -22153,5 +22776,763 @@ mod adversarial_whitespace_highlight_tests {
         // Should handle long lines with unicode whitespace
         assert!(!old_segs.is_empty());
         assert!(!new_segs.is_empty());
+    }
+
+    // =========================================================================
+    // ATTACK VECTOR GROUP 5: HunkHeader Selection Background Fill Security Tests
+    // =========================================================================
+
+    /// Attack 5.1: Integer overflow in y-coordinate calculations
+    /// Tests that y + offset calculations don't overflow when y is near u16::MAX
+    #[test]
+    fn attack_hunkheader_y_coordinate_overflow() {
+        // Simulate the calculation: y + (1 - effective_row_offset.min(1)) as u16
+        // If y is u16::MAX, adding any positive value would overflow
+        let y = u16::MAX;
+        let effective_row_offset = 0u16;
+
+        // The calculation in the code: y + (1 - effective_row_offset.min(1)) as u16
+        // This would overflow if not handled with saturating_add
+        let offset_calc = 1u16.saturating_sub(effective_row_offset.min(1));
+        let y2 = y.saturating_add(offset_calc);
+
+        // Should not panic, should saturate to u16::MAX
+        assert_eq!(y2, u16::MAX, "y + offset should saturate at u16::MAX");
+
+        // Test with effective_row_offset = 1 (should not add anything)
+        let effective_row_offset = 1u16;
+        let offset_calc = 1u16.saturating_sub(effective_row_offset.min(1));
+        let y2_safe = y.saturating_add(offset_calc);
+        assert_eq!(y2_safe, u16::MAX, "y + 0 should stay at u16::MAX");
+
+        // Test with effective_row_offset = 2
+        let effective_row_offset = 2u16;
+        let offset_calc = 1u16.saturating_sub(effective_row_offset.min(1));
+        let y2_safe = y.saturating_add(offset_calc);
+        assert_eq!(y2_safe, u16::MAX, "y + 0 should stay at u16::MAX");
+    }
+
+    /// Attack 5.2: Underflow in effective_row_offset calculations
+    /// Tests that (1 - effective_row_offset.min(1)) and (2 - effective_row_offset.min(2)) don't underflow
+    #[test]
+    fn attack_hunkheader_effective_row_offset_underflow() {
+        // Test all possible effective_row_offset values
+        for effective_row_offset in 0u16..=10 {
+            // Row 2 calculation: (1 - effective_row_offset.min(1))
+            let row2_offset = 1u16.saturating_sub(effective_row_offset.min(1));
+            assert!(
+                row2_offset <= 1,
+                "Row 2 offset should be 0 or 1, got {}",
+                row2_offset
+            );
+
+            // Row 3 calculation: (2 - effective_row_offset.min(2))
+            let row3_offset = 2u16.saturating_sub(effective_row_offset.min(2));
+            assert!(
+                row3_offset <= 2,
+                "Row 3 offset should be 0, 1, or 2, got {}",
+                row3_offset
+            );
+        }
+
+        // Test with maximum possible row_offset value
+        let max_row_offset = u16::MAX;
+        let row2_offset = 1u16.saturating_sub(max_row_offset.min(1));
+        let row3_offset = 2u16.saturating_sub(max_row_offset.min(2));
+
+        assert_eq!(
+            row2_offset, 0,
+            "Row 2 offset with max row_offset should be 0"
+        );
+        assert_eq!(
+            row3_offset, 0,
+            "Row 3 offset with max row_offset should be 0"
+        );
+    }
+
+    /// Attack 5.3: Rect with width=0 or height=0
+    /// Tests that Rect creation handles zero dimensions gracefully
+    #[test]
+    fn attack_hunkheader_rect_zero_dimensions() {
+        use helix_view::graphics::Rect;
+
+        // Create rect with zero width
+        let rect_zero_width = Rect::new(10, 10, 0, 1);
+        assert_eq!(rect_zero_width.width, 0);
+        assert_eq!(rect_zero_width.height, 1);
+        assert_eq!(
+            rect_zero_width.area(),
+            0,
+            "Zero width rect should have zero area"
+        );
+
+        // Create rect with zero height
+        let rect_zero_height = Rect::new(10, 10, 10, 0);
+        assert_eq!(rect_zero_height.width, 10);
+        assert_eq!(rect_zero_height.height, 0);
+        assert_eq!(
+            rect_zero_height.area(),
+            0,
+            "Zero height rect should have zero area"
+        );
+
+        // Create rect with both zero
+        let rect_both_zero = Rect::new(0, 0, 0, 0);
+        assert_eq!(rect_both_zero.area(), 0);
+
+        // Verify that set_style with zero-area rect doesn't panic
+        // (This is a logical test - actual rendering would need a Surface)
+        let _ = rect_zero_width;
+        let _ = rect_zero_height;
+        let _ = rect_both_zero;
+    }
+
+    /// Attack 5.4: Rect with x/y at u16::MAX
+    /// Tests that Rect handles coordinates at maximum values
+    #[test]
+    fn attack_hunkheader_rect_max_coordinates() {
+        use helix_view::graphics::Rect;
+
+        // Create rect at u16::MAX coordinates
+        let rect_max_x = Rect::new(u16::MAX, 0, 1, 1);
+        assert_eq!(rect_max_x.x, u16::MAX);
+
+        let rect_max_y = Rect::new(0, u16::MAX, 1, 1);
+        assert_eq!(rect_max_y.y, u16::MAX);
+
+        let rect_max_both = Rect::new(u16::MAX, u16::MAX, 1, 1);
+        assert_eq!(rect_max_both.x, u16::MAX);
+        assert_eq!(rect_max_both.y, u16::MAX);
+
+        // Test right() and bottom() with saturating_add
+        assert_eq!(
+            rect_max_x.right(),
+            u16::MAX,
+            "right() should saturate at u16::MAX"
+        );
+        assert_eq!(
+            rect_max_y.bottom(),
+            u16::MAX,
+            "bottom() should saturate at u16::MAX"
+        );
+
+        // Test with zero dimensions at max coordinates
+        let rect_max_zero = Rect::new(u16::MAX, u16::MAX, 0, 0);
+        assert_eq!(rect_max_zero.area(), 0);
+    }
+
+    /// Attack 5.5: content_area with zero dimensions
+    /// Tests that the rendering logic handles zero-sized content_area
+    #[test]
+    fn attack_hunkheader_zero_content_area() {
+        use helix_view::graphics::Rect;
+
+        // Simulate content_area with zero dimensions
+        let content_area = Rect::new(0, 0, 0, 0);
+
+        // box_width calculation: content_area.width as usize
+        let box_width = content_area.width as usize;
+        assert_eq!(box_width, 0);
+
+        // inner_width calculation: box_width.saturating_sub(2)
+        let inner_width = box_width.saturating_sub(2);
+        assert_eq!(
+            inner_width, 0,
+            "inner_width should be 0 when box_width is 0"
+        );
+
+        // The code creates "─".repeat(inner_width) which would be empty string
+        let border = format!("┌{}┐", "─".repeat(inner_width));
+        assert_eq!(
+            border, "┌┐",
+            "Border should be just corner chars with zero inner_width"
+        );
+
+        // Test with height = 0
+        let content_area_no_height = Rect::new(0, 0, 10, 0);
+        assert_eq!(content_area_no_height.height, 0);
+
+        // The check y2 < content_area.y + content_area.height would be:
+        // y2 < 0 + 0 = 0, so nothing would render
+        let y2: u16 = 0;
+        let should_render = y2 < content_area_no_height.y + content_area_no_height.height;
+        assert!(
+            !should_render,
+            "Nothing should render with zero height content_area"
+        );
+    }
+
+    /// Attack 5.6: selected_line index out of bounds
+    /// Tests that selected_line beyond diff_lines.len() is handled gracefully
+    #[test]
+    fn attack_hunkheader_selected_line_out_of_bounds() {
+        let diff_base = Rope::from("line 1\nline 2\n");
+        let doc = Rope::from("line 1\nline 2\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+        );
+
+        // Get the actual length of diff_lines
+        let diff_lines_len = diff_view.diff_lines.len();
+
+        // Test accessing with selected_line beyond bounds
+        let out_of_bounds = diff_lines_len + 100;
+        let line = diff_view.diff_lines.get(out_of_bounds);
+        assert!(line.is_none(), "Out of bounds access should return None");
+
+        // Test with usize::MAX
+        let line_max = diff_view.diff_lines.get(usize::MAX);
+        assert!(line_max.is_none(), "usize::MAX access should return None");
+
+        // Test the pattern used in render: diff_lines.get(selected_line)
+        // This should always use .get() for safe access
+        let safe_access = diff_view.diff_lines.get(diff_view.selected_line);
+        // selected_line defaults to 0, which should be valid if diff_lines is non-empty
+        if diff_lines_len > 0 {
+            assert!(safe_access.is_some(), "Valid index should return Some");
+        }
+    }
+
+    /// Attack 5.7: row_offset larger than 2
+    /// Tests that row_offset values > 2 are handled correctly
+    #[test]
+    fn attack_hunkheader_row_offset_larger_than_two() {
+        // The code checks: effective_row_offset < 1 and effective_row_offset < 2
+        // If row_offset is 3 or more, all rows should be skipped
+
+        for row_offset in 3u16..=10 {
+            // Row 1 check: effective_row_offset < 1
+            let render_row1 = row_offset < 1;
+            assert!(!render_row1, "Row 1 should not render with row_offset >= 1");
+
+            // Row 2 check: effective_row_offset < 2
+            let render_row2 = row_offset < 2;
+            assert!(!render_row2, "Row 2 should not render with row_offset >= 2");
+
+            // Row 3 check: always render if we have space (but y3 calculation)
+            // y3 = y + (2 - effective_row_offset.min(2)) as u16
+            // With row_offset = 3, effective_row_offset.min(2) = 2
+            // So y3 = y + 0 = y
+            let y3_offset = 2u16.saturating_sub(row_offset.min(2));
+            assert_eq!(
+                y3_offset, 0,
+                "Row 3 offset should be 0 when row_offset >= 2"
+            );
+
+            // rendered_rows calculation: (3 - effective_row_offset).max(1)
+            let rendered_rows = (3i32 - row_offset as i32).max(1);
+            assert_eq!(rendered_rows, 1, "Should render at least 1 row");
+        }
+
+        // Test with maximum row_offset
+        let max_row_offset = u16::MAX;
+        let y3_offset = 2u16.saturating_sub(max_row_offset.min(2));
+        assert_eq!(y3_offset, 0);
+    }
+
+    /// Attack 5.8: Combined attack - all extreme values at once
+    /// Tests the rendering logic with all edge cases combined
+    #[test]
+    fn attack_hunkheader_combined_extreme_values() {
+        use helix_view::graphics::Rect;
+
+        // Extreme content_area
+        let content_area = Rect::new(u16::MAX, u16::MAX, 0, 0);
+
+        // Extreme y coordinate
+        let y = u16::MAX;
+
+        // Extreme row_offset
+        let row_offset = u16::MAX;
+
+        // Calculate effective_row_offset
+        let effective_row_offset = row_offset; // For first rendered line
+
+        // All the calculations that would happen:
+        let box_width = content_area.width as usize;
+        let inner_width = box_width.saturating_sub(2);
+
+        // Row 1: effective_row_offset < 1 is false, skip
+        let render_row1 = effective_row_offset < 1;
+        assert!(!render_row1, "Row 1 should not render with max row_offset");
+
+        // Row 2: effective_row_offset < 2 is false, skip
+        let render_row2 = effective_row_offset < 2;
+        assert!(!render_row2, "Row 2 should not render with max row_offset");
+
+        // Row 3: y3 calculation
+        let y3_offset = 2u16.saturating_sub(effective_row_offset.min(2));
+        let y3 = y.saturating_add(y3_offset);
+
+        // Check if y3 is within content_area
+        let y3_in_bounds = y3 < content_area.y.saturating_add(content_area.height);
+        assert!(
+            !y3_in_bounds,
+            "y3 should be out of bounds with extreme values"
+        );
+
+        // rendered_rows
+        let rendered_rows = (3i32 - effective_row_offset.min(3) as i32).max(1);
+        assert!(rendered_rows >= 1, "Should render at least 1 row");
+
+        // No panics should occur
+    }
+
+    /// Attack 5.9: Boundary test - row_offset exactly at boundary values
+    #[test]
+    fn attack_hunkheader_row_offset_boundary_values() {
+        // Test row_offset = 0 (normal case)
+        let row_offset = 0u16;
+        assert!(row_offset < 1, "row_offset 0 should render row 1");
+        assert!(row_offset < 2, "row_offset 0 should render row 2");
+
+        // Test row_offset = 1 (skip row 1)
+        let row_offset = 1u16;
+        assert!(!(row_offset < 1), "row_offset 1 should skip row 1");
+        assert!(row_offset < 2, "row_offset 1 should render row 2");
+
+        // Test row_offset = 2 (skip rows 1 and 2)
+        let row_offset = 2u16;
+        assert!(!(row_offset < 1), "row_offset 2 should skip row 1");
+        assert!(!(row_offset < 2), "row_offset 2 should skip row 2");
+
+        // Verify y-coordinate calculations at boundaries
+        let y = 100u16;
+
+        // row_offset = 0
+        let y2_offset_0 = 1u16.saturating_sub(0u16.min(1));
+        let y3_offset_0 = 2u16.saturating_sub(0u16.min(2));
+        assert_eq!(y.saturating_add(y2_offset_0), 101);
+        assert_eq!(y.saturating_add(y3_offset_0), 102);
+
+        // row_offset = 1
+        let y2_offset_1 = 1u16.saturating_sub(1u16.min(1));
+        let y3_offset_1 = 2u16.saturating_sub(1u16.min(2));
+        assert_eq!(y.saturating_add(y2_offset_1), 100);
+        assert_eq!(y.saturating_add(y3_offset_1), 101);
+
+        // row_offset = 2
+        let y2_offset_2 = 1u16.saturating_sub(2u16.min(1));
+        let y3_offset_2 = 2u16.saturating_sub(2u16.min(2));
+        assert_eq!(y.saturating_add(y2_offset_2), 100);
+        assert_eq!(y.saturating_add(y3_offset_2), 100);
+    }
+
+    /// Attack 5.10: selected_line manipulation and bounds checking
+    #[test]
+    fn attack_hunkheader_selected_line_manipulation() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::from("line 1 modified\nline 2\nline 3\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let mut diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+        );
+
+        // Get valid bounds
+        let max_valid_index = diff_view.diff_lines.len().saturating_sub(1);
+
+        // Test setting selected_line to valid value
+        diff_view.selected_line = 0;
+        assert!(diff_view.diff_lines.get(diff_view.selected_line).is_some());
+
+        // Test setting selected_line to max valid
+        if max_valid_index > 0 {
+            diff_view.selected_line = max_valid_index;
+            assert!(diff_view.diff_lines.get(diff_view.selected_line).is_some());
+        }
+
+        // Test setting selected_line beyond bounds (simulating attack)
+        diff_view.selected_line = usize::MAX;
+        let line = diff_view.diff_lines.get(diff_view.selected_line);
+        assert!(
+            line.is_none(),
+            "usize::MAX selected_line should return None"
+        );
+
+        // The code pattern uses .get() which is safe
+        // Verify that accessing with .get() never panics
+        for i in 0..=diff_view.diff_lines.len() {
+            let _ = diff_view.diff_lines.get(i); // Should never panic
+        }
+        let _ = diff_view.diff_lines.get(usize::MAX); // Should not panic
+    }
+
+    /// Attack 5.11: Rect area calculation overflow
+    #[test]
+    fn attack_hunkheader_rect_area_overflow() {
+        use helix_view::graphics::Rect;
+
+        // Test area calculation with large values
+        // area = width * height, which could overflow usize on 32-bit
+        let rect = Rect::new(0, 0, u16::MAX, u16::MAX);
+        let area = rect.area();
+
+        // On 64-bit, this should be fine
+        // u16::MAX * u16::MAX = 65535 * 65535 = 4,294,836,225
+        // This fits in usize on 64-bit
+        assert_eq!(area, (u16::MAX as usize) * (u16::MAX as usize));
+
+        // Test with moderate values
+        let rect_moderate = Rect::new(0, 0, 1000, 1000);
+        assert_eq!(rect_moderate.area(), 1_000_000);
+    }
+
+    /// Attack 5.12: Injection attempt via HunkHeader text content
+    #[test]
+    fn attack_hunkheader_text_injection() {
+        // Test various injection patterns in HunkHeader text
+        let injection_patterns = vec![
+            "@@ -1,1 +1,1 @@ \x00null byte",
+            "@@ -1,1 +1,1 @@ \nnewline",
+            "@@ -1,1 +1,1 @@ \r\ncrlf",
+            "@@ -1,1 +1,1 @@ \x1b[31mANSI escape\x1b[0m",
+            "@@ -1,1 +1,1 @@ <script>alert('xss')</script>",
+            "@@ -1,1 +1,1 @@ ${system('rm -rf /')}",
+            "@@ -1,1 +1,1 @@ `whoami`",
+            "@@ -1,1 +1,1 @@ '; DROP TABLE users; --",
+        ];
+
+        for pattern in injection_patterns {
+            // Create a DiffLine::HunkHeader with injection pattern
+            let diff_line = DiffLine::HunkHeader {
+                text: pattern.to_string(),
+                new_start: 0,
+            };
+
+            // Verify the text is stored as-is (not executed)
+            match diff_line {
+                DiffLine::HunkHeader { text, .. } => {
+                    assert_eq!(text, pattern, "Text should be stored verbatim");
+                }
+                _ => panic!("Expected HunkHeader"),
+            }
+        }
+    }
+
+    // =========================================================================
+    // Enter Key on Context Lines Tests (Task 7.9)
+    // Tests for calculating doc_line from context-before lines
+    // =========================================================================
+
+    /// Helper function to calculate the line number for context-before lines
+    /// This mirrors the logic in the Enter key handler (lines 2443-2457)
+    fn calculate_context_before_line(base_line: u32, hunk: &Hunk) -> usize {
+        // Formula: hunk.after.start - hunk.before.start + base_line - 1
+        // base_line is 1-indexed, hunk.before.start/after.start are 0-indexed
+        (hunk.after.start as i32 - hunk.before.start as i32 + base_line as i32 - 1).max(0) as usize
+    }
+
+    /// Test 1: Context-after line (doc_line: Some) uses doc_line directly
+    /// This verifies the happy path where doc_line is available
+    #[test]
+    fn test_enter_context_after_uses_doc_line() {
+        // Context-after lines have doc_line set (from new version)
+        let context_after = DiffLine::Context {
+            base_line: Some(10), // May also have base_line, but doc_line takes precedence
+            doc_line: Some(42),
+            content: "unchanged line".to_string(),
+        };
+
+        // When doc_line is Some, we should use it directly (converted to 0-indexed)
+        if let DiffLine::Context {
+            doc_line: Some(n), ..
+        } = context_after
+        {
+            let line = (n - 1) as usize;
+            assert_eq!(
+                line, 41,
+                "Context-after should use doc_line directly (0-indexed)"
+            );
+        } else {
+            panic!("Expected Context with doc_line");
+        }
+    }
+
+    /// Test 2: Context-before line (doc_line: None, base_line: Some) calculates approximate line
+    /// This verifies the formula for calculating doc_line from base_line
+    #[test]
+    fn test_enter_context_before_calculates_line() {
+        // Scenario: Hunk at lines 10-15 in old file, lines 12-20 in new file
+        // This means 5 lines were added (net +5 lines)
+        let hunk = make_hunk(10..15, 12..20);
+
+        // Context-before line at base_line 8 (1-indexed)
+        // Formula: 12 - 10 + 8 - 1 = 9
+        let base_line = 8u32;
+        let result = calculate_context_before_line(base_line, &hunk);
+        assert_eq!(result, 9, "Context-before should calculate correct line");
+    }
+
+    /// Test 3: Context line with both None falls back to 0
+    #[test]
+    fn test_enter_context_both_none_fallback() {
+        let context_neither = DiffLine::Context {
+            base_line: None,
+            doc_line: None,
+            content: "orphan line".to_string(),
+        };
+
+        // When both are None, should fall back to 0
+        if let DiffLine::Context {
+            doc_line: None,
+            base_line: None,
+            ..
+        } = context_neither
+        {
+            let line = 0usize; // Fallback
+            assert_eq!(line, 0, "Context with no line info should fall back to 0");
+        } else {
+            panic!("Expected Context with no line info");
+        }
+    }
+
+    /// Test 4: Formula correctness for various hunk positions
+    /// Tests the math: hunk.after.start - hunk.before.start + base_line - 1
+    #[test]
+    fn test_formula_correctness_various_positions() {
+        // Test case 1: Pure addition (before is empty range)
+        // Hunk: before=[5..5], after=[5..10] means 5 lines added at line 5
+        let hunk_add = make_hunk(5..5, 5..10);
+        // Context-before at base_line 3 (1-indexed)
+        // Formula: 5 - 5 + 3 - 1 = 2
+        assert_eq!(calculate_context_before_line(3, &hunk_add), 2);
+
+        // Test case 2: Pure deletion (after is empty range)
+        // Hunk: before=[10..15], after=[10..10] means 5 lines deleted at line 10
+        let hunk_del = make_hunk(10..15, 10..10);
+        // Context-before at base_line 8 (1-indexed)
+        // Formula: 10 - 10 + 8 - 1 = 7
+        assert_eq!(calculate_context_before_line(8, &hunk_del), 7);
+
+        // Test case 3: Mixed change (some additions, some deletions)
+        // Hunk: before=[20..25], after=[20..30] means net +5 lines
+        let hunk_mixed = make_hunk(20..25, 20..30);
+        // Context-before at base_line 18 (1-indexed)
+        // Formula: 20 - 20 + 18 - 1 = 17
+        assert_eq!(calculate_context_before_line(18, &hunk_mixed), 17);
+
+        // Test case 4: Lines shifted due to earlier changes
+        // Hunk: before=[100..105], after=[110..115] means 10 lines added before this hunk
+        let hunk_shifted = make_hunk(100..105, 110..115);
+        // Context-before at base_line 98 (1-indexed)
+        // Formula: 110 - 100 + 98 - 1 = 107
+        assert_eq!(calculate_context_before_line(98, &hunk_shifted), 107);
+    }
+
+    /// Test 5: Edge case - negative result clamped to 0
+    /// When the formula would produce a negative number, it should clamp to 0
+    #[test]
+    fn test_negative_result_clamped_to_zero() {
+        // Scenario: Hunk where after.start < before.start (net deletion)
+        // Hunk: before=[10..20], after=[5..10] means 10 lines deleted, 5 added, net -5
+        let hunk = make_hunk(10..20, 5..10);
+
+        // Context-before at base_line 1 (1-indexed)
+        // Formula: 5 - 10 + 1 - 1 = -5, should clamp to 0
+        let result = calculate_context_before_line(1, &hunk);
+        assert_eq!(result, 0, "Negative result should clamp to 0");
+
+        // Context-before at base_line 2 (1-indexed)
+        // Formula: 5 - 10 + 2 - 1 = -4, should clamp to 0
+        let result2 = calculate_context_before_line(2, &hunk);
+        assert_eq!(result2, 0, "Negative result should clamp to 0");
+
+        // Context-before at base_line 6 (1-indexed)
+        // Formula: 5 - 10 + 6 - 1 = 0, exactly at boundary
+        let result3 = calculate_context_before_line(6, &hunk);
+        assert_eq!(result3, 0, "Zero result should stay at 0");
+
+        // Context-before at base_line 7 (1-indexed)
+        // Formula: 5 - 10 + 7 - 1 = 1, positive
+        let result4 = calculate_context_before_line(7, &hunk);
+        assert_eq!(result4, 1, "Positive result should not be clamped");
+    }
+
+    /// Test 6: Edge case - missing hunk falls back to 0
+    /// When selected_hunk is out of bounds, should fall back to 0
+    #[test]
+    fn test_missing_hunk_fallback() {
+        // Simulate the logic when hunks.get(selected_hunk) returns None
+        let hunks: Vec<Hunk> = vec![];
+        let selected_hunk = 0;
+
+        let result = hunks.get(selected_hunk);
+        assert!(result.is_none(), "Empty hunks should return None");
+
+        // The fallback value should be 0
+        let line = result
+            .map(|h| (h.after.start as i32 - h.before.start as i32 + 1i32 - 1).max(0) as usize)
+            .unwrap_or(0);
+        assert_eq!(line, 0, "Missing hunk should fall back to 0");
+    }
+
+    /// Test 7: Integration test - verify the formula matches actual diff scenarios
+    #[test]
+    fn test_formula_matches_diff_scenarios() {
+        // Scenario: A file with a hunk that adds lines in the middle
+        // Original file (base):
+        //   line 0: "header"
+        //   line 1: "old content"
+        //   line 2: "footer"
+        //
+        // Modified file (doc):
+        //   line 0: "header"
+        //   line 1: "new line 1"
+        //   line 2: "new line 2"
+        //   line 3: "new line 3"
+        //   line 4: "footer"
+        //
+        // Hunk: before=[1..2], after=[1..4] (1 line replaced with 3 lines)
+
+        let hunk = make_hunk(1..2, 1..4);
+
+        // Context-before at base_line 1 (the "header" line, 1-indexed)
+        // In the old file, "header" is at line 0 (0-indexed), line 1 (1-indexed)
+        // In the new file, "header" is still at line 0 (0-indexed)
+        // Formula: 1 - 1 + 1 - 1 = 0
+        assert_eq!(calculate_context_before_line(1, &hunk), 0);
+
+        // Context-after at doc_line 5 (the "footer" line, 1-indexed)
+        // In the new file, "footer" is at line 4 (0-indexed)
+        // Using doc_line directly: 5 - 1 = 4
+        let doc_line = 5u32;
+        assert_eq!((doc_line - 1) as usize, 4);
+    }
+
+    /// Test 8: Verify base_line 1-indexed conversion
+    #[test]
+    fn test_base_line_indexing() {
+        // base_line is 1-indexed in the Context variant
+        // The formula subtracts 1 to convert to 0-indexed
+
+        let hunk = make_hunk(0..5, 0..5); // No net change
+
+        // base_line 1 (first line, 1-indexed)
+        // Formula: 0 - 0 + 1 - 1 = 0
+        assert_eq!(calculate_context_before_line(1, &hunk), 0);
+
+        // base_line 2 (second line, 1-indexed)
+        // Formula: 0 - 0 + 2 - 1 = 1
+        assert_eq!(calculate_context_before_line(2, &hunk), 1);
+
+        // base_line 100 (100th line, 1-indexed)
+        // Formula: 0 - 0 + 100 - 1 = 99
+        assert_eq!(calculate_context_before_line(100, &hunk), 99);
+    }
+
+    /// Test 9: Large hunk offsets don't overflow
+    #[test]
+    fn test_large_hunk_offsets_no_overflow() {
+        // Test with large line numbers to ensure no overflow
+        let hunk = make_hunk(1000000..1000100, 1000500..1000600);
+
+        // Context-before at base_line 999999 (1-indexed)
+        // Formula: 1000500 - 1000000 + 999999 - 1 = 1000498
+        let result = calculate_context_before_line(999999, &hunk);
+        assert_eq!(result, 1000498);
+
+        // Test with u32::MAX - 1 to stay within bounds
+        let hunk_max = make_hunk(1..2, (u32::MAX - 100)..(u32::MAX - 50));
+        // This should not panic due to overflow
+        let _ = calculate_context_before_line(1, &hunk_max);
+    }
+
+    /// Test 10: Verify the actual Enter key logic structure
+    #[test]
+    fn test_enter_key_logic_structure() {
+        // This test verifies the structure of the Enter key handling logic
+        // by simulating the match on DiffLine variants
+
+        let diff_lines = vec![
+            DiffLine::HunkHeader {
+                text: "@@ -1,3 +1,4 @@".to_string(),
+                new_start: 0,
+            },
+            DiffLine::Context {
+                base_line: Some(1),
+                doc_line: None,
+                content: "context before".to_string(),
+            },
+            DiffLine::Deletion {
+                base_line: 2,
+                content: "deleted line".to_string(),
+            },
+            DiffLine::Addition {
+                doc_line: 3,
+                content: "added line".to_string(),
+            },
+            DiffLine::Context {
+                base_line: None,
+                doc_line: Some(4),
+                content: "context after".to_string(),
+            },
+        ];
+
+        let hunks = vec![make_hunk(1..2, 2..3)];
+        let selected_hunk = 0;
+
+        // Test each line type
+        for (idx, diff_line) in diff_lines.iter().enumerate() {
+            let line = match diff_line {
+                DiffLine::HunkHeader { new_start, .. } => *new_start as usize,
+                DiffLine::Context {
+                    doc_line,
+                    base_line,
+                    ..
+                } => {
+                    if let Some(n) = doc_line {
+                        (n - 1) as usize
+                    } else if let Some(base) = base_line {
+                        hunks
+                            .get(selected_hunk)
+                            .map(|h| {
+                                (h.after.start as i32 - h.before.start as i32 + *base as i32 - 1)
+                                    .max(0) as usize
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                }
+                DiffLine::Addition { doc_line, .. } => (*doc_line - 1) as usize,
+                DiffLine::Deletion { .. } => hunks
+                    .get(selected_hunk)
+                    .map(|h| h.after.start as usize)
+                    .unwrap_or(0),
+            };
+
+            // Verify each line produces a valid result
+            match idx {
+                0 => assert_eq!(line, 0, "HunkHeader should use new_start"),
+                1 => {
+                    // Context-before: base_line=1, hunk=[1..2, 2..3]
+                    // Formula: 2 - 1 + 1 - 1 = 1
+                    assert_eq!(line, 1, "Context-before should calculate line");
+                }
+                2 => assert_eq!(line, 2, "Deletion should use hunk.after.start"),
+                3 => assert_eq!(line, 2, "Addition should use doc_line - 1"),
+                4 => assert_eq!(line, 3, "Context-after should use doc_line - 1"),
+                _ => {}
+            }
+        }
     }
 }

@@ -4174,8 +4174,8 @@ fn goto_prev_hunk(cx: &mut Context) {
 
 fn diff_view(cx: &mut Context) {
     // Get diff data first to avoid borrow issues
-    let (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id) = {
-        let (_view, doc) = current!(cx.editor);
+    let (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line) = {
+        let (view, doc) = current!(cx.editor);
         let doc_id = doc.id();
 
         let diff_handle = match doc.diff_handle() {
@@ -4234,7 +4234,11 @@ fn diff_view(cx: &mut Context) {
             ),
         };
 
-        (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id)
+        // Get cursor line (0-indexed) to position diff view at closest hunk
+        let doc_text_slice = doc.text().slice(..);
+        let cursor_line = doc.selection(view.id).primary().cursor_line(doc_text_slice) as usize;
+
+        (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line)
     }; // diff is dropped here
 
     // Get the document's existing syntax to reuse for performance
@@ -4252,6 +4256,7 @@ fn diff_view(cx: &mut Context) {
         absolute_path,
         doc_id,
         existing_syntax,
+        cursor_line,
     );
 
     cx.push_layer(Box::new(overlaid(diff_view)));
