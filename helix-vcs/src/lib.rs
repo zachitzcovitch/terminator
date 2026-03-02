@@ -103,6 +103,20 @@ impl DiffProviderRegistry {
                 }
             })
     }
+
+    /// Commit staged changes with the given message (equivalent to `git commit -m <message>`).
+    pub fn commit(&self, cwd: &Path, message: &str) -> Option<Result<()>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.commit(cwd, message) {
+                Ok(res) => Some(Ok(res)),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to commit in {}", cwd.display());
+                    None
+                }
+            })
+    }
 }
 
 impl Default for DiffProviderRegistry {
@@ -172,6 +186,15 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::unstage_file(file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    /// Commit staged changes with the given message (equivalent to `git commit -m <message>`).
+    fn commit(&self, cwd: &Path, message: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::commit(cwd, message),
             Self::None => bail!("No diff support compiled in"),
         }
     }

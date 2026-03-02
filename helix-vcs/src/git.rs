@@ -23,6 +23,9 @@ use crate::{FileChange, StatusEntry};
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod commit_test;
+
 /// Unquote a path from git porcelain v1 format.
 /// Git quotes paths containing special characters (spaces, tabs, newlines, etc.)
 /// using C-style escaping with surrounding double quotes.
@@ -228,6 +231,38 @@ pub fn stage_hunk(file_path: &Path, patch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Commit staged changes with the given message (equivalent to `git commit -m <message>`).
+pub fn commit(cwd: &Path, message: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Use git commit with --file=- to read message from stdin
+    let mut child = Command::new("git")
+        .arg("commit")
+        .arg("--file=-") // Read commit message from stdin
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git commit")?;
+
+    // Write the commit message to stdin
+    let stdin = child.stdin.as_mut().expect("stdin should be piped");
+    stdin.write_all(message.as_bytes())?;
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git commit")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git commit failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
@@ -290,13 +325,13 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
         .to_path_buf();
 
     // Helper to get diff stats for a file if populate_stats is true
-    let get_stats = |file_path: &Path, staged: bool| -> (Option<usize>, Option<usize>) {
+    let get_stats = |file_path: &Path, staged: bool| -> (Option<usize>, Option<usize>, bool) {
         if !populate_stats {
-            return (None, None);
+            return (None, None, false);
         }
         match get_diff_stats(cwd, file_path, staged) {
-            Ok(Some((adds, dels))) => (Some(adds), Some(dels)),
-            _ => (None, None),
+            Ok(Some((adds, dels, is_binary))) => (Some(adds), Some(dels), is_binary),
+            _ => (None, None, false),
         }
     };
 
@@ -336,12 +371,13 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
         // Check for untracked files first (special case: ??)
         if x == '?' && y == '?' {
             let file_path = work_dir.join(&path);
-            let (additions, deletions) = get_stats(&file_path, false);
+            let (additions, deletions, is_binary) = get_stats(&file_path, false);
             entries.push(StatusEntry {
                 change: FileChange::Untracked { path: file_path },
                 staged: false,
                 additions,
                 deletions,
+                is_binary,
             });
             continue;
         }
@@ -360,12 +396,13 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
         );
         if is_conflict {
             let file_path = work_dir.join(&path);
-            let (additions, deletions) = get_stats(&file_path, true);
+            let (additions, deletions, is_binary) = get_stats(&file_path, true);
             entries.push(StatusEntry {
                 change: FileChange::Conflict { path: file_path },
                 staged: true,
                 additions,
                 deletions,
+                is_binary,
             });
             continue;
         }
@@ -404,12 +441,13 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
             };
             if let Some(change) = make_change(x, staged_path, from_path.as_deref()) {
                 let file_path = change.path();
-                let (additions, deletions) = get_stats(file_path, true);
+                let (additions, deletions, is_binary) = get_stats(file_path, true);
                 entries.push(StatusEntry {
                     change,
                     staged: true,
                     additions,
                     deletions,
+                    is_binary,
                 });
             }
         }
@@ -418,12 +456,13 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
         if y != ' ' {
             if let Some(change) = make_change(y, &path, from_path.as_deref()) {
                 let file_path = change.path();
-                let (additions, deletions) = get_stats(file_path, false);
+                let (additions, deletions, is_binary) = get_stats(file_path, false);
                 entries.push(StatusEntry {
                     change,
                     staged: false,
                     additions,
                     deletions,
+                    is_binary,
                 });
             }
         }
@@ -597,7 +636,15 @@ pub fn get_relative_path(file_path: &Path) -> Option<std::path::PathBuf> {
 /// * `file` - File path to get diff stats for
 /// * `staged` - If true, get stats for staged changes (HEAD → index).
 ///              If false, get stats for unstaged changes (index → working directory).
-pub fn get_diff_stats(cwd: &Path, file: &Path, staged: bool) -> Result<Option<(usize, usize)>> {
+///
+/// Returns `Ok(Some((additions, deletions, is_binary)))` where:
+/// - `(additions, deletions)` are the line counts (0 for binary files)
+/// - `is_binary` is true if the file is detected as binary by git
+pub fn get_diff_stats(
+    cwd: &Path,
+    file: &Path,
+    staged: bool,
+) -> Result<Option<(usize, usize, bool)>> {
     let mut cmd = Command::new("git");
     cmd.arg("diff").arg("--numstat");
 
@@ -640,7 +687,7 @@ pub fn get_diff_stats(cwd: &Path, file: &Path, staged: bool) -> Result<Option<(u
 
     // Binary files show `- - filename`
     if additions_str == "-" || deletions_str == "-" {
-        return Ok(None);
+        return Ok(Some((0, 0, true))); // Binary file
     }
 
     let additions = additions_str
@@ -650,7 +697,7 @@ pub fn get_diff_stats(cwd: &Path, file: &Path, staged: bool) -> Result<Option<(u
         .parse::<usize>()
         .context("failed to parse deletions count")?;
 
-    Ok(Some((additions, deletions)))
+    Ok(Some((additions, deletions, false))) // Normal file
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.

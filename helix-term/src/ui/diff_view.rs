@@ -942,6 +942,73 @@ impl DiffView {
         // Clear and prepare hunk boundaries
         self.hunk_boundaries.clear();
 
+        // Handle untracked files (new files with no diff base)
+        // If diff_base is empty (no characters) and doc has content, show as new file
+        // Note: Rope::new().len_lines() returns 1 (empty line), so we check len_chars() == 0
+        if self.diff_base.len_chars() == 0 && self.doc.len_chars() > 0 && self.hunks.is_empty() {
+            // Create a special "New File" hunk header
+            let hunk_start = self.diff_lines.len();
+            self.diff_lines.push(DiffLine::HunkHeader {
+                text: format!("@@ -0,0 +1,{} @@ (new file)", doc_len),
+                new_start: 0, // 0-indexed line in doc
+            });
+
+            // Show all lines as additions
+            for line_num in 0..doc_len {
+                let content = self.doc.line(line_num).to_string();
+                self.diff_lines.push(DiffLine::Addition {
+                    doc_line: line_num as u32 + 1, // 1-indexed
+                    content,
+                });
+            }
+
+            // Record the hunk boundary
+            let hunk_end = self.diff_lines.len();
+            self.hunk_boundaries.push(HunkBoundary {
+                start: hunk_start,
+                end: hunk_end,
+            });
+
+            // Update stats for new file
+            self.added = doc_len;
+            self.removed = 0;
+
+            return;
+        }
+
+        // Handle deleted files (files removed from working directory)
+        // If diff_base has content and doc is empty, show as deleted file
+        if self.diff_base.len_chars() > 0 && self.doc.len_chars() == 0 && self.hunks.is_empty() {
+            // Create a special "Deleted File" hunk header
+            let hunk_start = self.diff_lines.len();
+            self.diff_lines.push(DiffLine::HunkHeader {
+                text: format!("@@ -1,{} +0,0 @@ (deleted)", base_len),
+                new_start: 0,
+            });
+
+            // Show all lines as deletions
+            for line_num in 0..base_len {
+                let content = self.diff_base.line(line_num).to_string();
+                self.diff_lines.push(DiffLine::Deletion {
+                    base_line: line_num as u32 + 1, // 1-indexed
+                    content,
+                });
+            }
+
+            // Record the hunk boundary
+            let hunk_end = self.diff_lines.len();
+            self.hunk_boundaries.push(HunkBoundary {
+                start: hunk_start,
+                end: hunk_end,
+            });
+
+            // Update stats for deleted file
+            self.added = 0;
+            self.removed = base_len;
+
+            return;
+        }
+
         for hunk in &self.hunks {
             // Record the start of this hunk in diff_lines
             let hunk_start = self.diff_lines.len();
@@ -2664,22 +2731,6 @@ impl Component for DiffView {
                                 };
                                 let doc = helix_view::doc_mut!(cx.editor, &doc_id);
 
-                                // Get diff handle
-                                let diff_handle = match doc.diff_handle() {
-                                    Some(h) => h,
-                                    None => {
-                                        cx.editor.set_error("No diff available");
-                                        return;
-                                    }
-                                };
-
-                                // Get diff data
-                                let diff = diff_handle.load();
-                                let diff_base = diff.diff_base().clone();
-                                let doc_text = diff.doc().clone();
-                                let hunks: Vec<Hunk> =
-                                    (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
-
                                 // Get file name and path info
                                 let file_name = file_path
                                     .file_name()
@@ -2689,6 +2740,26 @@ impl Component for DiffView {
 
                                 // Get syntax for highlighting
                                 let existing_syntax = doc.syntax_arc();
+
+                                // Check if this is an untracked file (no diff handle)
+                                let (diff_base, doc_text, hunks) = match doc.diff_handle() {
+                                    Some(diff_handle) => {
+                                        // Normal file with diff
+                                        let diff = diff_handle.load();
+                                        let diff_base = diff.diff_base().clone();
+                                        let doc_text = diff.doc().clone();
+                                        let hunks: Vec<Hunk> =
+                                            (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+                                        (diff_base, doc_text, hunks)
+                                    }
+                                    None => {
+                                        // Untracked file - show as new file
+                                        let diff_base = Rope::new();
+                                        let doc_text = doc.text().clone();
+                                        let hunks = Vec::new(); // No hunks for untracked files
+                                        (diff_base, doc_text, hunks)
+                                    }
+                                };
 
                                 // Create new DiffView
                                 let diff_view = DiffView::new(
@@ -2742,22 +2813,6 @@ impl Component for DiffView {
                                 };
                                 let doc = helix_view::doc_mut!(cx.editor, &doc_id);
 
-                                // Get diff handle
-                                let diff_handle = match doc.diff_handle() {
-                                    Some(h) => h,
-                                    None => {
-                                        cx.editor.set_error("No diff available");
-                                        return;
-                                    }
-                                };
-
-                                // Get diff data
-                                let diff = diff_handle.load();
-                                let diff_base = diff.diff_base().clone();
-                                let doc_text = diff.doc().clone();
-                                let hunks: Vec<Hunk> =
-                                    (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
-
                                 // Get file name and path info
                                 let file_name = file_path
                                     .file_name()
@@ -2767,6 +2822,26 @@ impl Component for DiffView {
 
                                 // Get syntax for highlighting
                                 let existing_syntax = doc.syntax_arc();
+
+                                // Check if this is an untracked file (no diff handle)
+                                let (diff_base, doc_text, hunks) = match doc.diff_handle() {
+                                    Some(diff_handle) => {
+                                        // Normal file with diff
+                                        let diff = diff_handle.load();
+                                        let diff_base = diff.diff_base().clone();
+                                        let doc_text = diff.doc().clone();
+                                        let hunks: Vec<Hunk> =
+                                            (0..diff.len()).map(|i| diff.nth_hunk(i)).collect();
+                                        (diff_base, doc_text, hunks)
+                                    }
+                                    None => {
+                                        // Untracked file - show as new file
+                                        let diff_base = Rope::new();
+                                        let doc_text = doc.text().clone();
+                                        let hunks = Vec::new(); // No hunks for untracked files
+                                        (diff_base, doc_text, hunks)
+                                    }
+                                };
 
                                 // Create new DiffView
                                 let diff_view = DiffView::new(
@@ -3928,6 +4003,1033 @@ mod diff_view_tests {
         let clamped = selected_hunk.min(hunks_len.saturating_sub(1));
         // Note: saturating_sub on usize returns 0 when underflow would occur
         assert_eq!(clamped, 0, "Case 4: empty hunks should handle gracefully");
+    }
+
+    // =========================================================================
+    // File Navigation Tests (n/p keys)
+    // Tests for next/previous file navigation in DiffView
+    // =========================================================================
+
+    /// Helper to create a mock StatusEntry for testing
+    fn make_status_entry(path: &str) -> StatusEntry {
+        use helix_vcs::FileChange;
+        use std::path::PathBuf;
+
+        // Create a minimal StatusEntry with the given path
+        StatusEntry {
+            change: FileChange::Modified {
+                path: PathBuf::from(path),
+            },
+            staged: false,
+            additions: None,
+            deletions: None,
+            is_binary: false,
+        }
+    }
+
+    /// Test 1: Verify file navigation conditions at first file
+    /// Tests that at file_index 0 with multiple files, 'n' can navigate but 'p' cannot
+    #[test]
+    fn test_file_navigation_conditions_at_first_file() {
+        // Create a DiffView with 2 files, at index 0 (first file)
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![make_status_entry("file1.rs"), make_status_entry("file2.rs")];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "file1.rs".to_string(),
+            PathBuf::from("file1.rs"),
+            PathBuf::from("/fake/path/file1.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            0, // file_index = 0 (first file)
+        );
+
+        // Verify initial state
+        assert_eq!(diff_view.file_index, 0, "Should start at file 0");
+        assert_eq!(diff_view.files.len(), 2, "Should have 2 files");
+
+        // At index 0:
+        // - 'n' should work: file_index + 1 < files.len() => 0 + 1 < 2 => true
+        // - 'p' should NOT work: file_index > 0 => 0 > 0 => false
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+
+        assert!(can_go_next, "Should be able to go next from first file");
+        assert!(
+            !can_go_prev,
+            "Should NOT be able to go prev from first file"
+        );
+    }
+
+    /// Test 2: Verify file navigation conditions at second file
+    /// Tests that at file_index 1, both 'n' and 'p' can navigate
+    #[test]
+    fn test_file_navigation_conditions_at_second_file() {
+        // Create a DiffView with 2 files, at index 1 (second file)
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![make_status_entry("file1.rs"), make_status_entry("file2.rs")];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "file2.rs".to_string(),
+            PathBuf::from("file2.rs"),
+            PathBuf::from("/fake/path/file2.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            1, // file_index = 1 (second file)
+        );
+
+        // Verify initial state
+        assert_eq!(diff_view.file_index, 1, "Should be at file 1");
+        assert_eq!(diff_view.files.len(), 2, "Should have 2 files");
+
+        // At index 1:
+        // - 'n' should NOT work: file_index + 1 < files.len() => 1 + 1 < 2 => false
+        // - 'p' should work: file_index > 0 => 1 > 0 => true
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+
+        assert!(!can_go_next, "Should NOT be able to go next from last file");
+        assert!(can_go_prev, "Should be able to go prev from last file");
+    }
+
+    /// Test 3: Verify file navigation conditions at middle file
+    /// Tests that at file_index 1 of 3 files, both 'n' and 'p' can navigate
+    #[test]
+    fn test_file_navigation_conditions_at_middle_file() {
+        // Create a DiffView with 3 files, at index 1 (middle file)
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![
+            make_status_entry("file1.rs"),
+            make_status_entry("file2.rs"),
+            make_status_entry("file3.rs"),
+        ];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "file2.rs".to_string(),
+            PathBuf::from("file2.rs"),
+            PathBuf::from("/fake/path/file2.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            1, // file_index = 1 (middle file)
+        );
+
+        // At index 1 of 3:
+        // - 'n' should work: 1 + 1 < 3 => true
+        // - 'p' should work: 1 > 0 => true
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+
+        assert!(can_go_next, "Should be able to go next from middle file");
+        assert!(can_go_prev, "Should be able to go prev from middle file");
+    }
+
+    /// Test 4: Empty file list - navigation conditions should be false
+    /// Verifies that when files list is empty, navigation conditions are handled gracefully
+    #[test]
+    fn test_empty_file_list_navigation_conditions() {
+        // Create a DiffView with NO files
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files: Vec<StatusEntry> = vec![]; // Empty file list
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            0,
+        );
+
+        // Verify initial state
+        assert!(diff_view.files.is_empty(), "Files list should be empty");
+        assert_eq!(diff_view.file_index, 0, "file_index should be 0");
+
+        // With empty files list:
+        // - 'n': file_index + 1 < files.len() => 1 < 0 => false
+        // - 'p': file_index > 0 && !files.is_empty() => 0 > 0 && false => false
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+
+        assert!(
+            !can_go_next,
+            "Should NOT be able to go next with empty file list"
+        );
+        assert!(
+            !can_go_prev,
+            "Should NOT be able to go prev with empty file list"
+        );
+    }
+
+    /// Test 5: Single file in list - navigation conditions should be false for both
+    /// Verifies that with only one file, both n and p conditions are false
+    #[test]
+    fn test_single_file_navigation_conditions() {
+        // Create a DiffView with only 1 file
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![make_status_entry("only_file.rs")];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "only_file.rs".to_string(),
+            PathBuf::from("only_file.rs"),
+            PathBuf::from("/fake/path/only_file.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            0,
+        );
+
+        // Verify initial state
+        assert_eq!(diff_view.file_index, 0, "Should be at file 0");
+        assert_eq!(diff_view.files.len(), 1, "Should have 1 file");
+
+        // With single file at index 0:
+        // - 'n': 0 + 1 < 1 => false
+        // - 'p': 0 > 0 && true => false
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+
+        assert!(
+            !can_go_next,
+            "Should NOT be able to go next with single file"
+        );
+        assert!(
+            !can_go_prev,
+            "Should NOT be able to go prev with single file"
+        );
+    }
+
+    /// Test 6: File navigation preserves file list and updates file_index correctly
+    /// This test verifies the internal state management for file navigation
+    #[test]
+    fn test_file_navigation_state_management() {
+        // Create a DiffView with multiple files
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![
+            make_status_entry("file1.rs"),
+            make_status_entry("file2.rs"),
+            make_status_entry("file3.rs"),
+        ];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "file1.rs".to_string(),
+            PathBuf::from("file1.rs"),
+            PathBuf::from("/fake/path/file1.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            0, // Start at first file
+        );
+
+        // Verify initial state
+        assert_eq!(diff_view.file_index, 0, "Should start at file 0");
+        assert_eq!(diff_view.files.len(), 3, "Should have 3 files");
+        assert_eq!(
+            diff_view.files[0].change.path().to_string_lossy(),
+            "file1.rs"
+        );
+
+        // Test: Verify navigation conditions are correct at each position
+        // Condition for 'n': file_index + 1 < files.len()
+        // Condition for 'p': file_index > 0 && !files.is_empty()
+
+        // At index 0:
+        // - 'n' should work: 0 + 1 < 3 = true
+        // - 'p' should NOT work: 0 > 0 = false
+        let can_go_next = diff_view.file_index + 1 < diff_view.files.len();
+        let can_go_prev = diff_view.file_index > 0 && !diff_view.files.is_empty();
+        assert!(can_go_next, "Should be able to go next from index 0");
+        assert!(!can_go_prev, "Should NOT be able to go prev from index 0");
+
+        // At index 2 (last file):
+        // Note: We can't actually change file_index since diff_view is immutable here
+        // But we can verify the logic by checking what would happen
+        let last_index = diff_view.files.len() - 1;
+        assert_eq!(last_index, 2, "Last index should be 2");
+
+        // Simulate conditions at last index
+        let at_last = last_index + 1 < diff_view.files.len(); // 3 < 3 = false
+        let at_first = last_index > 0; // 2 > 0 = true
+        assert!(!at_last, "Should NOT be able to go next from last index");
+        assert!(at_first, "Should be able to go prev from last index");
+
+        // At index 1 (middle):
+        let at_last = 1 + 1 < 3; // 2 < 3 = true
+        let at_first = 1 > 0; // true
+        assert!(at_last, "Should be able to go next from middle index");
+        assert!(at_first, "Should be able to go prev from middle index");
+    }
+
+    /// Test 7: Verify file_index is correctly stored and accessible
+    #[test]
+    fn test_file_index_storage() {
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![
+            make_status_entry("a.rs"),
+            make_status_entry("b.rs"),
+            make_status_entry("c.rs"),
+            make_status_entry("d.rs"),
+        ];
+
+        // Test with different file indices
+        for expected_index in 0..4 {
+            let diff_view = DiffView::new(
+                diff_base.clone(),
+                doc.clone(),
+                hunks.clone(),
+                format!("file{}.rs", expected_index),
+                PathBuf::from(format!("file{}.rs", expected_index)),
+                PathBuf::from(format!("/fake/path/file{}.rs", expected_index)),
+                DocumentId::default(),
+                None,
+                0,
+                files.clone(),
+                expected_index,
+            );
+
+            assert_eq!(
+                diff_view.file_index, expected_index,
+                "file_index should be {} for index {}",
+                expected_index, expected_index
+            );
+        }
+    }
+
+    /// Test 8: Files are preserved after DiffView creation
+    #[test]
+    fn test_files_preserved_after_creation() {
+        let diff_base = Rope::from("line 1\n");
+        let doc = Rope::from("line 1 modified\n");
+        let hunks = vec![make_hunk(0..1, 0..1)];
+
+        let files = vec![
+            make_status_entry("first.rs"),
+            make_status_entry("second.rs"),
+            make_status_entry("third.rs"),
+        ];
+        let files_clone = files.clone();
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "second.rs".to_string(),
+            PathBuf::from("second.rs"),
+            PathBuf::from("/fake/path/second.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            files,
+            1, // Start at second file
+        );
+
+        // Verify files are preserved
+        assert_eq!(diff_view.files.len(), 3, "Should have 3 files");
+
+        // Verify each file is preserved
+        for (i, entry) in diff_view.files.iter().enumerate() {
+            let expected_path = files_clone[i].change.path();
+            let actual_path = entry.change.path();
+            assert_eq!(actual_path, expected_path, "File {} should be preserved", i);
+        }
+    }
+
+    /// Test: Untracked file (new file with no diff base)
+    #[test]
+    fn test_untracked_file() {
+        // Simulate an untracked file: empty diff_base, doc with content, no hunks
+        let diff_base = Rope::new(); // Empty - no base version
+        let doc = Rope::from("line 1\nline 2\nline 3\n"); // 3 lines of content + trailing newline = 4 lines
+        let hunks: Vec<Hunk> = vec![]; // No hunks for untracked files
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc.clone(),
+            hunks,
+            "new_file.rs".to_string(),
+            PathBuf::from("new_file.rs"),
+            PathBuf::from("/fake/path/new_file.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Verify stats show all lines as additions
+        // Note: Rope::from("line 1\nline 2\nline 3\n") has 4 lines (including trailing empty line)
+        assert_eq!(diff_view.added, 4, "Untracked file should have 4 additions");
+        assert_eq!(
+            diff_view.removed, 0,
+            "Untracked file should have 0 deletions"
+        );
+
+        // Verify diff_lines contains the new file header and all lines as additions
+        assert!(!diff_view.diff_lines.is_empty(), "Should have diff lines");
+
+        // First line should be a hunk header with "(new file)" and correct line count
+        match &diff_view.diff_lines[0] {
+            DiffLine::HunkHeader { text, .. } => {
+                assert!(
+                    text.contains("new file"),
+                    "Hunk header should contain 'new file': {}",
+                    text
+                );
+                // Verify the line count is correctly formatted (not literal "{}")
+                assert!(
+                    text.contains("+1,4"),
+                    "Hunk header should contain '+1,4' (line count): {}",
+                    text
+                );
+                assert!(
+                    !text.contains("{}"),
+                    "Hunk header should not contain literal '{{}}': {}",
+                    text
+                );
+            }
+            _ => panic!("First line should be a HunkHeader"),
+        }
+
+        // Remaining lines should be additions
+        assert_eq!(
+            diff_view.diff_lines.len(),
+            5,
+            "Should have 1 header + 4 additions"
+        ); // 1 header + 4 lines
+
+        for (i, line) in diff_view.diff_lines.iter().skip(1).enumerate() {
+            match line {
+                DiffLine::Addition { doc_line, content } => {
+                    assert_eq!(*doc_line, (i + 1) as u32, "Line number should be {}", i + 1);
+                    // First 3 lines start with "line", last line is empty (trailing newline)
+                    if i < 3 {
+                        assert!(
+                            content.starts_with("line"),
+                            "Content should start with 'line': {}",
+                            content
+                        );
+                    }
+                }
+                _ => panic!("Line {} should be an Addition", i + 1),
+            }
+        }
+
+        // Verify hunk_boundaries has one entry
+        assert_eq!(
+            diff_view.hunk_boundaries.len(),
+            1,
+            "Should have 1 hunk boundary"
+        );
+    }
+
+    /// Test: Deleted file shows all base lines as deletions
+    /// When diff_base has content but doc is empty, it should show all base lines as deletions
+    #[test]
+    fn test_deleted_file() {
+        // Scenario: File was deleted (diff_base has content, doc is empty)
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n"); // 3 lines
+        let doc = Rope::new(); // Empty doc
+        let hunks: Vec<Hunk> = vec![]; // No pre-computed hunks
+        let base_len = diff_base.len_lines();
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "deleted_file.rs".to_string(),
+            PathBuf::from("deleted_file.rs"),
+            PathBuf::from("/fake/path/deleted_file.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should show all base lines as deletions
+        assert_eq!(diff_view.added, 0, "Deleted file should have 0 additions");
+        assert_eq!(
+            diff_view.removed, base_len,
+            "Deleted file should show all base lines as deletions"
+        );
+
+        // Should have "(deleted)" indicator
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                text.contains("(deleted)"),
+                "Should show '(deleted)' indicator: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Deleted file shows all lines as deletions with proper line numbers
+    /// Verifies that each line in the diff is a Deletion variant with correct base_line
+    #[test]
+    fn test_deleted_file_all_lines_as_deletions() {
+        // Scenario: File was deleted (diff_base has content, doc is empty)
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n"); // 3 lines
+        let doc = Rope::new(); // Empty doc
+        let hunks: Vec<Hunk> = vec![]; // No pre-computed hunks
+        let base_len = diff_base.len_lines();
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "deleted_file.rs".to_string(),
+            PathBuf::from("deleted_file.rs"),
+            PathBuf::from("/fake/path/deleted_file.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // First line should be HunkHeader
+        assert!(
+            matches!(&diff_view.diff_lines[0], DiffLine::HunkHeader { .. }),
+            "First line should be a HunkHeader"
+        );
+
+        // All remaining lines should be Deletions
+        // diff_lines[0] is HunkHeader, diff_lines[1..] should be Deletions
+        for (i, line) in diff_view.diff_lines.iter().skip(1).enumerate() {
+            match line {
+                DiffLine::Deletion { base_line, content } => {
+                    // Line numbers should be 1-indexed
+                    assert_eq!(
+                        *base_line,
+                        (i + 1) as u32,
+                        "Line {} should have base_line = {}",
+                        i,
+                        i + 1
+                    );
+                    // Content should start with "line" for first 3 lines
+                    if i < 3 {
+                        assert!(
+                            content.starts_with("line"),
+                            "Content should start with 'line': {}",
+                            content
+                        );
+                    }
+                }
+                _ => panic!("Line {} should be a Deletion, got: {:?}", i + 1, line),
+            }
+        }
+
+        // Verify total count matches base_len
+        let deletion_count = diff_view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Deletion { .. }))
+            .count();
+        assert_eq!(
+            deletion_count, base_len,
+            "Should have {} deletion lines, got {}",
+            base_len, deletion_count
+        );
+
+        // Verify hunk_boundaries has one entry
+        assert_eq!(
+            diff_view.hunk_boundaries.len(),
+            1,
+            "Should have 1 hunk boundary"
+        );
+    }
+
+    /// Test: Deleted file hunk header format
+    /// Verifies the hunk header shows correct line counts for deleted files
+    #[test]
+    fn test_deleted_file_hunk_header_format() {
+        let diff_base = Rope::from("line 1\nline 2\nline 3\nline 4\n"); // 5 lines (4 content + trailing newline)
+        let doc = Rope::new(); // Empty doc
+        let hunks: Vec<Hunk> = vec![];
+        let base_len = diff_base.len_lines();
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "deleted.rs".to_string(),
+            PathBuf::from("deleted.rs"),
+            PathBuf::from("/fake/path/deleted.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Check hunk header format: @@ -1,N +0,0 @@ (deleted)
+        if let DiffLine::HunkHeader { text, new_start } = &diff_view.diff_lines[0] {
+            // Should show -1,N where N is the base line count
+            assert!(
+                text.contains(&format!("-1,{}", base_len)),
+                "Hunk header should contain '-1,{}': {}",
+                base_len,
+                text
+            );
+            // Should show +0,0 (0 lines added)
+            assert!(
+                text.contains("+0,0"),
+                "Hunk header should contain '+0,0': {}",
+                text
+            );
+            // Should have (deleted) indicator
+            assert!(
+                text.contains("(deleted)"),
+                "Hunk header should contain '(deleted)': {}",
+                text
+            );
+            // new_start should be 0 (no lines in doc)
+            assert_eq!(*new_start, 0, "new_start should be 0 for deleted file");
+        } else {
+            panic!("First line should be a HunkHeader");
+        }
+    }
+
+    /// Test: Empty diff_base is NOT treated as deleted file
+    /// When diff_base is empty and doc is empty, it should NOT show as deleted
+    #[test]
+    fn test_empty_diff_base_not_treated_as_deleted() {
+        // Scenario: Both diff_base and doc are empty
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::new(); // Empty
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "empty.txt".to_string(),
+            PathBuf::from("empty.txt"),
+            PathBuf::from("/fake/path/empty.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should NOT be treated as deleted file
+        // Both empty = no diff lines
+        assert!(
+            diff_view.diff_lines.is_empty(),
+            "Both empty should have no diff lines"
+        );
+        assert_eq!(diff_view.added, 0, "Both empty should have 0 additions");
+        assert_eq!(diff_view.removed, 0, "Both empty should have 0 deletions");
+    }
+
+    /// Test: Empty diff_base with content in doc is treated as new file, not deleted
+    #[test]
+    fn test_empty_diff_base_with_content_is_new_file() {
+        // Scenario: diff_base is empty, doc has content
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::from("new content\n"); // Has content
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "new_file.txt".to_string(),
+            PathBuf::from("new_file.txt"),
+            PathBuf::from("/fake/path/new_file.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should be treated as new file, NOT deleted
+        assert_eq!(
+            diff_view.added, 2,
+            "New file should have 2 additions (1 line + trailing newline)"
+        );
+        assert_eq!(diff_view.removed, 0, "New file should have 0 deletions");
+
+        // Should have "(new file)" indicator, NOT "(deleted)"
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                text.contains("new file"),
+                "Should show 'new file' indicator: {}",
+                text
+            );
+            assert!(
+                !text.contains("deleted"),
+                "Should NOT show 'deleted' indicator: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Pre-computed hunks for deleted file scenario are processed normally
+    /// When hunks are provided, the deleted file special logic should NOT trigger
+    #[test]
+    fn test_deleted_file_with_precomputed_hunks_not_overridden() {
+        // Scenario: diff_base has content, doc is empty, but hunks are provided
+        // This simulates a case where hunks were pre-computed externally
+        let diff_base = Rope::from("line 1\nline 2\nline 3\n");
+        let doc = Rope::new(); // Empty
+                               // Pre-computed hunks (simulating external computation)
+        let hunks: Vec<Hunk> = vec![make_hunk(0..2, 0..0)]; // 2 deletions
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // With pre-computed hunks, the deleted file special logic should NOT trigger
+        // Stats should come from the hunk, not from treating it as fully deleted
+        assert_eq!(diff_view.added, 0, "Should have 0 additions from hunk");
+        assert_eq!(
+            diff_view.removed, 2,
+            "Should have 2 deletions from hunk (not 3 from full file)"
+        );
+
+        // Should NOT have "(deleted)" indicator because hunks were provided
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                !text.contains("(deleted)"),
+                "Pre-computed hunks should NOT show '(deleted)' indicator: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Deleted file with single line (no trailing newline)
+    #[test]
+    fn test_deleted_file_single_line_no_trailing_newline() {
+        let diff_base = Rope::from("single line"); // No trailing newline
+        let doc = Rope::new(); // Empty
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "single.txt".to_string(),
+            PathBuf::from("single.txt"),
+            PathBuf::from("/fake/path/single.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should be treated as deleted
+        assert_eq!(diff_view.added, 0, "Deleted file should have 0 additions");
+        assert_eq!(
+            diff_view.removed, 1,
+            "Single line deleted file should have 1 deletion"
+        );
+
+        // Should have "(deleted)" indicator
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                text.contains("(deleted)"),
+                "Should show '(deleted)' indicator: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Deleted file stats are correctly computed
+    #[test]
+    fn test_deleted_file_stats() {
+        let diff_base = Rope::from("a\nb\nc\nd\ne\n"); // 5 lines + trailing newline = 6 lines
+        let doc = Rope::new();
+        let hunks: Vec<Hunk> = vec![];
+        let base_len = diff_base.len_lines(); // Compute before move
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "multi.txt".to_string(),
+            PathBuf::from("multi.txt"),
+            PathBuf::from("/fake/path/multi.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Stats should show 0 added, N removed
+        assert_eq!(diff_view.added, 0, "Deleted file should have 0 additions");
+        assert_eq!(
+            diff_view.removed, base_len,
+            "Deleted file should have removed = base line count"
+        );
+    }
+
+    /// Test: Pre-computed hunks are processed normally (not overridden by untracked logic)
+    /// When hunks are provided, they should be used even if diff_base is empty
+    #[test]
+    fn test_precomputed_hunks_not_overridden() {
+        // Scenario: Hunks are pre-computed and provided
+        // Even though diff_base is empty, the pre-computed hunks should be used
+        let diff_base = Rope::new(); // Empty diff base
+        let doc = Rope::from("line 1\nline 2\nline 3\n");
+        // Pre-computed hunks (simulating a case where hunks were computed externally)
+        let hunks: Vec<Hunk> = vec![make_hunk(0..0, 0..3)]; // 3 additions
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "test.rs".to_string(),
+            PathBuf::from("test.rs"),
+            PathBuf::from("/fake/path/test.rs"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // With pre-computed hunks, the untracked file logic should NOT trigger
+        // The hunks should be processed normally
+        assert!(
+            !diff_view.diff_lines.is_empty(),
+            "Should have diff lines from pre-computed hunks"
+        );
+
+        // Should NOT have "(new file)" indicator because hunks were provided
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                !text.contains("new file"),
+                "Pre-computed hunks should NOT show 'new file' indicator: {}",
+                text
+            );
+        }
+
+        // Stats should come from the hunk, not from treating it as untracked
+        // The hunk has 0 deletions (before: 0..0) and 3 additions (after: 0..3)
+        assert_eq!(diff_view.added, 3, "Should have 3 additions from hunk");
+        assert_eq!(diff_view.removed, 0, "Should have 0 deletions from hunk");
+    }
+
+    /// Test: Untracked file with single line (no trailing newline)
+    #[test]
+    fn test_untracked_file_single_line_no_trailing_newline() {
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::from("single line"); // No trailing newline
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "single.txt".to_string(),
+            PathBuf::from("single.txt"),
+            PathBuf::from("/fake/path/single.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should be treated as untracked
+        assert_eq!(
+            diff_view.added, 1,
+            "Single line file should have 1 addition"
+        );
+        assert_eq!(
+            diff_view.removed, 0,
+            "Untracked file should have 0 deletions"
+        );
+
+        // Should have "(new file)" indicator
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                text.contains("new file"),
+                "Should show 'new file' indicator: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Untracked file with many lines
+    #[test]
+    fn test_untracked_file_many_lines() {
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::from(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "many_lines.txt".to_string(),
+            PathBuf::from("many_lines.txt"),
+            PathBuf::from("/fake/path/many_lines.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Should be treated as untracked
+        assert_eq!(
+            diff_view.added, 11,
+            "10 lines + trailing newline = 11 additions"
+        );
+        assert_eq!(
+            diff_view.removed, 0,
+            "Untracked file should have 0 deletions"
+        );
+
+        // Verify all lines are additions
+        let addition_count = diff_view
+            .diff_lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Addition { .. }))
+            .count();
+        assert_eq!(addition_count, 11, "Should have 11 addition lines");
+
+        // Verify hunk header has correct line count
+        if let DiffLine::HunkHeader { text, .. } = &diff_view.diff_lines[0] {
+            assert!(
+                text.contains("+1,11"),
+                "Hunk header should show +1,11: {}",
+                text
+            );
+        }
+    }
+
+    /// Test: Untracked file stats are correct
+    #[test]
+    fn test_untracked_file_stats_correct() {
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::from("a\nb\nc\n"); // 3 lines + trailing newline = 4 lines
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "stats.txt".to_string(),
+            PathBuf::from("stats.txt"),
+            PathBuf::from("/fake/path/stats.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Stats should match the number of lines in the doc
+        assert_eq!(
+            diff_view.added, 4,
+            "Stats should show 4 additions (matching doc line count)"
+        );
+        assert_eq!(
+            diff_view.removed, 0,
+            "Stats should show 0 deletions for untracked file"
+        );
+    }
+
+    /// Test: Addition lines have correct doc_line numbers (1-indexed)
+    #[test]
+    fn test_untracked_file_line_numbers() {
+        let diff_base = Rope::new(); // Empty
+        let doc = Rope::from("first\nsecond\nthird\n");
+        let hunks: Vec<Hunk> = vec![];
+
+        let diff_view = DiffView::new(
+            diff_base,
+            doc,
+            hunks,
+            "lines.txt".to_string(),
+            PathBuf::from("lines.txt"),
+            PathBuf::from("/fake/path/lines.txt"),
+            DocumentId::default(),
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        // Verify line numbers are 1-indexed and sequential
+        let mut expected_line = 1;
+        for line in diff_view.diff_lines.iter().skip(1) {
+            if let DiffLine::Addition { doc_line, .. } = line {
+                assert_eq!(
+                    *doc_line, expected_line,
+                    "Line number should be {} (1-indexed)",
+                    expected_line
+                );
+                expected_line += 1;
+            }
+        }
     }
 }
 

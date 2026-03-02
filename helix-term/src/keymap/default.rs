@@ -236,7 +236,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "S" => lsp_or_syntax_workspace_symbol_picker,
             "d" => diagnostics_picker,
             "D" => workspace_diagnostics_picker,
-            "g" => changed_file_picker,
+            "g" => git_status_picker,
             "\\" => hunk_picker,
             "a" => code_action,
             "'" => last_picker,

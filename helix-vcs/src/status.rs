@@ -42,4 +42,6 @@ pub struct StatusEntry {
     pub additions: Option<usize>,
     /// Number of deletions (from git diff --numstat), if available
     pub deletions: Option<usize>,
+    /// Whether this file is binary (detected by git)
+    pub is_binary: bool,
 }

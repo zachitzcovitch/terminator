@@ -179,7 +179,7 @@ fn status_porcelain_staged_modification() {
     File::create(&file).unwrap().write_all(b"modified").unwrap();
     exec_git_cmd("add file.txt", temp_git.path());
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     assert_eq!(entries.len(), 1, "Should have exactly one entry");
     let entry = &entries[0];
@@ -204,7 +204,7 @@ fn status_porcelain_unstaged_modification() {
     // Modify without staging
     File::create(&file).unwrap().write_all(b"modified").unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     assert_eq!(entries.len(), 1, "Should have exactly one entry");
     let entry = &entries[0];
@@ -232,7 +232,7 @@ fn status_porcelain_dual_staged_unstaged() {
     // Modify again without staging
     File::create(&file).unwrap().write_all(b"unstaged").unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     assert_eq!(entries.len(), 2, "Should have two entries for MM state");
 
@@ -268,7 +268,7 @@ fn status_porcelain_staged_new_file() {
         .unwrap();
     exec_git_cmd("add new_file.txt", temp_git.path());
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = find_entry_by_path(&entries, "new_file.txt").expect("Should find new_file.txt");
     assert!(entry.staged, "New file should be staged");
@@ -295,7 +295,7 @@ fn status_porcelain_untracked_file() {
         .write_all(b"untracked")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = find_entry_by_path(&entries, "untracked.txt").expect("Should find untracked.txt");
     assert!(!entry.staged, "Untracked file should not be staged");
@@ -319,7 +319,7 @@ fn status_porcelain_staged_deleted_file() {
     std::fs::remove_file(&file).unwrap();
     exec_git_cmd("add to_delete.txt", temp_git.path());
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     assert_eq!(entries.len(), 1, "Should have exactly one entry");
     let entry = &entries[0];
@@ -348,7 +348,7 @@ fn status_porcelain_renamed_file() {
     std::fs::rename(&old_file, &new_file).unwrap();
     exec_git_cmd("add -A", temp_git.path());
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = entries
         .iter()
@@ -408,7 +408,7 @@ fn status_porcelain_conflict_uu() {
         "Merge should fail due to conflict"
     );
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = find_entry_by_path(&entries, "conflict.txt").expect("Should find conflict.txt");
     assert!(
@@ -434,7 +434,7 @@ fn status_porcelain_quoted_path_spaces() {
         .write_all(b"content")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = entries
         .iter()
@@ -470,7 +470,7 @@ fn status_porcelain_escaped_tab() {
         .write_all(b"content")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     // The path should contain an actual tab character, not \t
     let entry = entries
@@ -538,7 +538,7 @@ fn status_porcelain_empty_repo() {
     // Create initial commit (empty repo with no files)
     exec_git_cmd("commit --allow-empty -m 'initial'", temp_git.path());
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
     assert!(entries.is_empty(), "Empty repo should have no entries");
 }
 
@@ -575,7 +575,7 @@ fn status_porcelain_multiple_files() {
         .write_all(b"untracked")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     assert_eq!(entries.len(), 3, "Should have three entries");
 
@@ -810,7 +810,8 @@ fn adversarial_unquote_many_escapes() {
 /// Test get_status_porcelain with non-existent directory
 #[test]
 fn adversarial_status_nonexistent_cwd() {
-    let result = git::get_status_porcelain(Path::new("/nonexistent/path/that/does/not/exist"));
+    let result =
+        git::get_status_porcelain(Path::new("/nonexistent/path/that/does/not/exist"), false);
     assert!(result.is_err(), "Should fail for non-existent directory");
 }
 
@@ -818,7 +819,7 @@ fn adversarial_status_nonexistent_cwd() {
 #[test]
 fn adversarial_status_non_git_dir() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let result = git::get_status_porcelain(temp_dir.path());
+    let result = git::get_status_porcelain(temp_dir.path(), false);
     assert!(result.is_err(), "Should fail for non-git directory");
 }
 
@@ -971,7 +972,7 @@ fn adversarial_real_file_leading_dash() {
         .write_all(b"content")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = entries
         .iter()
@@ -998,7 +999,7 @@ fn adversarial_real_file_newline_in_name() {
         .write_all(b"content")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     // Should find the file with actual newlines in path
     let entry = entries
@@ -1027,7 +1028,7 @@ fn adversarial_real_file_backslash_in_name() {
         .write_all(b"content")
         .unwrap();
 
-    let entries = git::get_status_porcelain(temp_git.path()).unwrap();
+    let entries = git::get_status_porcelain(temp_git.path(), false).unwrap();
 
     let entry = entries
         .iter()
@@ -1127,7 +1128,8 @@ fn diff_stats_modified_file() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats for modified file");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 1, "Should have 1 addition (line5)");
     assert_eq!(deletions, 1, "Should have 1 deletion (line2)");
 }
@@ -1184,10 +1186,11 @@ fn diff_stats_binary_file() {
         .unwrap();
 
     let result = git::get_diff_stats(temp_git.path(), Path::new("image.png"), false).unwrap();
-    assert!(
-        result.is_none(),
-        "Binary file should return None (shows `- - filename` in numstat)"
-    );
+    assert!(result.is_some(), "Binary file should return Some");
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(is_binary, "Binary file should have is_binary=true");
+    assert_eq!(additions, 0, "Binary file should have 0 additions");
+    assert_eq!(deletions, 0, "Binary file should have 0 deletions");
 }
 
 /// Test 4: File with no changes → None (empty output)
@@ -1238,7 +1241,8 @@ fn diff_stats_staged_new_file() {
         "Staged new file should have stats (comparing staged content against HEAD)"
     );
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 3, "Should have 3 additions (new lines)");
     assert_eq!(deletions, 0, "Should have 0 deletions (file not in HEAD)");
 }
@@ -1262,7 +1266,8 @@ fn diff_stats_deleted_file() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("to_delete.txt"), false).unwrap();
     assert!(result.is_some(), "Deleted file should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 0, "Deleted file should have 0 additions");
     assert_eq!(deletions, 3, "Deleted file should have 3 deletions");
 }
@@ -1286,7 +1291,8 @@ fn diff_stats_only_additions() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 3, "Should have 3 additions");
     assert_eq!(deletions, 0, "Should have 0 deletions");
 }
@@ -1310,7 +1316,8 @@ fn diff_stats_only_deletions() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("file.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 0, "Should have 0 additions");
     assert_eq!(deletions, 3, "Should have 3 deletions");
 }
@@ -1339,7 +1346,8 @@ fn diff_stats_large_changes() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("large.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     // The exact counts depend on diff algorithm, but should be substantial
     assert!(additions > 400, "Should have many additions");
     assert!(deletions > 400, "Should have many deletions");
@@ -1364,7 +1372,8 @@ fn diff_stats_empty_file() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("empty.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 1, "Should have 1 addition");
     assert_eq!(deletions, 0, "Should have 0 deletions");
 }
@@ -1435,7 +1444,8 @@ fn diff_stats_subdirectory_file() {
     let result = git::get_diff_stats(temp_git.path(), Path::new("subdir/file.txt"), false).unwrap();
     assert!(result.is_some(), "Should have diff stats");
 
-    let (additions, deletions) = result.unwrap();
+    let (additions, deletions, is_binary) = result.unwrap();
+    assert!(!is_binary, "Text file should not be binary");
     assert_eq!(additions, 1, "Should have 1 addition");
     assert_eq!(deletions, 1, "Should have 1 deletion");
 }
@@ -1461,7 +1471,7 @@ fn diff_stats_renamed_file() {
     let old_result =
         git::get_diff_stats(temp_git.path(), Path::new("old_name.txt"), false).unwrap();
     assert!(old_result.is_some(), "Old file should have stats");
-    let (_, deletions) = old_result.unwrap();
+    let (_, deletions, _) = old_result.unwrap();
     assert_eq!(deletions, 1, "Old file should show as deleted");
 
     // New file should show as added (untracked, so None against HEAD)
@@ -2064,6 +2074,7 @@ fn adversarial_diff_stats_nonexistent_cwd() {
     let result = git::get_diff_stats(
         Path::new("/nonexistent/path/that/does/not/exist"),
         Path::new("file.txt"),
+        false,
     );
     // Should error gracefully, not panic
     assert!(
@@ -2246,7 +2257,7 @@ fn adversarial_diff_stats_symlink_outside_repo() {
     let _ = symlink("/etc/passwd", &symlink_path);
 
     // Should handle symlink safely
-    let result = git::get_diff_stats(temp_git.path(), Path::new("external_link"));
+    let result = git::get_diff_stats(temp_git.path(), Path::new("external_link"), false);
     // Should not panic, may error or return None
     assert!(
         result.is_ok() || result.is_err(),
@@ -2274,7 +2285,7 @@ fn adversarial_diff_stats_symlink_loop() {
     let _ = symlink("link1", &link2);
 
     // Should handle symlink loop safely
-    let result = git::get_diff_stats(temp_git.path(), Path::new("link1"));
+    let result = git::get_diff_stats(temp_git.path(), Path::new("link1"), false);
     // Should not panic
     assert!(
         result.is_ok() || result.is_err(),
@@ -2303,7 +2314,7 @@ fn adversarial_diff_stats_null_byte_path() {
     let path = Path::new(null_path);
 
     // Should handle safely
-    let result = git::get_diff_stats(temp_git.path(), path);
+    let result = git::get_diff_stats(temp_git.path(), path, false);
     // Should not panic
     assert!(
         result.is_ok() || result.is_err(),
@@ -2336,7 +2347,7 @@ fn adversarial_diff_stats_absolute_path() {
         .unwrap();
 
     // Use absolute path
-    let result = git::get_diff_stats(temp_git.path(), abs_file.as_path());
+    let result = git::get_diff_stats(temp_git.path(), abs_file.as_path(), false);
     // Should handle absolute path safely
     assert!(
         result.is_ok() || result.is_err(),
@@ -2375,7 +2386,11 @@ fn adversarial_diff_stats_combined_attacks() {
             .unwrap();
 
         // Should handle combined attacks safely
-        let result = git::get_diff_stats(temp_git.path(), Path::new("file;$(whoami)`id`|cat.txt"));
+        let result = git::get_diff_stats(
+            temp_git.path(),
+            Path::new("file;$(whoami)`id`|cat.txt"),
+            false,
+        );
         assert!(
             result.is_ok(),
             "Combined attack vectors should be handled safely"
@@ -2395,7 +2410,7 @@ fn adversarial_diff_stats_resource_exhaustion() {
 
     // Rapid repeated calls should not cause resource exhaustion
     for _ in 0..100 {
-        let result = git::get_diff_stats(temp_git.path(), Path::new("initial.txt"));
+        let result = git::get_diff_stats(temp_git.path(), Path::new("initial.txt"), false);
         assert!(
             result.is_ok(),
             "Repeated calls should not cause resource issues"
