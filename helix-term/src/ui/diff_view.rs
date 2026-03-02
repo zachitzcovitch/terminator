@@ -1,5 +1,7 @@
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
+use crate::job;
 use crate::ui::overlay::overlaid;
+use crate::ui::{Prompt, PromptEvent};
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::tree_sitter::Node;
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
@@ -1019,6 +1021,10 @@ pub struct DiffView {
     files: Vec<StatusEntry>,
     /// Current file index in the files list
     file_index: usize,
+    /// Whether the document has unsaved changes
+    is_modified: bool,
+    /// Whether the file on disk is newer than the buffer (external changes)
+    is_stale: bool,
 }
 
 impl DiffView {
@@ -1034,6 +1040,8 @@ impl DiffView {
         cursor_line: usize,                   // 0-indexed line to position selection near
         files: Vec<StatusEntry>,              // List of all files for n/p navigation
         file_index: usize,                    // Current file index in the files list
+        is_modified: bool,                    // Whether the document has unsaved changes
+        is_stale: bool,                       // Whether the file on disk is newer than the buffer
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -1072,6 +1080,8 @@ impl DiffView {
             needs_initial_scroll: cursor_line > 0,
             files,
             file_index,
+            is_modified,
+            is_stale,
         };
 
         view.compute_diff_lines();
@@ -1403,19 +1413,30 @@ impl DiffView {
         // Clear the area
         surface.clear_with(area, style_delta);
 
+        // Build header text with optional [modified] badge
+        let header_text = if self.is_modified {
+            format!(
+                " {} [modified]: +{} -{} [{}/{}] ",
+                self.file_name,
+                self.added,
+                self.removed,
+                self.selected_hunk + 1,
+                self.hunk_boundaries.len()
+            )
+        } else {
+            format!(
+                " {}: +{} -{} [{}/{}] ",
+                self.file_name,
+                self.added,
+                self.removed,
+                self.selected_hunk + 1,
+                self.hunk_boundaries.len()
+            )
+        };
+
         // Calculate dimensions
         let block = Block::bordered()
-            .title(Span::styled(
-                format!(
-                    " {}: +{} -{} [{}/{}] ",
-                    self.file_name,
-                    self.added,
-                    self.removed,
-                    self.selected_hunk + 1,
-                    self.hunk_boundaries.len()
-                ),
-                style_header,
-            ))
+            .title(Span::styled(header_text, style_header))
             .border_style(style_header);
         let inner = block.inner(area);
         block.render(area, surface);
@@ -1426,6 +1447,23 @@ impl DiffView {
 
         let margin = Margin::horizontal(1);
         let content_area = inner.inner(margin);
+
+        // Show warning banner if file on disk is newer than the buffer
+        let content_area = if self.is_stale {
+            let warning_style = cx.editor.theme.get("warning");
+            let warning_text = "⚠ File changed on disk. Buffer may be stale. Press R to reload.";
+            // Render warning banner at top of content area
+            surface.set_string(content_area.x, content_area.y, warning_text, warning_style);
+            // Adjust content area to start below warning
+            Rect::new(
+                content_area.x,
+                content_area.y + 1,
+                content_area.width,
+                content_area.height.saturating_sub(1),
+            )
+        } else {
+            content_area
+        };
 
         let visible_lines = content_area.height as usize;
 
@@ -2661,30 +2699,84 @@ impl Component for DiffView {
 
                         // Get the absolute file path for revert operation
                         let absolute_path = self.absolute_path.clone();
-
-                        // Create a callback to perform the revert
                         let file_name = self.file_name.clone();
-                        let revert_fn: Callback =
-                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
-                                // Revert the hunk using git apply -R
-                                match git::revert_hunk(&absolute_path, &patch) {
-                                    Ok(()) => {
-                                        // Show success message
-                                        cx.editor
-                                            .set_status(format!("Reverted hunk in {}", file_name));
-                                    }
-                                    Err(e) => {
-                                        // Show error message
-                                        cx.editor
-                                            .set_error(format!("Failed to revert hunk: {}", e));
-                                    }
-                                }
+                        let has_unsaved = self.is_modified;
 
-                                // Pop the diff view overlay
-                                compositor.pop();
-                            });
+                        if has_unsaved {
+                            // Show confirmation prompt for unsaved changes
+                            let callback: Callback = Box::new(
+                                move |compositor: &mut Compositor, _cx: &mut Context| {
+                                    let prompt = Prompt::new(
+                                        format!(
+                                            "Revert hunk in '{}'? Unsaved changes will be discarded. [y/N]",
+                                            file_name
+                                        )
+                                        .into(),
+                                        None,
+                                        |_editor: &helix_view::Editor, _input: &str| Vec::new(),
+                                        move |cx: &mut Context, input: &str, event: PromptEvent| {
+                                            if event != PromptEvent::Validate {
+                                                return;
+                                            }
 
-                        return EventResult::Consumed(Some(revert_fn));
+                                            let input = input.trim().to_lowercase();
+                                            if input == "y" || input == "yes" {
+                                                // Proceed with revert
+                                                match git::revert_hunk(&absolute_path, &patch) {
+                                                    Ok(()) => {
+                                                        cx.editor.set_status(format!(
+                                                            "Reverted hunk in {}",
+                                                            file_name
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        cx.editor.set_error(format!(
+                                                            "Failed to revert hunk: {}",
+                                                            e
+                                                        ));
+                                                    }
+                                                }
+
+                                                // Close the diff view
+                                                job::dispatch_blocking(
+                                                    |_editor, compositor: &mut Compositor| {
+                                                        compositor.pop(); // Pop the prompt
+                                                        compositor.pop(); // Pop the diff view
+                                                    },
+                                                );
+                                            }
+                                        },
+                                    );
+                                    compositor.push(Box::new(prompt));
+                                },
+                            );
+                            return EventResult::Consumed(Some(callback));
+                        } else {
+                            // No unsaved changes - revert directly
+                            let revert_fn: Callback =
+                                Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                                    // Revert the hunk using git apply -R
+                                    match git::revert_hunk(&absolute_path, &patch) {
+                                        Ok(()) => {
+                                            // Show success message
+                                            cx.editor.set_status(format!(
+                                                "Reverted hunk in {}",
+                                                file_name
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            // Show error message
+                                            cx.editor
+                                                .set_error(format!("Failed to revert hunk: {}", e));
+                                        }
+                                    }
+
+                                    // Pop the diff view overlay
+                                    compositor.pop();
+                                });
+
+                            return EventResult::Consumed(Some(revert_fn));
+                        }
                     }
                 }
                 KeyCode::Char('s') => {
@@ -2787,6 +2879,24 @@ impl Component for DiffView {
                                     }
                                 };
 
+                                // Check if document has unsaved changes
+                                let is_modified = doc.is_modified();
+
+                                // Check if file on disk is newer than the buffer
+                                let is_stale = if let Some(path) = doc.path() {
+                                    if let Ok(metadata) = std::fs::metadata(path) {
+                                        if let Ok(disk_mtime) = metadata.modified() {
+                                            disk_mtime > doc.last_saved_time()
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
                                 // Create new DiffView
                                 let diff_view = DiffView::new(
                                     diff_base,
@@ -2800,6 +2910,8 @@ impl Component for DiffView {
                                     0, // cursor_line
                                     files,
                                     next_index,
+                                    is_modified,
+                                    is_stale,
                                 );
 
                                 // Push new diff view
@@ -2869,6 +2981,24 @@ impl Component for DiffView {
                                     }
                                 };
 
+                                // Check if document has unsaved changes
+                                let is_modified = doc.is_modified();
+
+                                // Check if file on disk is newer than the buffer
+                                let is_stale = if let Some(path) = doc.path() {
+                                    if let Ok(metadata) = std::fs::metadata(path) {
+                                        if let Ok(disk_mtime) = metadata.modified() {
+                                            disk_mtime > doc.last_saved_time()
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
                                 // Create new DiffView
                                 let diff_view = DiffView::new(
                                     diff_base,
@@ -2882,6 +3012,8 @@ impl Component for DiffView {
                                     0, // cursor_line
                                     files,
                                     prev_index,
+                                    is_modified,
+                                    is_stale,
                                 );
 
                                 // Push new diff view
@@ -2892,6 +3024,101 @@ impl Component for DiffView {
                     } else if !self.files.is_empty() {
                         // At the first file, show a message
                         cx.editor.set_status("Already at first file");
+                    }
+                }
+                KeyCode::Char('R') => {
+                    // Reload file from disk
+                    let has_unsaved = self.is_modified;
+                    let doc_id = self.doc_id;
+                    let file_name = self.file_name.clone();
+
+                    if has_unsaved {
+                        // Show confirmation prompt for unsaved changes
+                        let callback: Callback =
+                            Box::new(move |compositor: &mut Compositor, _cx: &mut Context| {
+                                let prompt = Prompt::new(
+                                    format!(
+                                        "Reload '{}'? Unsaved changes will be discarded. [y/N]",
+                                        file_name
+                                    )
+                                    .into(),
+                                    None,
+                                    |_editor: &helix_view::Editor, _input: &str| Vec::new(),
+                                    move |cx: &mut Context, input: &str, event: PromptEvent| {
+                                        if event != PromptEvent::Validate {
+                                            return;
+                                        }
+
+                                        let input = input.trim().to_lowercase();
+                                        if input == "y" || input == "yes" {
+                                            // Proceed with reload
+                                            let doc = helix_view::doc_mut!(cx.editor, &doc_id);
+                                            let view = helix_view::view_mut!(cx.editor);
+                                            let diff_providers = cx.editor.diff_providers.clone();
+
+                                            match doc.reload(view, &diff_providers) {
+                                                Ok(()) => {
+                                                    // Notify language servers that file changed
+                                                    if let Some(path) = doc.path() {
+                                                        cx.editor
+                                                            .language_servers
+                                                            .file_event_handler
+                                                            .file_changed(path.clone());
+                                                    }
+                                                    cx.editor.set_status(format!(
+                                                        "Reloaded {}",
+                                                        file_name
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    cx.editor.set_error(format!(
+                                                        "Failed to reload: {}",
+                                                        e
+                                                    ));
+                                                }
+                                            }
+
+                                            // Close the diff view - user will need to reopen it to see updated diff
+                                            job::dispatch_blocking(
+                                                |_editor, compositor: &mut Compositor| {
+                                                    compositor.pop(); // Pop the prompt
+                                                    compositor.pop(); // Pop the diff view
+                                                },
+                                            );
+                                        }
+                                    },
+                                );
+                                compositor.push(Box::new(prompt));
+                            });
+                        return EventResult::Consumed(Some(callback));
+                    } else {
+                        // No unsaved changes - reload directly
+                        let callback: Callback =
+                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                                let doc = helix_view::doc_mut!(cx.editor, &doc_id);
+                                let view = helix_view::view_mut!(cx.editor);
+                                let diff_providers = cx.editor.diff_providers.clone();
+
+                                match doc.reload(view, &diff_providers) {
+                                    Ok(()) => {
+                                        // Notify language servers that file changed
+                                        if let Some(path) = doc.path() {
+                                            cx.editor
+                                                .language_servers
+                                                .file_event_handler
+                                                .file_changed(path.clone());
+                                        }
+                                        cx.editor.set_status(format!("Reloaded {}", file_name));
+                                    }
+                                    Err(e) => {
+                                        cx.editor.set_error(format!("Failed to reload: {}", e));
+                                    }
+                                }
+
+                                // Close the diff view - user will need to reopen it to see updated diff
+                                compositor.pop();
+                            });
+                        return EventResult::Consumed(Some(callback));
                     }
                 }
                 _ => {}
@@ -3297,6 +3524,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3346,6 +3575,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3384,6 +3615,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3422,6 +3655,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3456,6 +3691,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3499,6 +3736,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3531,6 +3770,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -3594,6 +3835,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Step 2: Simulate Esc key press
@@ -3672,6 +3915,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let esc_event = Event::Key(helix_view::input::KeyEvent {
@@ -3720,6 +3965,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -3789,6 +4036,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Send Enter key
@@ -3843,6 +4092,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // The hunk's after.start should be 5 (0-indexed line number in working copy)
@@ -3896,6 +4147,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify hunks is empty
@@ -3953,6 +4206,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Manually set selected_hunk to an out-of-bounds value
@@ -4076,6 +4331,8 @@ mod diff_view_tests {
             0,
             files,
             0, // file_index = 0 (first file)
+            false,
+            false,
         );
 
         // Verify initial state
@@ -4118,6 +4375,8 @@ mod diff_view_tests {
             0,
             files,
             1, // file_index = 1 (second file)
+            false,
+            false,
         );
 
         // Verify initial state
@@ -4161,6 +4420,8 @@ mod diff_view_tests {
             0,
             files,
             1, // file_index = 1 (middle file)
+            false,
+            false,
         );
 
         // At index 1 of 3:
@@ -4196,6 +4457,8 @@ mod diff_view_tests {
             0,
             files,
             0,
+            false,
+            false,
         );
 
         // Verify initial state
@@ -4241,6 +4504,8 @@ mod diff_view_tests {
             0,
             files,
             0,
+            false,
+            false,
         );
 
         // Verify initial state
@@ -4290,6 +4555,8 @@ mod diff_view_tests {
             0,
             files,
             0, // Start at first file
+            false,
+            false,
         );
 
         // Verify initial state
@@ -4359,6 +4626,8 @@ mod diff_view_tests {
                 0,
                 files.clone(),
                 expected_index,
+                false,
+                false,
             );
 
             assert_eq!(
@@ -4395,6 +4664,8 @@ mod diff_view_tests {
             0,
             files,
             1, // Start at second file
+            false,
+            false,
         );
 
         // Verify files are preserved
@@ -4428,6 +4699,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify stats show all lines as additions
@@ -4518,6 +4791,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should show all base lines as deletions
@@ -4559,6 +4834,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // First line should be HunkHeader
@@ -4634,6 +4911,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Check hunk header format: @@ -1,N +0,0 @@ (deleted)
@@ -4685,6 +4964,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should NOT be treated as deleted file
@@ -4717,6 +4998,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should be treated as new file, NOT deleted
@@ -4764,6 +5047,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // With pre-computed hunks, the deleted file special logic should NOT trigger
@@ -4803,6 +5088,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should be treated as deleted
@@ -4842,6 +5129,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Stats should show 0 added, N removed
@@ -4875,6 +5164,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // With pre-computed hunks, the untracked file logic should NOT trigger
@@ -4918,6 +5209,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should be treated as untracked
@@ -4961,6 +5254,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should be treated as untracked
@@ -5010,6 +5305,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Stats should match the number of lines in the doc
@@ -5042,6 +5339,8 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify line numbers are 1-indexed and sequential
@@ -5118,6 +5417,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
     }
 
@@ -5140,6 +5441,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.added, 2);
@@ -5164,6 +5467,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -5188,6 +5493,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -5215,6 +5522,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic - test passes if we reach here
@@ -5240,6 +5549,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic - test passes if we reach here
@@ -5265,6 +5576,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic - test passes if we reach here
@@ -5292,6 +5605,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -5317,6 +5632,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(true);
@@ -5346,6 +5663,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -5370,6 +5689,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let total_lines = diff_view.diff_lines.len();
@@ -5400,6 +5721,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         diff_view.scroll = 100;
@@ -5427,6 +5750,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         diff_view.scroll = u16::MAX;
@@ -5455,6 +5780,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let content_area = Rect::new(0, 0, 0, 10)
@@ -5482,6 +5809,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let inner_width = 3u16;
@@ -5509,6 +5838,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let content_area = Rect::new(0, 0, 80, 0)
@@ -5536,6 +5867,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let inner_height = 1u16;
@@ -5562,6 +5895,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         diff_view.update_scroll(1);
@@ -5589,6 +5924,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(true);
@@ -5612,6 +5949,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -5636,6 +5975,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -5659,6 +6000,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -5682,6 +6025,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(diff_view.added > 0 || diff_view.removed > 0);
@@ -5716,6 +6061,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -6135,6 +6482,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // First line should be at screen row 0
@@ -6165,6 +6514,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Request screen row for index way beyond bounds
@@ -6199,6 +6550,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic with usize::MAX
@@ -6231,6 +6584,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Screen row 0 should map to diff line 0
@@ -6261,6 +6616,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Request diff line for screen row way beyond total
@@ -6295,6 +6652,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic with usize::MAX
@@ -6327,6 +6686,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // All operations should handle empty diff_lines gracefully
@@ -6381,6 +6742,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count HunkHeaders
@@ -6428,6 +6791,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the first HunkHeader and verify its screen row is valid
@@ -6478,6 +6843,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find HunkHeader and verify it handles long text
@@ -6519,6 +6886,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle unicode without panicking
@@ -6566,6 +6935,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll to exactly max_scroll
@@ -6609,6 +6980,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count HunkHeaders
@@ -6666,6 +7039,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // For each diff line, convert to screen row and verify it maps back
@@ -6701,6 +7076,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the HunkHeader index
@@ -6750,6 +7127,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count HunkHeaders
@@ -6810,6 +7189,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle wide unicode without issues
@@ -6853,6 +7234,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll to some value
@@ -6891,6 +7274,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle extreme line numbers without panic
@@ -6924,6 +7309,8 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let visible_lines = 3;
@@ -6997,6 +7384,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -7129,6 +7518,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Navigate to second hunk using J (Shift+j)
@@ -7219,6 +7610,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // With 1 hunk, indicator should be [1/1]
@@ -7276,6 +7669,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let hunk_count = diff_view.hunk_boundaries.len();
@@ -7370,6 +7765,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "Should start at hunk 0");
@@ -7398,6 +7795,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             )
         };
 
@@ -7427,6 +7826,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             )
         };
 
@@ -7456,6 +7857,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // For single hunk, indicator should show [1/1]
@@ -7486,6 +7889,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "selected_hunk should be 0");
@@ -7513,6 +7918,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             )
         };
 
@@ -7547,6 +7954,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             )
         };
 
@@ -7581,6 +7990,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // For no hunks, indicator should show [0/0]
@@ -7607,6 +8018,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             )
         };
 
@@ -7716,6 +8129,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify hunk_boundaries is empty
@@ -7763,6 +8178,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify we have 1000 hunks
@@ -8153,6 +8570,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify diff_lines is empty
@@ -8203,6 +8622,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should have at least a hunk header and the diff lines
@@ -8299,6 +8720,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Navigate through all hunks rapidly
@@ -8411,6 +8834,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
@@ -8456,6 +8881,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Verify the path is stored as-is (no sanitization, but also no execution)
@@ -8496,6 +8923,8 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Navigate - should not panic with unicode content
@@ -8531,6 +8960,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Navigate - should handle long lines without hanging
@@ -8973,6 +9404,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let hunk_start = diff_view.hunk_boundaries[0].start;
@@ -9127,6 +9560,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find a line between the two hunks (context area)
@@ -9326,6 +9761,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify empty state
@@ -9465,6 +9902,8 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Rapidly navigate through all adjacent hunks
@@ -9534,6 +9973,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // WorkingCopy context: should use doc for context lines
@@ -9596,6 +10037,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // This is how stage operation generates the patch (line 659)
@@ -9644,6 +10087,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // This is how revert operation generates the patch (line 615)
@@ -9694,6 +10139,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Stage uses Index context
@@ -9741,6 +10188,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Stage uses Index context
@@ -9784,6 +10233,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Revert uses WorkingCopy context
@@ -9828,6 +10279,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let patch_working =
@@ -9870,6 +10323,8 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let stage_patch = diff_view.generate_hunk_patch(&diff_view.hunks[0], ContextSource::Index);
@@ -10546,6 +11001,8 @@ mod syntax_highlighting_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Initially, syntax should not be cached
@@ -11846,6 +12303,8 @@ mod performance_caching_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -12447,6 +12906,8 @@ mod function_context_styling_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -12915,6 +13376,8 @@ mod box_decoration_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -13783,6 +14246,8 @@ mod phase7_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count hunk headers
@@ -13950,6 +14415,8 @@ mod phase7_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle Unicode content without panicking
@@ -13982,6 +14449,8 @@ mod phase7_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle many hunks without panicking
@@ -14061,6 +14530,8 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -14095,6 +14566,8 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -14120,6 +14593,8 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Empty diff should have 0 screen rows
@@ -14370,6 +14845,8 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert_eq!(
@@ -16349,6 +16826,8 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Initial state: first hunk selected
@@ -16388,6 +16867,8 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify diff_lines contains expected line types
@@ -16434,6 +16915,8 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Initial scroll should be 0
@@ -16782,6 +17265,8 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify initial state: first line should be HunkHeader
@@ -16955,6 +17440,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll to 0
@@ -16988,6 +17475,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll to max
@@ -17026,6 +17515,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll way beyond total
@@ -17060,6 +17551,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic with 0 visible lines
@@ -17184,6 +17677,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count HunkHeaders
@@ -17233,6 +17728,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -17281,6 +17778,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set scroll to middle of first HunkHeader
@@ -17556,6 +18055,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set extreme scroll
@@ -17600,6 +18101,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic with extreme line numbers
@@ -17630,6 +18133,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set extreme scroll
@@ -17666,6 +18171,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // All operations should work on empty diff
@@ -17714,6 +18221,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify we have multiple HunkHeaders
@@ -17795,6 +18304,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify total screen rows calculation
@@ -17990,6 +18501,8 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Test scroll behavior
@@ -18094,6 +18607,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // ATTACK: Set scroll to 0
@@ -18148,6 +18663,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let visible_lines = 10;
@@ -18207,6 +18724,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the first HunkHeader
@@ -18269,6 +18788,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the first HunkHeader
@@ -18330,6 +18851,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         diff_view.scroll = 0;
@@ -18369,6 +18892,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let visible_lines = 3;
@@ -18411,6 +18936,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Set selected_line to first hunk's start so J navigates (not snaps to current header)
@@ -18462,6 +18989,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let visible_lines = 10;
@@ -18519,6 +19048,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // ATTACK: Rapidly change scroll and navigate
@@ -18573,6 +19104,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // ATTACK: Rapid PageDown/PageUp
@@ -18655,6 +19188,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify diff_lines are created
@@ -18751,6 +19286,8 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Navigate - should not panic with unicode content
@@ -18803,6 +19340,8 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Verify file_name is stored correctly
@@ -18850,6 +19389,8 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Navigate - should not hang or panic
@@ -18917,6 +19458,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Navigate through all hunks
@@ -18972,6 +19515,8 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Verify diff_lines are created
@@ -19022,6 +19567,8 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
+                false,
             );
 
             // Verify no panic occurs
@@ -19056,6 +19603,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Navigate - should not panic
@@ -19101,6 +19650,8 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Rapid scroll changes
@@ -19162,6 +19713,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -19560,6 +20113,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should have context lines
@@ -19593,6 +20148,8 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic with empty diff_lines
@@ -19669,6 +20226,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -19806,6 +20365,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the HunkHeader
@@ -19861,6 +20422,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Count HunkHeaders
@@ -19988,6 +20551,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find a context line at the start
@@ -20029,6 +20594,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Find the last context line
@@ -20196,6 +20763,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // All scroll operations should be safe
@@ -20229,6 +20798,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should have HunkHeader
@@ -20343,6 +20914,8 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let hunk_header_idx = view
@@ -20463,6 +21036,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Verify the DiffView was created successfully
@@ -20499,6 +21074,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle None gracefully
@@ -20530,6 +21107,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let view2 = DiffView::new(
@@ -20544,6 +21123,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let view3 = DiffView::new(
@@ -20558,6 +21139,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // All views should have consistent state
@@ -20589,6 +21172,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         let view2 = DiffView::new(
@@ -20603,6 +21188,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Both should handle None gracefully
@@ -20633,6 +21220,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not have cached syntax
@@ -20662,6 +21251,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(diff_view.diff_lines.is_empty());
@@ -20688,6 +21279,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle binary-like content without panic
@@ -20719,6 +21312,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle gracefully
@@ -20745,6 +21340,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Caches should not be initialized yet
@@ -20783,6 +21380,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle large documents
@@ -20812,6 +21411,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -20846,6 +21447,8 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should have 100 hunk boundaries
@@ -20897,6 +21500,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -20955,6 +21560,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Word diff cache should be empty for empty diff
@@ -20980,6 +21587,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Syntax highlight cache should be empty before initialization
@@ -21005,6 +21614,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Function context cache should be empty before initialization
@@ -21034,6 +21645,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Caches should not be initialized on creation
@@ -21059,6 +21672,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should have 2 hunk boundaries
@@ -21094,6 +21709,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -21118,6 +21735,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -21142,6 +21761,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -21170,6 +21791,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle hunks at boundaries
@@ -21197,6 +21820,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should not panic
@@ -21224,6 +21849,8 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Should handle zero-width hunks
@@ -21284,6 +21911,8 @@ mod lazy_evaluation_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -22189,6 +22818,8 @@ mod adversarial_function_context_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         )
     }
 
@@ -24636,6 +25267,8 @@ mod adversarial_whitespace_highlight_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Get the actual length of diff_lines
@@ -24803,6 +25436,8 @@ mod adversarial_whitespace_highlight_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         // Get valid bounds
@@ -25762,6 +26397,8 @@ mod diff_preview_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         view.initialize_caches(&loader, &theme);
@@ -25820,6 +26457,8 @@ mod diff_preview_tests {
             0,
             Vec::new(),
             0,
+            false,
+            false,
         );
 
         view.initialize_caches(&loader, &theme);

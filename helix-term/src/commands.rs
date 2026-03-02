@@ -3630,7 +3630,7 @@ fn git_status_picker(cx: &mut Context) {
             Span::styled(status_text, style).into()
         }),
         PickerColumn::new("path", |entry: &StatusEntry, data: &GitStatusData| {
-            git_status_path(entry, &data.cwd).into()
+            git_status_path(entry, data).into()
         }),
         PickerColumn::new("stats", |entry: &StatusEntry, _data: &GitStatusData| {
             git_status_stats(entry).into()
@@ -3639,6 +3639,15 @@ fn git_status_picker(cx: &mut Context) {
 
     // Clone cwd for the wrapper before moving into the picker
     let cwd_for_wrapper = cwd.clone();
+
+    // Collect paths of documents with unsaved changes
+    let modified_paths: HashSet<PathBuf> = cx
+        .editor
+        .documents
+        .values()
+        .filter(|doc| doc.is_modified())
+        .filter_map(|doc| doc.path().cloned())
+        .collect();
 
     let picker = Picker::new(
         columns,
@@ -3651,6 +3660,7 @@ fn git_status_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_untracked: untracked,
             style_conflict: conflict,
+            modified_paths,
         },
         |_cx, _entry: &StatusEntry, _action| {
             // The actual file opening is handled by the Enter key in GitStatusPicker
@@ -3721,6 +3731,14 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
             let untracked = editor.theme.get("diff.delta.moved");
             let conflict = editor.theme.get("diff.delta.conflict");
 
+            // Collect paths of documents with unsaved changes
+            let modified_paths: HashSet<PathBuf> = editor
+                .documents
+                .values()
+                .filter(|doc| doc.is_modified())
+                .filter_map(|doc| doc.path().cloned())
+                .collect();
+
             let columns = [
                 PickerColumn::new("status", |entry: &StatusEntry, data: &GitStatusData| {
                     let status_text = git_status_text(entry);
@@ -3728,7 +3746,7 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
                     Span::styled(status_text, style).into()
                 }),
                 PickerColumn::new("path", |entry: &StatusEntry, data: &GitStatusData| {
-                    git_status_path(entry, &data.cwd).into()
+                    git_status_path(entry, data).into()
                 }),
                 PickerColumn::new("stats", |entry: &StatusEntry, _data: &GitStatusData| {
                     git_status_stats(entry).into()
@@ -3746,6 +3764,7 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
                     style_deleted: deleted,
                     style_untracked: untracked,
                     style_conflict: conflict,
+                    modified_paths,
                 },
                 |_cx, _entry: &StatusEntry, _action| {
                     // The actual file opening is handled by the Enter key in GitStatusPicker
@@ -3951,6 +3970,24 @@ impl GitStatusPicker {
                         }
                     };
 
+                    // Check if document has unsaved changes
+                    let is_modified = doc.is_modified();
+
+                    // Check if file on disk is newer than the buffer
+                    let is_stale = if let Some(path) = doc.path() {
+                        if let Ok(metadata) = std::fs::metadata(path) {
+                            if let Ok(disk_mtime) = metadata.modified() {
+                                disk_mtime > doc.last_saved_time()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     // Create the DiffView
                     let diff_view = DiffView::new(
                         diff_base,
@@ -3964,6 +4001,8 @@ impl GitStatusPicker {
                         0, // cursor_line
                         files.clone(),
                         file_index,
+                        is_modified,
+                        is_stale,
                     );
 
                     // Pop the picker and push the diff view
@@ -4857,9 +4896,10 @@ fn goto_prev_hunk(cx: &mut Context) {
 
 fn diff_view(cx: &mut Context) {
     // Get diff data first to avoid borrow issues
-    let (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line) = {
+    let (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line, is_modified) = {
         let (view, doc) = current!(cx.editor);
         let doc_id = doc.id();
+        let is_modified = doc.is_modified();
 
         let diff_handle = match doc.diff_handle() {
             Some(handle) => handle,
@@ -4921,7 +4961,7 @@ fn diff_view(cx: &mut Context) {
         let doc_text_slice = doc.text().slice(..);
         let cursor_line = doc.selection(view.id).primary().cursor_line(doc_text_slice) as usize;
 
-        (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line)
+        (diff_base, doc_text, hunks, file_name, file_path, absolute_path, doc_id, cursor_line, is_modified)
     }; // diff is dropped here
 
     // Get the document's existing syntax to reuse for performance
@@ -4942,6 +4982,8 @@ fn diff_view(cx: &mut Context) {
         cursor_line,
         Vec::new(), // No file list for standalone diff view
         0,          // No file index
+        is_modified,
+        false,      // Not stale for standalone diff view
     );
 
     cx.push_layer(Box::new(overlaid(diff_view)));
@@ -7877,6 +7919,8 @@ pub struct GitStatusData {
     pub style_deleted: Style,
     pub style_untracked: Style,
     pub style_conflict: Style,
+    /// Paths of files that are open in the editor with unsaved changes
+    pub modified_paths: HashSet<PathBuf>,
 }
 
 /// Returns the status text ("staged" or "unstaged") for a StatusEntry
@@ -7908,14 +7952,14 @@ pub fn git_status_style(entry: &StatusEntry, data: &GitStatusData) -> Style {
 }
 
 /// Returns the display path for a StatusEntry
-pub fn git_status_path(entry: &StatusEntry, cwd: &Path) -> String {
+pub fn git_status_path(entry: &StatusEntry, data: &GitStatusData) -> String {
     let display_path = |path: &PathBuf| {
-        path.strip_prefix(cwd)
+        path.strip_prefix(&data.cwd)
             .unwrap_or(path)
             .display()
             .to_string()
     };
-    match &entry.change {
+    let path_str = match &entry.change {
         FileChange::Untracked { path } => display_path(path),
         FileChange::Modified { path } => display_path(path),
         FileChange::Conflict { path } => display_path(path),
@@ -7923,6 +7967,14 @@ pub fn git_status_path(entry: &StatusEntry, cwd: &Path) -> String {
         FileChange::Renamed { from_path, to_path } => {
             format!("{} -> {}", display_path(from_path), display_path(to_path))
         }
+    };
+    
+    // Add [modified] badge if the file has unsaved changes in the editor
+    let file_path = entry.change.path();
+    if data.modified_paths.contains(file_path) {
+        format!("{} [modified]", path_str)
+    } else {
+        path_str
     }
 }
 
@@ -7970,6 +8022,7 @@ mod git_status_tests {
             style_deleted: Style::default().fg(Color::Red),
             style_untracked: Style::default().fg(Color::Gray),
             style_conflict: Style::default().fg(Color::Magenta),
+            modified_paths: HashSet::new(),
         }
     }
 
@@ -8163,7 +8216,7 @@ mod git_status_tests {
     // =========================================================================
     #[test]
     fn test_renamed_file_shows_arrow_format() {
-        let cwd = PathBuf::from("/test/repo");
+        let data = create_test_data();
         let entry = StatusEntry {
             change: FileChange::Renamed {
                 from_path: PathBuf::from("/test/repo/old_name.rs"),
@@ -8175,13 +8228,13 @@ mod git_status_tests {
             is_binary: false,
         };
 
-        let path_display = git_status_path(&entry, &cwd);
+        let path_display = git_status_path(&entry, &data);
         assert_eq!(path_display, "old_name.rs -> new_name.rs");
     }
 
     #[test]
     fn test_renamed_file_with_different_directories() {
-        let cwd = PathBuf::from("/test/repo");
+        let data = create_test_data();
         let entry = StatusEntry {
             change: FileChange::Renamed {
                 from_path: PathBuf::from("/test/repo/src/old.rs"),
@@ -8193,7 +8246,7 @@ mod git_status_tests {
             is_binary: false,
         };
 
-        let path_display = git_status_path(&entry, &cwd);
+        let path_display = git_status_path(&entry, &data);
         assert_eq!(path_display, "src/old.rs -> lib/new.rs");
     }
 
@@ -8356,7 +8409,8 @@ mod git_status_tests {
 
     #[test]
     fn test_path_outside_cwd_shows_full_path() {
-        let cwd = PathBuf::from("/test/repo");
+        let mut data = create_test_data();
+        data.cwd = PathBuf::from("/test/repo");
         let entry = StatusEntry {
             change: FileChange::Modified { 
                 path: PathBuf::from("/other/location/file.rs") 
@@ -8367,7 +8421,7 @@ mod git_status_tests {
             is_binary: false,
         };
 
-        let path_display = git_status_path(&entry, &cwd);
+        let path_display = git_status_path(&entry, &data);
         // When path is outside cwd, it shows the full path
         assert_eq!(path_display, "/other/location/file.rs");
     }
@@ -8386,6 +8440,69 @@ mod git_status_tests {
 
         // Zero values should still show the format
         assert_eq!(git_status_stats(&entry), "+0 -0");
+    }
+
+    // =========================================================================
+    // Test: [modified] badge shows for files with unsaved changes
+    // =========================================================================
+    #[test]
+    fn test_modified_badge_shows_for_unsaved_files() {
+        let mut data = create_test_data();
+        // Add a path to modified_paths to simulate an unsaved file
+        data.modified_paths.insert(PathBuf::from("/test/repo/src/main.rs"));
+        
+        let entry = StatusEntry {
+            change: FileChange::Modified { 
+                path: PathBuf::from("/test/repo/src/main.rs") 
+            },
+            staged: false,
+            additions: Some(5),
+            deletions: Some(2),
+            is_binary: false,
+        };
+
+        let path_display = git_status_path(&entry, &data);
+        assert_eq!(path_display, "src/main.rs [modified]");
+    }
+
+    #[test]
+    fn test_no_modified_badge_for_saved_files() {
+        let data = create_test_data();
+        // modified_paths is empty, so no files have unsaved changes
+        
+        let entry = StatusEntry {
+            change: FileChange::Modified { 
+                path: PathBuf::from("/test/repo/src/main.rs") 
+            },
+            staged: false,
+            additions: Some(5),
+            deletions: Some(2),
+            is_binary: false,
+        };
+
+        let path_display = git_status_path(&entry, &data);
+        assert_eq!(path_display, "src/main.rs");
+    }
+
+    #[test]
+    fn test_modified_badge_for_renamed_files() {
+        let mut data = create_test_data();
+        // Add the destination path to modified_paths
+        data.modified_paths.insert(PathBuf::from("/test/repo/new_name.rs"));
+        
+        let entry = StatusEntry {
+            change: FileChange::Renamed {
+                from_path: PathBuf::from("/test/repo/old_name.rs"),
+                to_path: PathBuf::from("/test/repo/new_name.rs"),
+            },
+            staged: true,
+            additions: None,
+            deletions: None,
+            is_binary: false,
+        };
+
+        let path_display = git_status_path(&entry, &data);
+        assert_eq!(path_display, "old_name.rs -> new_name.rs [modified]");
     }
 
     // =========================================================================

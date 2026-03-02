@@ -1798,6 +1798,11 @@ impl Document {
         self.last_saved_revision
     }
 
+    /// Get the time of the last save operation.
+    pub fn last_saved_time(&self) -> SystemTime {
+        self.last_saved_time
+    }
+
     /// Get the current revision number
     pub fn get_current_revision(&mut self) -> usize {
         let history = self.history.take();
