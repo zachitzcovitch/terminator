@@ -2175,8 +2175,13 @@ impl DiffView {
                         // Build content spans first (without box decoration)
                         let mut content_spans = Vec::new();
 
-                        // Add file path at the beginning
-                        let file_path_str = self.file_path.to_string_lossy();
+                        // Add file path at the beginning (relative to cwd)
+                        let cwd = helix_stdx::env::current_working_dir();
+                        let file_path_str = self
+                            .file_path
+                            .strip_prefix(&cwd)
+                            .unwrap_or(&self.file_path)
+                            .to_string_lossy();
                         content_spans
                             .push(Span::styled(format!("{}:", file_path_str), border_style));
 
@@ -2185,7 +2190,7 @@ impl DiffView {
                             // Add line number (1-indexed for display)
                             let line_num_display = ctx.line_number + 1;
                             content_spans
-                                .push(Span::styled(format!("{}:", line_num_display), border_style));
+                                .push(Span::styled(format!(" {}", line_num_display), border_style));
                             content_spans.push(Span::styled(" ", border_style));
 
                             // Add the function context text with syntax highlighting
@@ -2258,7 +2263,7 @@ impl DiffView {
                         } else {
                             // No function context: show file path and line number from the hunk header
                             content_spans
-                                .push(Span::styled(format!("{}:", new_start + 1), border_style));
+                                .push(Span::styled(format!(" {}", new_start + 1), border_style));
                         }
 
                         // Calculate content width for the box
