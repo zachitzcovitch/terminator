@@ -401,11 +401,24 @@ pub fn should_pair_lines(old: &str, new: &str) -> bool {
     (common as f64 / union as f64) >= 0.4
 }
 
+/// A single line of scope context with its own highlights
+#[derive(Debug, Clone)]
+struct ContextLine {
+    /// The scope header text (e.g., "impl Drop for Thing {")
+    text: String,
+    /// Indentation level (0, 2, 4, ... spaces)
+    indent: usize,
+    /// Byte offsets relative to this line's text
+    highlights: Vec<(usize, usize, Style)>,
+}
+
 /// Function context information for hunk headers (delta-style)
 #[derive(Debug, Clone)]
 struct FunctionContext {
     /// The function/class/method signature text (truncated, may include "..." suffix)
     text: String,
+    /// Multi-line scope context (populated for nested scopes)
+    lines: Vec<ContextLine>,
     /// The 0-indexed line number where the function starts
     line_number: usize,
     /// The byte length of the original text before truncation (excluding "...")
@@ -432,6 +445,7 @@ fn is_function_like(node: &Node) -> bool {
         | "macro_definition"   // for macro_rules! foo {}
         | "const_item"         // for const fn foo() or const X: i32
         | "static_item"        // for static CONTEXT: ...
+        | "closure_expression" // for |x| { ... }
         // Python
         | "function_definition"
         | "class_definition"
@@ -457,8 +471,8 @@ fn is_function_like(node: &Node) -> bool {
 }
 
 /// Get function/scope context for a line (like delta's hunk header context)
-/// Returns the first line of the containing function/class/method, truncated to ~50 chars
-/// Also returns the line number where the function starts for syntax highlighting
+/// Returns nested scope context: `outer_scope { middle_scope { innermost`
+/// Also returns the line number where the innermost scope starts for syntax highlighting
 ///
 /// Performance: Uses O(log n) tree navigation via descendant_for_byte_range
 /// instead of O(n) query iteration.
@@ -466,7 +480,8 @@ fn get_function_context(
     line: usize,                  // 0-indexed line number
     slice: helix_core::RopeSlice, // document text
     syntax: Option<&Syntax>,
-    _loader: &Loader, // Keep for API compatibility, no longer used
+    loader: &Loader,                   // Used for creating Syntax for synthetic text
+    theme: Option<&helix_view::Theme>, // Optional theme for syntax highlighting
 ) -> Option<FunctionContext> {
     let syntax = syntax?;
     let tree = syntax.tree();
@@ -484,59 +499,350 @@ fn get_function_context(
     // Find deepest node at position - O(log n) tree navigation
     let node = root.descendant_for_byte_range(byte_u32, byte_u32)?;
 
-    // Walk up the tree to find enclosing function-like node
-    // This is O(depth) where depth is typically small (< 20)
+    // Walk up the tree collecting interesting scopes
+    // We only need at most 3: outermost, innermost, and optionally middle ones
+    // For 4+ scopes, we only need outermost and innermost
+    const MAX_SCOPES: usize = 3;
+    let mut innermost_scope: Option<Node> = None;
+    let mut outermost_scope: Option<Node> = None;
+    // Only track middle scopes if we have 3 or fewer total scopes
+    let mut middle_scope: Option<Node> = None;
+    let mut scope_count = 0usize;
     let mut current = node;
-    let func_node = loop {
+
+    loop {
         if is_function_like(&current) {
-            break current;
+            scope_count += 1;
+            if innermost_scope.is_none() {
+                // First scope we find is the innermost
+                innermost_scope = Some(current.clone());
+            }
+            // Track middle scope (for the case of exactly 3 scopes)
+            // and outermost scope
+            middle_scope = outermost_scope.take();
+            outermost_scope = Some(current.clone());
         }
-        current = current.parent()?;
+        current = match current.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
+
+    // If no interesting scopes found, return None
+    let innermost_node = innermost_scope?;
+    let outermost_node = outermost_scope?;
+
+    // Get the starting line number (0-indexed) of the innermost scope
+    let innermost_start_byte = innermost_node.start_byte() as usize;
+    let innermost_start_line = slice.byte_to_line(innermost_start_byte);
+
+    // Build the list of scopes to process (at most 3)
+    let limited_scopes: Vec<Node> = if scope_count == 1 {
+        vec![outermost_node]
+    } else if scope_count == 2 {
+        vec![outermost_node, innermost_node]
+    } else if scope_count == MAX_SCOPES {
+        // For exactly 3 scopes, show all (outermost, middle, innermost)
+        let mut result = vec![outermost_node];
+        if let Some(mid) = middle_scope {
+            result.push(mid);
+        }
+        result.push(innermost_node);
+        result
+    } else {
+        // For 4+ scopes, show outermost, "...", innermost
+        vec![outermost_node, innermost_node]
+    };
+    let has_ellipsis = scope_count > MAX_SCOPES;
+
+    // For each scope, extract the header portion (text before `{` or `:` for Python)
+    let scope_headers: Vec<String> = limited_scopes
+        .iter()
+        .filter_map(|scope_node| {
+            let start_byte = scope_node.start_byte() as usize;
+            let end_byte = scope_node.end_byte() as usize;
+
+            // Get the full text of this node
+            if end_byte > slice.len_bytes() || start_byte >= end_byte {
+                return None;
+            }
+            let node_text = slice.byte_slice(start_byte..end_byte);
+            let node_str: String = node_text.into();
+
+            // Python uses `:` for function/class definitions, not `{`
+            // Other languages use `{`
+            let is_python = matches!(
+                scope_node.kind(),
+                "function_definition" | "class_definition"
+            );
+
+            // Extract header: text before `{` (or `:` for Python)
+            // split().next() always returns Some (at least empty string)
+            let header = if is_python {
+                node_str.split(':').next().unwrap_or_default()
+            } else {
+                node_str.split('{').next().unwrap_or_default()
+            }
+            .trim()
+            .to_string();
+
+            // Skip empty headers
+            if header.is_empty() {
+                None
+            } else {
+                Some(header)
+            }
+        })
+        .collect();
+
+    // If all headers were empty, return None
+    if scope_headers.is_empty() {
+        return None;
+    }
+
+    // Build multi-line scope context with syntax highlighting
+    // Call build_context_lines BEFORE inserting "..." to avoid breaking syntax highlighting
+    let mut context_lines = build_context_lines(&scope_headers, syntax, loader, theme);
+
+    // Insert "..." line if we have 4+ scopes (2 headers in scope_headers)
+    if has_ellipsis && context_lines.len() == 2 {
+        context_lines.insert(
+            1,
+            ContextLine {
+                text: "...".to_string(),
+                indent: 2,              // Middle indentation level
+                highlights: Vec::new(), // No syntax highlights for ellipsis
+            },
+        );
+    }
+
+    // Build nested brace format for the single-line text display
+    // For 4+ scopes, show: "outer { ... { innermost"
+    let nested_text = if has_ellipsis && scope_headers.len() == 2 {
+        format!("{} {{ ... {{ {}", scope_headers[0], scope_headers[1])
+    } else if scope_headers.len() == 1 {
+        scope_headers[0].clone()
+    } else {
+        // Join with " { " for nested scopes
+        scope_headers.join(" { ")
     };
 
-    // Get the starting line number (0-indexed) of the function
-    let func_start_byte = func_node.start_byte() as usize;
-    let func_start_line = slice.byte_to_line(func_start_byte);
+    // Truncate to ~80 chars, adding "…" if truncated
+    const MAX_LEN: usize = 80;
+    let (truncated, truncated_len) = if nested_text.len() > MAX_LEN {
+        // Find a good truncation point at word boundary
+        let max_content = MAX_LEN - "…".len(); // Reserve space for "…" (3 bytes in UTF-8)
+        let truncate_at = nested_text
+            .char_indices()
+            .take_while(|(i, _)| *i < max_content)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(max_content);
 
-    // Extract the full LINE where the function starts (includes modifiers like pub, async, export)
-    // This is important because tree-sitter nodes start after modifiers, but we want to show them
-    let line_start_char = slice.line_to_char(func_start_line);
-    let line_end_char = slice.line_to_char(func_start_line + 1);
+        // Try to find last space before truncate point for word boundary
+        let word_boundary = nested_text[..truncate_at]
+            .rfind(' ')
+            .map(|space_pos| space_pos)
+            .unwrap_or(truncate_at);
 
+        // Use word boundary if it's not too short (at least 60% of max)
+        let final_truncate = if word_boundary > max_content * 6 / 10 {
+            word_boundary
+        } else {
+            truncate_at
+        };
+
+        (
+            format!("{}…", &nested_text[..final_truncate]),
+            final_truncate,
+        )
+    } else {
+        let len = nested_text.len();
+        (nested_text, len)
+    };
+
+    // Calculate byte offset in the innermost scope's line
+    // We need to get the full line where the innermost scope starts
+    let line_start_char = slice.line_to_char(innermost_start_line);
+    let line_end_char = slice.line_to_char(innermost_start_line + 1);
     let line_text = slice.slice(line_start_char..line_end_char);
     let first_line = line_text.lines().next()?;
     let first_line_str: String = first_line.into();
-
-    // Calculate byte offset as the number of bytes of leading whitespace
     let byte_offset_in_line = first_line_str.len() - first_line_str.trim_start().len();
-    // Trim leading whitespace for display
-    let first_line_str = first_line_str.trim_start().to_string();
-
-    // Truncate to ~50 chars, adding "..." if truncated
-    const MAX_LEN: usize = 50;
-    let (truncated, truncated_len) = if first_line_str.len() > MAX_LEN {
-        // Find a good truncation point (avoid cutting in middle of word if possible)
-        let truncate_at = first_line_str
-            .char_indices()
-            .take_while(|(i, _)| *i < MAX_LEN - 3)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(MAX_LEN - 3);
-        (
-            format!("{}...", &first_line_str[..truncate_at]),
-            truncate_at,
-        )
-    } else {
-        let len = first_line_str.len();
-        (first_line_str, len)
-    };
 
     Some(FunctionContext {
         text: truncated,
-        line_number: func_start_line,
+        lines: context_lines,
+        line_number: innermost_start_line,
         truncated_len,
         byte_offset_in_line,
     })
+}
+
+/// Build multi-line context lines with syntax highlighting
+/// Creates synthetic text from scope headers, highlights it, and splits into lines
+fn build_context_lines(
+    scope_headers: &[String],
+    original_syntax: &Syntax,
+    loader: &Loader,
+    theme: Option<&helix_view::Theme>,
+) -> Vec<ContextLine> {
+    use helix_view::graphics::Style as ViewStyle;
+
+    const MAX_LINE_LEN: usize = 60;
+
+    // Helper to truncate lines in place
+    fn truncate_lines(lines: &mut [ContextLine]) {
+        for line in lines {
+            if line.text.len() > MAX_LINE_LEN {
+                // Find word boundary for cleaner truncation
+                let truncate_at = line
+                    .text
+                    .char_indices()
+                    .take_while(|(i, _)| *i < MAX_LINE_LEN - 1) // -1 for ellipsis
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(MAX_LINE_LEN - 1);
+
+                line.text.truncate(truncate_at);
+                line.text.push('…');
+
+                // Clamp highlights to truncated length
+                line.highlights.retain(|(start, _, _)| *start < truncate_at);
+                for (_start, end, _) in &mut line.highlights {
+                    *end = (*end).min(truncate_at);
+                }
+            }
+        }
+    }
+
+    // If no theme provided, return unhighlighted lines early (avoid creating Syntax)
+    let Some(theme) = theme else {
+        let mut lines: Vec<ContextLine> = scope_headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| ContextLine {
+                text: header.clone(),
+                indent: i * 2,
+                highlights: Vec::new(),
+            })
+            .collect();
+        truncate_lines(&mut lines);
+        return lines;
+    };
+
+    // Build synthetic text with newlines: "impl Drop for Thing {\nfn drop(&mut self)"
+    let synthetic_text = scope_headers.join(" {\n");
+
+    // Create a Rope from synthetic text
+    let synthetic_rope = Rope::from(synthetic_text.as_str());
+    let synthetic_slice = synthetic_rope.slice(..);
+
+    // Get the language from the original syntax
+    let language = original_syntax.root_language();
+
+    // Create a new Syntax for the synthetic text
+    let Ok(synthetic_syntax) = Syntax::new(synthetic_slice, language, loader) else {
+        // Fall back to unhighlighted lines if syntax creation fails
+        let mut lines: Vec<ContextLine> = scope_headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| ContextLine {
+                text: header.clone(),
+                indent: i * 2,
+                highlights: Vec::new(),
+            })
+            .collect();
+        truncate_lines(&mut lines);
+        return lines;
+    };
+
+    // Get highlights for the entire synthetic text
+    let total_bytes = synthetic_rope.len_bytes() as u32;
+    let mut highlighter = synthetic_syntax.highlighter(synthetic_slice, loader, 0..total_bytes);
+
+    // Collect all highlight events and build highlight segments
+    let mut all_highlights: Vec<(usize, usize, ViewStyle)> = Vec::new();
+    let mut pos: u32 = 0;
+    let mut highlight_stack: Vec<helix_core::syntax::Highlight> = Vec::new();
+
+    // Use default style as base
+    let base_style = ViewStyle::default();
+
+    while pos < total_bytes {
+        let next_event_pos = highlighter.next_event_offset();
+
+        if pos == next_event_pos {
+            let (event, new_highlights) = highlighter.advance();
+            if event == HighlightEvent::Refresh {
+                highlight_stack.clear();
+            }
+            highlight_stack.extend(new_highlights);
+            continue;
+        }
+
+        let end = if next_event_pos == u32::MAX {
+            total_bytes
+        } else {
+            next_event_pos
+        };
+
+        if end > pos {
+            // Compute the style for this segment from the highlight stack using the theme
+            let style = highlight_stack
+                .iter()
+                .fold(base_style, |acc, &h| acc.patch(theme.highlight(h)));
+
+            all_highlights.push((pos as usize, end as usize, style));
+        }
+
+        pos = end;
+    }
+
+    // Split by line and create ContextLine for each
+    let mut lines: Vec<ContextLine> = Vec::new();
+    let mut byte_offset = 0usize;
+
+    for (scope_idx, header_text) in scope_headers.iter().enumerate() {
+        let line_len = header_text.len();
+        let line_end = byte_offset + line_len;
+
+        // Extract highlights for this line's byte range
+        let line_highlights: Vec<(usize, usize, Style)> = all_highlights
+            .iter()
+            .filter_map(|(start, end, style)| {
+                // Find overlap with this line
+                let overlap_start = (*start).max(byte_offset);
+                let overlap_end = (*end).min(line_end);
+
+                if overlap_start < overlap_end {
+                    // Convert to line-relative offsets
+                    Some((
+                        overlap_start - byte_offset,
+                        overlap_end - byte_offset,
+                        *style,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        lines.push(ContextLine {
+            text: header_text.clone(),
+            indent: scope_idx * 2,
+            highlights: line_highlights,
+        });
+
+        // Move past this line and the " {\n" separator (if not the last line)
+        byte_offset = line_end;
+        if scope_idx < scope_headers.len() - 1 {
+            byte_offset += " {\n".len(); // 3 bytes for separator
+        }
+    }
+
+    truncate_lines(&mut lines);
+    lines
 }
 
 /// Specifies the source of context lines in a hunk patch
@@ -1320,6 +1626,7 @@ impl DiffView {
                             self.doc.slice(..),
                             doc_syntax,
                             loader,
+                            Some(theme),
                         );
 
                         // If we have function context, also compute its syntax highlights
@@ -1664,115 +1971,16 @@ impl DiffView {
                         border_style
                     };
 
-                    // Build content spans first (without box decoration)
-                    let mut content_spans = Vec::new();
-
-                    // Add file path at the beginning
-                    let file_path_str = self.file_path.to_string_lossy();
-                    content_spans.push(Span::styled(format!("{}:", file_path_str), border_style));
-
-                    // If we have function context, show "line: function_context"
-                    if let Some(ctx) = context {
-                        // Add line number (1-indexed for display)
-                        let line_num_display = ctx.line_number + 1;
-                        content_spans
-                            .push(Span::styled(format!("{}:", line_num_display), border_style));
-                        content_spans.push(Span::styled(" ", border_style));
-
-                        // Add the function context text with syntax highlighting
-                        // Clone the text to avoid lifetime issues
-                        let ctx_text = ctx.text.clone();
-                        // Get the truncation length (length of original text before "..." suffix)
-                        let truncated_len = ctx.truncated_len;
-
-                        if context_highlights.is_empty() {
-                            // No syntax highlights, just use the border style for cohesive appearance
-                            content_spans.push(Span::styled(ctx_text, border_style));
-                        } else {
-                            // Create multiple spans based on the highlight ranges
-                            // The highlights are in terms of byte offsets relative to the original line start
-                            // We need to filter and adjust them for the truncated text:
-                            // 1. Only include highlights that start before truncated_len
-                            // 2. Clamp end offsets to truncated_len
-                            // 3. The "..." suffix (if present) is rendered with base style
-                            let ctx_str = ctx_text.as_str();
-                            let mut last_end = 0;
-
-                            for (byte_start, byte_end, segment_style) in &context_highlights {
-                                // Skip highlights that start after the truncated portion
-                                if *byte_start >= truncated_len {
-                                    continue;
-                                }
-
-                                // Clamp offsets to the truncated portion (not the full ctx_str which includes "...")
-                                let start = (*byte_start).min(truncated_len);
-                                let end = (*byte_end).min(truncated_len);
-
-                                // Add any gap before this segment with border style
-                                if start > last_end {
-                                    let gap = &ctx_str[last_end..start];
-                                    if !gap.is_empty() {
-                                        content_spans
-                                            .push(Span::styled(gap.to_string(), border_style));
-                                    }
-                                }
-
-                                // Add the highlighted segment (patch with border style)
-                                if end > start {
-                                    let segment = &ctx_str[start..end];
-                                    if !segment.is_empty() {
-                                        let mut patched_style = border_style.patch(*segment_style);
-                                        if border_style.bg.is_some() {
-                                            patched_style.bg = border_style.bg;
-                                        }
-                                        content_spans
-                                            .push(Span::styled(segment.to_string(), patched_style));
-                                    }
-                                }
-
-                                last_end = end;
-                            }
-
-                            // Add any trailing content with border style
-                            // This includes both unhighlighted portion of truncated text and the "..." suffix
-                            if last_end < ctx_str.len() {
-                                let trailing = &ctx_str[last_end..];
-                                if !trailing.is_empty() {
-                                    content_spans
-                                        .push(Span::styled(trailing.to_string(), border_style));
-                                }
-                            }
-                        }
-                    } else {
-                        // No function context: show file path and line number from the hunk header
-                        content_spans
-                            .push(Span::styled(format!("{}:", new_start + 1), border_style));
-                    }
-
-                    // Calculate content width for the box
-                    // Content width = total width - 4 (for "│ " prefix and " │" suffix)
-                    let content_width = content_area.width.saturating_sub(4) as usize;
-
-                    // Calculate the actual content width from spans
-                    let actual_content_width: usize =
-                        content_spans.iter().map(|s| s.content.width()).sum();
-
-                    // Pad content to fill the box width
-                    let padding_needed = content_width.saturating_sub(actual_content_width);
-                    if padding_needed > 0 {
-                        content_spans.push(Span::styled(" ".repeat(padding_needed), border_style));
-                    }
-
-                    // Render 3-line delta-style box
-                    // Row 1: ┌──────┐ (top border)
-                    // Row 2: │ content │ (content line)
-                    // Row 3: └──────┘ (bottom border)
-                    // Issue 2: Handle row_offset for scroll behavior at top of diff
-                    // When scroll is mid-HunkHeader, skip the appropriate rows
-
-                    // Calculate box width (content + 4 for borders and spaces)
+                    // Calculate box dimensions
                     let box_width = content_area.width as usize;
                     let inner_width = box_width.saturating_sub(2); // -2 for left and right border chars
+
+                    // Determine header height based on whether we have multi-line context
+                    let has_multi_line = context
+                        .as_ref()
+                        .map(|ctx| !ctx.lines.is_empty())
+                        .unwrap_or(false);
+                    let header_height = self.get_hunk_header_height(current_line_index);
 
                     // row_offset only applies to the first rendered line
                     let effective_row_offset = if is_first_rendered_line {
@@ -1785,48 +1993,22 @@ impl DiffView {
                     // Track how many rows we actually render for this HunkHeader
                     let mut rows_rendered = 0usize;
 
-                    // When selected, fill the entire background of all 3 rows with selection color
-                    // This makes the HunkHeader look more selected (full row background, not just characters)
-                    if is_selected_line {
-                        // Fill background for each row that will be rendered
-                        // Row 1: Top border (skip if effective_row_offset >= 1)
-                        if effective_row_offset < 1 {
-                            let row_rect = Rect::new(content_area.x, y, content_area.width, 1);
-                            surface.set_style(row_rect, border_style);
-                        }
-                        // Row 2: Content line (skip if effective_row_offset >= 2)
-                        if effective_row_offset < 2 {
-                            let y2 = y + (1 - effective_row_offset.min(1)) as u16;
-                            if y2 < content_area.y + content_area.height {
-                                let row_rect = Rect::new(content_area.x, y2, content_area.width, 1);
-                                surface.set_style(row_rect, border_style);
+                    // Helper to render a content row with spans
+                    let render_content_row =
+                        |surface: &mut Surface,
+                         y_pos: u16,
+                         content_spans: &[Span],
+                         border_style: helix_view::graphics::Style,
+                         content_area: Rect| {
+                            if y_pos >= content_area.y + content_area.height {
+                                return;
                             }
-                        }
-                        // Row 3: Bottom border (always render if we have space)
-                        let y3 = y + (2 - effective_row_offset.min(2)) as u16;
-                        if y3 < content_area.y + content_area.height {
-                            let row_rect = Rect::new(content_area.x, y3, content_area.width, 1);
-                            surface.set_style(row_rect, border_style);
-                        }
-                    }
-
-                    // Row 1: Top border (skip if effective_row_offset >= 1)
-                    if effective_row_offset < 1 {
-                        let top_border = format!("┌{}┐", "─".repeat(inner_width));
-                        surface.set_string(content_area.x, y, top_border, border_style);
-                        rows_rendered += 1;
-                    }
-
-                    // Row 2: Content line (skip if effective_row_offset >= 2)
-                    if effective_row_offset < 2 {
-                        let y2 = y + (1 - effective_row_offset.min(1)) as u16;
-                        if y2 < content_area.y + content_area.height {
                             // Left border
-                            surface.set_string(content_area.x, y2, "│ ", border_style);
+                            surface.set_string(content_area.x, y_pos, "│ ", border_style);
 
                             // Content spans
                             let mut x_pos = content_area.x + 2;
-                            for span in &content_spans {
+                            for span in content_spans {
                                 if x_pos >= content_area.x + content_area.width - 2 {
                                     break;
                                 }
@@ -1836,7 +2018,7 @@ impl DiffView {
                                 if content_len > 0 {
                                     surface.set_stringn(
                                         x_pos,
-                                        y2,
+                                        y_pos,
                                         &span.content,
                                         content_len,
                                         span.style,
@@ -1847,21 +2029,289 @@ impl DiffView {
 
                             // Right border with space padding
                             let right_border_x = content_area.x + content_area.width - 1;
-                            surface.set_string(right_border_x - 1, y2, " │", border_style);
+                            surface.set_string(right_border_x - 1, y_pos, " │", border_style);
+                        };
+
+                    // When selected, fill the entire background with selection color
+                    if is_selected_line {
+                        for row in 0..header_height {
+                            let row_y = y + row as u16;
+                            if row_y < content_area.y + content_area.height {
+                                let row_rect =
+                                    Rect::new(content_area.x, row_y, content_area.width, 1);
+                                surface.set_style(row_rect, border_style);
+                            }
                         }
-                        rows_rendered += 1;
                     }
 
-                    // Row 3: Bottom border (always render if we have space)
-                    let y3 = y + (2 - effective_row_offset.min(2)) as u16;
-                    if y3 < content_area.y + content_area.height {
-                        let bottom_border = format!("└{}┘", "─".repeat(inner_width));
-                        surface.set_string(content_area.x, y3, bottom_border, border_style);
-                        rows_rendered += 1;
+                    // Render multi-line or single-line HunkHeader
+                    if has_multi_line {
+                        // Multi-line rendering: top border + N context lines + bottom border
+                        let ctx = context.as_ref().unwrap();
+                        let context_lines = &ctx.lines;
+
+                        // Row 1: Top border (skip if effective_row_offset >= 1)
+                        if effective_row_offset < 1 {
+                            let top_border = format!("┌{}┐", "─".repeat(inner_width));
+                            surface.set_string(content_area.x, y, top_border, border_style);
+                            rows_rendered += 1;
+                        }
+
+                        // Rows 2 to N+1: Context lines (each line with indentation)
+                        for (line_idx, ctx_line) in context_lines.iter().enumerate() {
+                            let content_row_idx = 1 + line_idx; // 0-indexed within content rows
+                            let absolute_row_idx = content_row_idx;
+
+                            // Skip if this row is before the scroll offset
+                            if effective_row_offset > absolute_row_idx {
+                                continue;
+                            }
+
+                            let y_line = y
+                                + (absolute_row_idx - effective_row_offset.min(absolute_row_idx))
+                                    as u16;
+                            if y_line >= content_area.y + content_area.height {
+                                break;
+                            }
+
+                            // Build content spans for this line: indentation + text with highlights
+                            let mut line_spans = Vec::new();
+
+                            // Add indentation (spaces before text)
+                            if ctx_line.indent > 0 {
+                                line_spans
+                                    .push(Span::styled(" ".repeat(ctx_line.indent), border_style));
+                            }
+
+                            // Add the text with syntax highlighting
+                            let text_str = ctx_line.text.as_str();
+                            if ctx_line.highlights.is_empty() {
+                                // No highlights, use border style
+                                line_spans.push(Span::styled(text_str.to_string(), border_style));
+                            } else {
+                                // Apply syntax highlights
+                                let mut last_end = 0;
+                                for (byte_start, byte_end, segment_style) in &ctx_line.highlights {
+                                    let start = (*byte_start).min(text_str.len());
+                                    let end = (*byte_end).min(text_str.len());
+
+                                    // Add gap before this segment
+                                    if start > last_end {
+                                        let gap = &text_str[last_end..start];
+                                        if !gap.is_empty() {
+                                            line_spans
+                                                .push(Span::styled(gap.to_string(), border_style));
+                                        }
+                                    }
+
+                                    // Add highlighted segment
+                                    if end > start {
+                                        let segment = &text_str[start..end];
+                                        if !segment.is_empty() {
+                                            let mut patched_style =
+                                                border_style.patch(*segment_style);
+                                            if border_style.bg.is_some() {
+                                                patched_style.bg = border_style.bg;
+                                            }
+                                            line_spans.push(Span::styled(
+                                                segment.to_string(),
+                                                patched_style,
+                                            ));
+                                        }
+                                    }
+
+                                    last_end = end;
+                                }
+
+                                // Add trailing content
+                                if last_end < text_str.len() {
+                                    let trailing = &text_str[last_end..];
+                                    if !trailing.is_empty() {
+                                        line_spans
+                                            .push(Span::styled(trailing.to_string(), border_style));
+                                    }
+                                }
+                            }
+
+                            // Pad to fill width
+                            let content_width = content_area.width.saturating_sub(4) as usize;
+                            let actual_width: usize =
+                                line_spans.iter().map(|s| s.content.width()).sum();
+                            let padding_needed = content_width.saturating_sub(actual_width);
+                            if padding_needed > 0 {
+                                line_spans
+                                    .push(Span::styled(" ".repeat(padding_needed), border_style));
+                            }
+
+                            render_content_row(
+                                surface,
+                                y_line,
+                                &line_spans,
+                                border_style,
+                                content_area,
+                            );
+                            rows_rendered += 1;
+                        }
+
+                        // Last row: Bottom border
+                        let bottom_row_idx = header_height - 1;
+                        if effective_row_offset < bottom_row_idx {
+                            let y_bottom = y
+                                + (bottom_row_idx - effective_row_offset.min(bottom_row_idx))
+                                    as u16;
+                            if y_bottom < content_area.y + content_area.height {
+                                let bottom_border = format!("└{}┘", "─".repeat(inner_width));
+                                surface.set_string(
+                                    content_area.x,
+                                    y_bottom,
+                                    bottom_border,
+                                    border_style,
+                                );
+                                rows_rendered += 1;
+                            }
+                        }
+                    } else {
+                        // Single-line rendering (backward compat)
+                        // Build content spans first (without box decoration)
+                        let mut content_spans = Vec::new();
+
+                        // Add file path at the beginning
+                        let file_path_str = self.file_path.to_string_lossy();
+                        content_spans
+                            .push(Span::styled(format!("{}:", file_path_str), border_style));
+
+                        // If we have function context, show "line: function_context"
+                        if let Some(ctx) = context {
+                            // Add line number (1-indexed for display)
+                            let line_num_display = ctx.line_number + 1;
+                            content_spans
+                                .push(Span::styled(format!("{}:", line_num_display), border_style));
+                            content_spans.push(Span::styled(" ", border_style));
+
+                            // Add the function context text with syntax highlighting
+                            // Clone the text to avoid lifetime issues
+                            let ctx_text = ctx.text.clone();
+                            // Get the truncation length (length of original text before "..." suffix)
+                            let truncated_len = ctx.truncated_len;
+
+                            if context_highlights.is_empty() {
+                                // No syntax highlights, just use the border style for cohesive appearance
+                                content_spans.push(Span::styled(ctx_text, border_style));
+                            } else {
+                                // Create multiple spans based on the highlight ranges
+                                // The highlights are in terms of byte offsets relative to the original line start
+                                // We need to filter and adjust them for the truncated text:
+                                // 1. Only include highlights that start before truncated_len
+                                // 2. Clamp end offsets to truncated_len
+                                // 3. The "..." suffix (if present) is rendered with base style
+                                let ctx_str = ctx_text.as_str();
+                                let mut last_end = 0;
+
+                                for (byte_start, byte_end, segment_style) in &context_highlights {
+                                    // Skip highlights that start after the truncated portion
+                                    if *byte_start >= truncated_len {
+                                        continue;
+                                    }
+
+                                    // Clamp offsets to the truncated portion (not the full ctx_str which includes "...")
+                                    let start = (*byte_start).min(truncated_len);
+                                    let end = (*byte_end).min(truncated_len);
+
+                                    // Add any gap before this segment with border style
+                                    if start > last_end {
+                                        let gap = &ctx_str[last_end..start];
+                                        if !gap.is_empty() {
+                                            content_spans
+                                                .push(Span::styled(gap.to_string(), border_style));
+                                        }
+                                    }
+
+                                    // Add the highlighted segment (patch with border style)
+                                    if end > start {
+                                        let segment = &ctx_str[start..end];
+                                        if !segment.is_empty() {
+                                            let mut patched_style =
+                                                border_style.patch(*segment_style);
+                                            if border_style.bg.is_some() {
+                                                patched_style.bg = border_style.bg;
+                                            }
+                                            content_spans.push(Span::styled(
+                                                segment.to_string(),
+                                                patched_style,
+                                            ));
+                                        }
+                                    }
+
+                                    last_end = end;
+                                }
+
+                                // Add any trailing content with border style
+                                // This includes both unhighlighted portion of truncated text and the "..." suffix
+                                if last_end < ctx_str.len() {
+                                    let trailing = &ctx_str[last_end..];
+                                    if !trailing.is_empty() {
+                                        content_spans
+                                            .push(Span::styled(trailing.to_string(), border_style));
+                                    }
+                                }
+                            }
+                        } else {
+                            // No function context: show file path and line number from the hunk header
+                            content_spans
+                                .push(Span::styled(format!("{}:", new_start + 1), border_style));
+                        }
+
+                        // Calculate content width for the box
+                        // Content width = total width - 4 (for "│ " prefix and " │" suffix)
+                        let content_width = content_area.width.saturating_sub(4) as usize;
+
+                        // Calculate the actual content width from spans
+                        let actual_content_width: usize =
+                            content_spans.iter().map(|s| s.content.width()).sum();
+
+                        // Pad content to fill the box width
+                        let padding_needed = content_width.saturating_sub(actual_content_width);
+                        if padding_needed > 0 {
+                            content_spans
+                                .push(Span::styled(" ".repeat(padding_needed), border_style));
+                        }
+
+                        // Render 3-line delta-style box
+                        // Row 1: ┌──────┐ (top border)
+                        // Row 2: │ content │ (content line)
+                        // Row 3: └──────┘ (bottom border)
+
+                        // Row 1: Top border (skip if effective_row_offset >= 1)
+                        if effective_row_offset < 1 {
+                            let top_border = format!("┌{}┐", "─".repeat(inner_width));
+                            surface.set_string(content_area.x, y, top_border, border_style);
+                            rows_rendered += 1;
+                        }
+
+                        // Row 2: Content line (skip if effective_row_offset >= 2)
+                        if effective_row_offset < 2 {
+                            let y2 = y + (1 - effective_row_offset.min(1)) as u16;
+                            render_content_row(
+                                surface,
+                                y2,
+                                &content_spans,
+                                border_style,
+                                content_area,
+                            );
+                            rows_rendered += 1;
+                        }
+
+                        // Row 3: Bottom border (always render if we have space)
+                        let y3 = y + (2 - effective_row_offset.min(2)) as u16;
+                        if y3 < content_area.y + content_area.height {
+                            let bottom_border = format!("└{}┘", "─".repeat(inner_width));
+                            surface.set_string(content_area.x, y3, bottom_border, border_style);
+                            rows_rendered += 1;
+                        }
                     }
 
-                    // Increment rendered_rows by actual rows rendered (3 - effective_row_offset, but at least 1)
-                    rendered_rows += (3 - effective_row_offset).max(1);
+                    // Increment rendered_rows by actual rows rendered
+                    rendered_rows += (header_height - effective_row_offset).max(1);
                     line_index += 1;
                     continue; // Skip the normal rendering at the end of the loop
                 }
@@ -2259,8 +2709,22 @@ impl DiffView {
         }
     }
 
+    /// Get the height (in screen rows) for a HunkHeader line
+    /// Returns 2 + lines.len() if multi-line context is available, otherwise 3 (backward compat)
+    fn get_hunk_header_height(&self, line_index: usize) -> usize {
+        // Check if we have multi-line context in the cache
+        if let Some(Some(ctx)) = self.function_context_cache.borrow().get(&line_index) {
+            if !ctx.lines.is_empty() {
+                // Multi-line: top border + N content lines + bottom border
+                return 2 + ctx.lines.len();
+            }
+        }
+        // Default: 3 rows (top border + single content line + bottom border)
+        3
+    }
+
     /// Convert a diff_lines index to a screen row position
-    /// HunkHeaders take 3 rows, all other lines take 1 row
+    /// HunkHeaders take variable rows (2 + lines.len() or 3), all other lines take 1 row
     fn diff_line_to_screen_row(&self, line_index: usize) -> usize {
         let mut screen_row = 0;
         for (i, line) in self.diff_lines.iter().enumerate() {
@@ -2268,7 +2732,7 @@ impl DiffView {
                 return screen_row;
             }
             screen_row += if matches!(line, DiffLine::HunkHeader { .. }) {
-                3
+                self.get_hunk_header_height(i)
             } else {
                 1
             };
@@ -2281,7 +2745,7 @@ impl DiffView {
         let mut current_row = 0;
         for (i, line) in self.diff_lines.iter().enumerate() {
             let rows = if matches!(line, DiffLine::HunkHeader { .. }) {
-                3
+                self.get_hunk_header_height(i)
             } else {
                 1
             };
@@ -2297,9 +2761,10 @@ impl DiffView {
     fn total_screen_rows(&self) -> usize {
         self.diff_lines
             .iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(i, line)| {
                 if matches!(line, DiffLine::HunkHeader { .. }) {
-                    3
+                    self.get_hunk_header_height(i)
                 } else {
                     1
                 }
@@ -2344,12 +2809,12 @@ impl DiffView {
         let scroll = self.scroll as usize;
         let line_row = self.diff_line_to_screen_row(self.selected_line);
 
-        // Check if selected line is a HunkHeader (takes 3 rows)
+        // Check if selected line is a HunkHeader (takes variable rows)
         let line_height = if matches!(
             self.diff_lines.get(self.selected_line),
             Some(DiffLine::HunkHeader { .. })
         ) {
-            3
+            self.get_hunk_header_height(self.selected_line)
         } else {
             1
         };
@@ -11949,7 +12414,7 @@ mod syntax_highlighting_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 1 (0-indexed) is inside the function body
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return the function signature
         assert!(
@@ -11976,7 +12441,7 @@ mod syntax_highlighting_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 1 (0-indexed) is inside the struct body
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return the struct signature (note: Rust structs may not have "class.around" capture)
         // The result depends on whether the language has class.around capture
@@ -12001,7 +12466,7 @@ mod syntax_highlighting_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 2 (0-indexed) is inside the inner closure
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return some function context (either outer or inner depending on tree-sitter)
         if let Some(ctx) = &result {
@@ -12027,7 +12492,7 @@ mod syntax_highlighting_tests {
         let rope = Rope::from(content);
 
         // Pass None for syntax
-        let result = get_function_context(1, rope.slice(..), None, &loader);
+        let result = get_function_context(1, rope.slice(..), None, &loader, None);
 
         assert!(
             result.is_none(),
@@ -12047,7 +12512,7 @@ mod syntax_highlighting_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 0 (0-indexed) is a comment, not inside any function
-        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return None since there's no containing function
         // (or might return something if tree-sitter captures comments differently)
@@ -12071,20 +12536,20 @@ mod syntax_highlighting_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 1 (0-indexed) is inside the function body
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = &result {
-            // Should be truncated to ~50 chars with "..."
+            // Should be truncated to ~80 chars with "…"
             assert!(
-                ctx.text.len() <= 53, // 50 chars + "..." = 53 max
-                "Context should be truncated to ~50 chars, got len {}: {}",
+                ctx.text.len() <= 83, // 80 chars + "…" = 83 max
+                "Context should be truncated to ~80 chars, got len {}: {}",
                 ctx.text.len(),
                 ctx.text
             );
-            if ctx.text.len() > 50 {
+            if ctx.text.len() > 80 {
                 assert!(
-                    ctx.text.ends_with("..."),
-                    "Truncated context should end with '...', got: {}",
+                    ctx.text.ends_with("…"),
+                    "Truncated context should end with '…', got: {}",
                     ctx.text
                 );
             }
@@ -12104,7 +12569,7 @@ mod syntax_highlighting_tests {
         // Try to get context for a line that doesn't exist (line 100)
         // This should not panic - it should handle gracefully
         let result = std::panic::catch_unwind(|| {
-            get_function_context(100, rope.slice(..), syntax.as_ref(), &loader)
+            get_function_context(100, rope.slice(..), syntax.as_ref(), &loader, None)
         });
 
         // The function should either return None or panic in a controlled way
@@ -13489,7 +13954,7 @@ mod function_context_styling_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 1 (inside the function body)
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // The line number should be 0 (the function starts at line 0)
@@ -13577,7 +14042,7 @@ mod function_context_styling_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 2 (inside the indented function body)
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // The function "fn inner_function()" starts with 4 spaces of indentation
@@ -13612,29 +14077,29 @@ mod function_context_styling_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 1 (inside the function body)
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
-            // The text should be truncated to ~50 chars
+            // The text should be truncated to ~80 chars
             assert!(
-                ctx.text.len() <= 53, // 50 chars + "..." = 53 max
-                "Truncated text should be at most 53 chars, got len {}: {}",
+                ctx.text.len() <= 83, // 80 chars + "…" = 83 max
+                "Truncated text should be at most 83 chars, got len {}: {}",
                 ctx.text.len(),
                 ctx.text
             );
 
-            // truncated_len should be the length of the original text before "..."
+            // truncated_len should be the length of the original text before "…"
             assert!(
-                ctx.truncated_len <= 50,
-                "Truncated length should be at most 50, got: {}",
+                ctx.truncated_len <= 80,
+                "Truncated length should be at most 80, got: {}",
                 ctx.truncated_len
             );
 
-            // If truncated, the text should end with "..."
+            // If truncated, the text should end with "…"
             if ctx.text.len() > ctx.truncated_len {
                 assert!(
-                    ctx.text.ends_with("..."),
-                    "Truncated text should end with '...', got: {}",
+                    ctx.text.ends_with("…"),
+                    "Truncated text should end with '…', got: {}",
                     ctx.text
                 );
             }
@@ -13745,7 +14210,7 @@ mod function_context_styling_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 1 (inside the function body)
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // byte_offset_in_line should be 4 (4 spaces of indentation)
@@ -13826,7 +14291,7 @@ where
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 5 (inside the function body)
-        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // The context should contain some part of the function signature
@@ -14173,7 +14638,7 @@ mod box_decoration_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Get function context for line 1 (inside the function body)
-        let result = super::get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = super::get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // The line number should be 0 (the function starts at line 0)
@@ -14469,7 +14934,7 @@ mod phase7_adversarial_tests {
         let rope = Rope::from(content);
 
         // Try to get function context for line 0
-        let result = get_function_context(0, rope.slice(..), None, &loader);
+        let result = get_function_context(0, rope.slice(..), None, &loader, None);
 
         // Should return None without panicking
         assert!(
@@ -14482,20 +14947,20 @@ mod phase7_adversarial_tests {
     #[test]
     fn attack_hunk_header_very_long_function_context() {
         // Test that function context truncation works
-        // The MAX_LEN constant in get_function_context is 50
+        // The MAX_LEN constant in get_function_context is 80
         let long_signature = "fn very_long_function_name_that_exceeds_the_maximum_display_length_for_hunk_headers(param1: Type1, param2: Type2, param3: Type3)";
         assert!(
-            long_signature.len() > 50,
-            "Test signature should be longer than 50 chars"
+            long_signature.len() > 80,
+            "Test signature should be longer than 80 chars"
         );
 
-        // The truncation logic should add "..." suffix
+        // The truncation logic should add "…" suffix
         // This is tested indirectly through the FunctionContext struct
-        let truncated_len = 50 - 3; // Account for "..." suffix
-        let expected_truncated = format!("{}...", &long_signature[..truncated_len]);
+        let truncated_len = 80 - 1; // Account for "…" suffix
+        let expected_truncated = format!("{}…", &long_signature[..truncated_len]);
         assert!(
-            expected_truncated.ends_with("..."),
-            "Truncated text should end with '...'"
+            expected_truncated.ends_with("…"),
+            "Truncated text should end with '…'"
         );
     }
 
@@ -14509,7 +14974,7 @@ mod phase7_adversarial_tests {
         let rope = Rope::from(content);
 
         // Try to get function context for line 0
-        let result = get_function_context(0, rope.slice(..), None, &loader);
+        let result = get_function_context(0, rope.slice(..), None, &loader, None);
 
         // Should return None without panicking
         assert!(result.is_none(), "Should return None for empty file");
@@ -14674,9 +15139,9 @@ mod phase7_adversarial_tests {
         let long_content: String = (0..200)
             .map(|i| format!("param{}: Type{}, ", i, i))
             .collect();
-        let truncated_len = 50 - 3; // MAX_LEN - "..."
+        let truncated_len = 80 - 1; // MAX_LEN - "…"
         let truncated = format!(
-            "{}...",
+            "{}…",
             &long_content[..truncated_len.min(long_content.len())]
         );
 
@@ -23373,7 +23838,7 @@ mod adversarial_function_context_tests {
 
         // This should not panic or hang
         let result = std::panic::catch_unwind(|| {
-            get_function_context(deep_line, rope.slice(..), syntax.as_ref(), &loader)
+            get_function_context(deep_line, rope.slice(..), syntax.as_ref(), &loader, None)
         });
 
         // Should complete without panic
@@ -23386,8 +23851,8 @@ mod adversarial_function_context_tests {
         if let Ok(Some(ctx)) = result {
             assert!(!ctx.text.is_empty(), "Context text should not be empty");
             assert!(
-                ctx.text.len() <= 53,
-                "Context should be truncated to ~50 chars"
+                ctx.text.len() <= 83,
+                "Context should be truncated to ~80 chars"
             );
         }
     }
@@ -23415,7 +23880,7 @@ mod adversarial_function_context_tests {
 
         // Measure time for deep lookup
         let start = Instant::now();
-        let _ = get_function_context(100, rope.slice(..), syntax.as_ref(), &loader);
+        let _ = get_function_context(100, rope.slice(..), syntax.as_ref(), &loader, None);
         let duration = start.elapsed();
 
         // Should complete in reasonable time (< 10ms for 100 levels)
@@ -23447,7 +23912,7 @@ mod adversarial_function_context_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // The deepest line should still find the outer function
-        let result = get_function_context(51, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(51, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23474,7 +23939,7 @@ mod adversarial_function_context_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 0 is the function signature
-        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23502,7 +23967,8 @@ mod adversarial_function_context_tests {
 
         // Last line is line 3 (0-indexed)
         let last_line = rope.len_lines() - 1;
-        let result = get_function_context(last_line, rope.slice(..), syntax.as_ref(), &loader);
+        let result =
+            get_function_context(last_line, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should find the last function or return None gracefully
         if let Some(ctx) = result {
@@ -23522,7 +23988,7 @@ mod adversarial_function_context_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 0 is the single-line function
-        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23544,7 +24010,7 @@ mod adversarial_function_context_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 0 in empty file
-        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(0, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return None gracefully
         assert!(
@@ -23563,7 +24029,7 @@ mod adversarial_function_context_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should return None gracefully
         assert!(
@@ -23591,7 +24057,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23613,7 +24079,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(4, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(4, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23635,7 +24101,7 @@ fn query_function() {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line inside uses_macro
-        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(5, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23656,7 +24122,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23679,7 +24145,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23706,7 +24172,7 @@ fn query_function() {
 
         // Should not panic with incomplete syntax
         let result = std::panic::catch_unwind(|| {
-            get_function_context(1, rope.slice(..), syntax.as_ref(), &loader)
+            get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None)
         });
 
         assert!(result.is_ok(), "Should not panic with incomplete function");
@@ -23722,7 +24188,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should still find the function context despite syntax error
         if let Some(ctx) = result {
@@ -23744,7 +24210,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should still find function context
         if let Some(ctx) = result {
@@ -23766,7 +24232,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should handle gracefully
         if let Some(ctx) = result {
@@ -23789,7 +24255,7 @@ fn query_function() {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         let result = std::panic::catch_unwind(|| {
-            get_function_context(0, rope.slice(..), syntax.as_ref(), &loader)
+            get_function_context(0, rope.slice(..), syntax.as_ref(), &loader, None)
         });
 
         // Should not panic
@@ -23811,12 +24277,12 @@ fn query_function() {
         let rope = Rope::from(content.as_str());
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should be truncated
             assert!(
-                ctx.text.len() <= 53,
+                ctx.text.len() <= 83,
                 "Long signature should be truncated, got len {}: {}",
                 ctx.text.len(),
                 ctx.text
@@ -23838,7 +24304,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23859,7 +24325,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         // Should handle gracefully (may or may not find context)
         if let Some(ctx) = result {
@@ -23880,7 +24346,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -23902,7 +24368,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(!ctx.text.is_empty(), "Context should not be empty");
@@ -23920,7 +24386,7 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(!ctx.text.is_empty(), "Context should not be empty");
@@ -23939,21 +24405,21 @@ fn query_function() {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should be truncated and not cut in middle of unicode character
             assert!(
-                ctx.text.len() <= 53,
+                ctx.text.len() <= 83,
                 "Unicode function name should be truncated properly, got len {}: {}",
                 ctx.text.len(),
                 ctx.text
             );
-            // Should end with ... if truncated
-            if ctx.text.len() > 50 {
+            // Should end with … if truncated
+            if ctx.text.len() > 80 {
                 assert!(
-                    ctx.text.ends_with("..."),
-                    "Truncated unicode context should end with '...', got: {}",
+                    ctx.text.ends_with("…"),
+                    "Truncated unicode context should end with '…', got: {}",
                     ctx.text
                 );
             }
@@ -24257,7 +24723,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should include modifiers in the context
@@ -24281,7 +24747,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -24302,7 +24768,7 @@ mod adversarial_edge_case_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 2 is inside the method body
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should find either the impl or the method
@@ -24324,7 +24790,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -24345,7 +24811,7 @@ mod adversarial_edge_case_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 3 is inside the deep method
-        let result = get_function_context(3, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(3, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -24365,7 +24831,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should include the function signature (possibly truncated)
@@ -24387,7 +24853,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert!(
@@ -24408,7 +24874,7 @@ mod adversarial_edge_case_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 2 is inside inner function
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Should find the innermost function
@@ -24435,7 +24901,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // byte_offset_in_line should account for the 2-byte NBSP
@@ -24464,7 +24930,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Total whitespace: 3 + 3 + 3 = 9 bytes
@@ -24493,7 +24959,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Tab (1 byte) + 4 spaces (4 bytes) = 5 bytes
@@ -24515,7 +24981,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // 3 tabs = 3 bytes
@@ -24538,7 +25004,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Zero-width space is NOT whitespace per trim_start(), so byte_offset should be 0
@@ -24563,7 +25029,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Full-width space is 3 bytes
@@ -24591,7 +25057,7 @@ mod adversarial_edge_case_tests {
         let syntax = create_syntax(&rope, &file_path, &loader);
 
         // Line 2 is inside the function body
-        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(2, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // Function starts at line 1, no indentation
@@ -24619,7 +25085,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // BOM is ZERO WIDTH NO-BREAK SPACE, which is NOT whitespace per trim_start()
@@ -24641,7 +25107,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content.as_str());
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             assert_eq!(
@@ -24668,7 +25134,7 @@ mod adversarial_edge_case_tests {
         let rope = Rope::from(content);
         let syntax = create_syntax(&rope, &file_path, &loader);
 
-        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader);
+        let result = get_function_context(1, rope.slice(..), syntax.as_ref(), &loader, None);
 
         if let Some(ctx) = result {
             // 2 + 3 + 2 = 7 bytes
