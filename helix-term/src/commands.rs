@@ -3457,45 +3457,59 @@ fn compute_diff_preview(
     // Check if file exists (handle deleted files)
     let file_exists = path.exists();
     
-    // Get diff base from git
-    let diff_base_bytes = editor.diff_providers.get_diff_base(path);
+    // Get the appropriate content based on staged status
+    let (diff_base_bytes, current_content_bytes) = if entry.staged {
+        // Staged: Show HEAD → INDEX
+        let head_content = editor.diff_providers.get_diff_base(path);
+        let index_content = editor.diff_providers.get_index_content(path);
+        (head_content, index_content)
+    } else {
+        // Unstaged: Show INDEX → WORKDIR
+        let index_content = editor.diff_providers.get_index_content(path);
+        let workdir_content = if file_exists {
+            std::fs::read(path).ok()
+        } else {
+            None
+        };
+        // If no index content, fall back to HEAD → WORKDIR
+        if index_content.is_none() {
+            let head_content = editor.diff_providers.get_diff_base(path);
+            (head_content, workdir_content)
+        } else {
+            (index_content, workdir_content)
+        }
+    };
     
     // Handle different file states
-    match (&diff_base_bytes, file_exists) {
-        (None, false) => {
-            // File doesn't exist in git and on disk - shouldn't happen
+    match (&diff_base_bytes, &current_content_bytes, file_exists) {
+        (None, None, _) => {
+            // File doesn't exist anywhere - shouldn't happen
             return Some(CachedPreview::CustomText {
                 content: format!("File not found: {}", path.display()),
                 is_diff: false,
             });
         }
-        (None, true) => {
-            // Untracked file - show as new file
-            return compute_new_file_preview(path);
+        (None, Some(_), _) => {
+            // Untracked or new file - show as new file
+            return compute_new_file_preview_from_bytes(&current_content_bytes.as_ref().unwrap());
         }
-        (Some(_), false) => {
+        (Some(_), None, false) => {
             // Deleted file - show as deleted
-            return compute_deleted_file_preview(&diff_base_bytes.unwrap());
+            return compute_deleted_file_preview(&diff_base_bytes.as_ref().unwrap());
         }
-        (Some(_), true) => {
+        (Some(_), None, true) => {
+            // Staged file that was deleted from workdir but still in index
+            // Show the staged content
+            return compute_new_file_preview_from_bytes(&diff_base_bytes.as_ref().unwrap());
+        }
+        (Some(_), Some(_), _) => {
             // Modified file - compute diff
         }
     }
     
-    // Read current file content
-    let current_content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) => {
-            return Some(CachedPreview::CustomText {
-                content: format!("Error reading file: {}", e),
-                is_diff: false,
-            });
-        }
-    };
-    
     // Convert to Ropes
     let diff_base = Rope::from(String::from_utf8_lossy(&diff_base_bytes.unwrap()));
-    let doc = Rope::from(current_content);
+    let doc = Rope::from(String::from_utf8_lossy(&current_content_bytes.unwrap()));
     
     // Check for binary content
     if diff_base.len_chars() > 0 && contains_binary(&diff_base) {
@@ -3533,44 +3547,6 @@ fn compute_diff_preview(
     })
 }
 
-/// Compute preview for a new (untracked) file
-fn compute_new_file_preview(path: &Path) -> Option<CachedPreview> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            return Some(CachedPreview::CustomText {
-                content: format!("Error reading file: {}", e),
-                is_diff: false,
-            });
-        }
-    };
-    
-    // Check for binary content
-    if content.bytes().any(|b| b == 0) {
-        return Some(CachedPreview::CustomText {
-            content: "[Binary file]".to_string(),
-            is_diff: false,
-        });
-    }
-    
-    let doc = Rope::from(content);
-    let diff_base = Rope::new(); // Empty diff base for new files
-    
-    // Get file name for display
-    let file_name = path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
-    
-    // Return the Diff variant - empty hunks will be handled as new file
-    Some(CachedPreview::Diff {
-        diff_base,
-        doc,
-        hunks: Vec::new(), // Empty hunks signals new file
-        file_path: path.to_path_buf(),
-        file_name,
-    })
-}
-
 /// Compute preview for a deleted file
 fn compute_deleted_file_preview(diff_base_bytes: &[u8]) -> Option<CachedPreview> {
     let diff_base = Rope::from(String::from_utf8_lossy(diff_base_bytes));
@@ -3592,6 +3568,30 @@ fn compute_deleted_file_preview(diff_base_bytes: &[u8]) -> Option<CachedPreview>
         hunks: Vec::new(), // Empty hunks signals deleted file
         file_path: PathBuf::new(), // No path needed for deleted files
         file_name: "(deleted)".to_string(),
+    })
+}
+
+/// Compute preview for a new file from bytes
+fn compute_new_file_preview_from_bytes(content: &[u8]) -> Option<CachedPreview> {
+    // Check for binary content
+    if content.iter().any(|&b| b == 0) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+    
+    let content_str = String::from_utf8_lossy(content);
+    let doc = Rope::from(content_str);
+    let diff_base = Rope::new(); // Empty diff base for new files
+    
+    // Return the Diff variant - empty hunks will be handled as new file
+    Some(CachedPreview::Diff {
+        diff_base,
+        doc,
+        hunks: Vec::new(), // Empty hunks signals new file
+        file_path: PathBuf::new(), // No path needed for bytes-based preview
+        file_name: "(new)".to_string(),
     })
 }
 

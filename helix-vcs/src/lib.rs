@@ -117,6 +117,20 @@ impl DiffProviderRegistry {
                 }
             })
     }
+
+    /// Get the content of a file from the git index (staged version).
+    pub fn get_index_content(&self, file: &Path) -> Option<Vec<u8>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.get_index_content(file) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to get index content for {}", file.display());
+                    None
+                }
+            })
+    }
 }
 
 impl Default for DiffProviderRegistry {
@@ -195,6 +209,15 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::commit(cwd, message),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    /// Get the content of a file from the git index (staged version).
+    fn get_index_content(&self, file: &Path) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_index_content(file),
             Self::None => bail!("No diff support compiled in"),
         }
     }

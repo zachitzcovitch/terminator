@@ -154,6 +154,37 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Get the content of a file from the git index (staged version).
+/// This retrieves the content that has been staged with `git add`.
+pub fn get_index_content(file: &Path) -> Result<Vec<u8>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let work_dir = repo.workdir().context("bare repository has no worktree")?;
+    let rela_path = file.strip_prefix(work_dir)?;
+    let rela_path_str = rela_path.to_string_lossy();
+
+    // Use git show :path to get staged content from the index
+    let output = Command::new("git")
+        .args(["show", &format!(":{}", rela_path_str)])
+        .current_dir(work_dir)
+        .output()
+        .context("failed to execute git show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show failed: {}", stderr);
+    }
+
+    Ok(output.stdout)
+}
+
 /// Revert a hunk by applying a reverse patch using `git apply -R`
 pub fn revert_hunk(file_path: &Path, patch: &str) -> Result<()> {
     use std::io::Write;
