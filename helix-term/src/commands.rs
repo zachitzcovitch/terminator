@@ -3963,9 +3963,9 @@ impl GitStatusPicker {
             Ok(entries) => {
                 // Update our stored files list
                 self.files = entries.clone();
-                // Clear and repopulate the picker
+                // Clear old items and repopulate the picker
+                self.picker.clear();
                 let injector = self.picker.injector();
-                // The picker's version will be incremented, clearing old items
                 for entry in entries {
                     if injector.push(entry).is_err() {
                         break;

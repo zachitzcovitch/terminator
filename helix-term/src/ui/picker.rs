@@ -440,6 +440,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
+    /// Clear all items from the picker. This increments the version
+    /// and restarts the matcher, invalidating any existing injectors.
+    pub fn clear(&mut self) {
+        self.version.fetch_add(1, atomic::Ordering::Relaxed);
+        self.matcher.restart(false);
+    }
+
     pub fn truncate_start(mut self, truncate_start: bool) -> Self {
         self.truncate_start = truncate_start;
         self
