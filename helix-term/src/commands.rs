@@ -4036,6 +4036,10 @@ impl GitStatusPicker {
                         .unwrap_or_else(|| "untitled".to_string());
                     let absolute_path = file_path.clone();
 
+                    // Compute repo-relative path for patch headers
+                    let rel_path = git::get_relative_path(&file_path)
+                        .unwrap_or_else(|| file_path.clone());
+
                     // Get syntax for highlighting
                     let existing_syntax = doc.syntax_arc();
 
@@ -4092,7 +4096,7 @@ impl GitStatusPicker {
                         doc_text,
                         hunks,
                         file_name,
-                        file_path.clone(),
+                        rel_path,
                         absolute_path,
                         doc_id,
                         existing_syntax,
