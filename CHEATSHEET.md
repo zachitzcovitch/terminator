@@ -1,6 +1,6 @@
 # Helix-Git Cheat Sheet
 
-## Git Status Picker (`Space+g`)
+## Git Status Picker (`Space+g+s`)
 
 Open the git status picker to see all changed files with diff preview.
 
@@ -105,10 +105,69 @@ Each entry displays the correct diff independently.
 
 | Command | Action |
 |---------|--------|
-| `Space+g` | Open git status picker |
+| `Space+g+s` | Open git status picker |
+| `Space+g+l` | Open git log browser |
+| `Space+g+S` | Open git stash picker |
 | `gv` | Open diff view for current file |
+| `gB` | Open blame view for current file |
 | `]d` | Go to next diff hunk |
 | `[d` | Go to previous diff hunk |
+
+---
+
+## Git Log Browser (`Space+g+l`)
+
+Browse commit history with diff preview.
+
+| Key | Action |
+|-----|--------|
+| `j/k` | Navigate commits |
+| `Enter` | (Coming soon) Open commit diff |
+| `y` | (Coming soon) Yank commit hash |
+| `q/Esc` | Close |
+
+Preview pane shows commit stat summary.
+
+---
+
+## Git Blame (`gB`)
+
+View blame annotations for the current file.
+
+| Key | Action |
+|-----|--------|
+| `j/k` | Navigate lines |
+| `g/G` | Jump to top/bottom |
+| `PageUp/PageDown` | Scroll by page |
+| `q/Esc` | Close |
+
+Features:
+- Consecutive lines from same commit are collapsed
+- Each commit gets a unique color based on its hash
+- Shows warning if file has unsaved changes
+
+---
+
+## Git Stash (`Space+g+S`)
+
+Manage git stashes with preview.
+
+### Picker Actions
+| Key | Action |
+|-----|--------|
+| `j/k` | Navigate stashes |
+| `a` | Apply stash (keep in list) |
+| `Enter`/`p` | Pop stash (apply + remove) |
+| `d` | Drop stash (confirms first) |
+| `q/Esc` | Close |
+
+### Typed Commands
+| Command | Action |
+|---------|--------|
+| `:stash-push [message]` | Stash current changes |
+| `:stash-pop [index]` | Pop stash (default: stash@{0}) |
+
+Preview pane shows stash diff.
 
 ---
 
@@ -119,3 +178,6 @@ Each entry displays the correct diff independently.
 3. **Check whitespace**: Trailing whitespace is highlighted in red
 4. **Navigate efficiently**: Use `J/K` to jump between hunks, `n/p` for files
 5. **Partial staging**: Files with both staged and unstaged changes appear twice
+6. **Browse history**: Use `Space+g+l` to explore commit log with stat preview
+7. **Blame a line**: Use `gB` to see who last changed each line
+8. **Stash work**: Use `Space+g+S` to manage stashes, `:stash-push` to create
