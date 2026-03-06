@@ -3982,6 +3982,7 @@ impl GitStatusPicker {
     fn open_diff_view(&mut self, _cx: &mut compositor::Context) -> Option<compositor::Callback> {
         if let Some(entry) = self.selection() {
             let file_path = entry.change.path().to_path_buf();
+            let cwd = self.cwd.clone();
 
             // Use the stored files list for n/p navigation
             let files = self.files.clone();
@@ -4038,7 +4039,11 @@ impl GitStatusPicker {
 
                     // Compute repo-relative path for patch headers
                     let rel_path = git::get_relative_path(&file_path)
-                        .unwrap_or_else(|| file_path.clone());
+                        .or_else(|| file_path.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+                        .unwrap_or_else(|| {
+                            // Last resort: just use the file name
+                            PathBuf::from(file_path.file_name().unwrap_or_default())
+                        });
 
                     // Get syntax for highlighting
                     let existing_syntax = doc.syntax_arc();
