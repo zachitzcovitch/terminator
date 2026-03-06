@@ -944,6 +944,136 @@ pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
     Ok(entries)
 }
 
+/// List all git stashes.
+pub fn stash_list(cwd: &Path) -> Result<Vec<crate::status::StashEntry>> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("list")
+        .arg("--format=%gd%x00%s%x00%cr")
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash list")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash list failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(3, '\0').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        entries.push(crate::status::StashEntry {
+            index: parts[0].to_string(),
+            message: parts[1].to_string(),
+            relative_date: parts[2].to_string(),
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Show the diff for a specific stash entry.
+pub fn stash_show(cwd: &Path, index: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("show")
+        .arg("-p")
+        .arg(index)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash show failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Push current changes to a new stash entry.
+pub fn stash_push(cwd: &Path, message: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("stash").arg("push").current_dir(cwd);
+
+    if let Some(msg) = message {
+        cmd.arg("-m").arg(msg);
+    }
+
+    let output = cmd.output().context("failed to execute git stash push")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash push failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Pop a stash entry (apply and remove).
+pub fn stash_pop(cwd: &Path, index: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("pop")
+        .arg(index)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash pop")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash pop failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Apply a stash entry without removing it.
+pub fn stash_apply(cwd: &Path, index: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("apply")
+        .arg(index)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash apply")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash apply failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Drop (delete) a stash entry.
+pub fn stash_drop(cwd: &Path, index: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("drop")
+        .arg(index)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash drop")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash drop failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
 /// Convert a duration in seconds to a human-readable relative time string.
 fn compute_relative_time(diff_secs: i64) -> String {
     if diff_secs < 60 {

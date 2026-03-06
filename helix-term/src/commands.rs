@@ -10,7 +10,7 @@ use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{git, FileChange, Hunk, LogEntry, StatusEntry};
+use helix_vcs::{git, FileChange, Hunk, LogEntry, StashEntry, StatusEntry};
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -415,6 +415,7 @@ impl MappableCommand {
         changed_file_picker, "Open changed file picker",
         git_status_picker, "Open git status picker",
         git_log_picker, "Open git log picker",
+        git_stash_picker, "Open git stash picker",
         git_blame_view, "Open git blame view",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
@@ -4359,6 +4360,258 @@ fn git_log_picker(cx: &mut Context) {
     }
 
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn git_stash_picker(cx: &mut Context) {
+    let cwd = helix_stdx::env::current_working_dir();
+    if !cwd.exists() {
+        cx.editor
+            .set_error("Current working directory does not exist");
+        return;
+    }
+
+    let entries = match git::stash_list(&cwd) {
+        Ok(entries) if entries.is_empty() => {
+            cx.editor.set_status("No stashes found");
+            return;
+        }
+        Ok(entries) => entries,
+        Err(err) => {
+            cx.editor
+                .set_error(format!("Failed to list stashes: {}", err));
+            return;
+        }
+    };
+
+    let cwd_for_preview = cwd.clone();
+    let cwd_for_wrapper = cwd.clone();
+
+    let columns = [
+        PickerColumn::new(
+            "index",
+            |entry: &StashEntry, _data: &PathBuf| {
+                Span::styled(
+                    entry.index.clone(),
+                    Style::default().fg(helix_view::graphics::Color::Yellow),
+                )
+                .into()
+            },
+        ),
+        PickerColumn::new(
+            "message",
+            |entry: &StashEntry, _data: &PathBuf| {
+                entry.message.clone().into()
+            },
+        ),
+        PickerColumn::new(
+            "date",
+            |entry: &StashEntry, _data: &PathBuf| {
+                Span::styled(
+                    entry.relative_date.clone(),
+                    Style::default().fg(helix_view::graphics::Color::Cyan),
+                )
+                .into()
+            },
+        ),
+    ];
+
+    let picker = Picker::new(
+        columns,
+        1, // message column for fuzzy search
+        [],
+        cwd.clone(),
+        |_cx, _entry: &StashEntry, _action| {},
+    )
+    .with_custom_preview(move |_editor, entry: &StashEntry| {
+        match git::stash_show(&cwd_for_preview, &entry.index) {
+            Ok(diff_text) => Some(CachedPreview::CustomText {
+                content: diff_text,
+                is_diff: true,
+            }),
+            Err(_) => Some(CachedPreview::CustomText {
+                content: format!("Failed to load stash {}", entry.index),
+                is_diff: false,
+            }),
+        }
+    });
+
+    let injector = picker.injector();
+    for entry in &entries {
+        if injector.push(entry.clone()).is_err() {
+            break;
+        }
+    }
+
+    let stash_picker = StashPicker::new(picker, cwd_for_wrapper);
+    cx.push_layer(Box::new(overlaid(stash_picker)));
+}
+
+/// Custom wrapper component for the stash picker that adds apply/pop/drop key handlers.
+struct StashPicker {
+    picker: Picker<StashEntry, PathBuf>,
+    cwd: PathBuf,
+}
+
+impl StashPicker {
+    fn new(picker: Picker<StashEntry, PathBuf>, cwd: PathBuf) -> Self {
+        Self { picker, cwd }
+    }
+
+    fn selection(&self) -> Option<&StashEntry> {
+        self.picker.selection()
+    }
+
+    /// Refresh the picker with the current stash list.
+    /// Returns a callback to close the picker if no stashes remain.
+    fn refresh(&mut self) -> Option<compositor::Callback> {
+        match git::stash_list(&self.cwd) {
+            Ok(entries) if entries.is_empty() => {
+                // No stashes left — close the picker
+                return Some(Box::new(|compositor: &mut Compositor, _| {
+                    compositor.pop();
+                }));
+            }
+            Ok(entries) => {
+                self.picker.clear();
+                let injector = self.picker.injector();
+                for entry in entries {
+                    if injector.push(entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        None
+    }
+}
+
+impl Component for StashPicker {
+    fn render(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        frame: &mut tui::buffer::Buffer,
+        cx: &mut compositor::Context,
+    ) {
+        self.picker.render(area, frame, cx);
+    }
+
+    fn handle_event(&mut self, event: &Event, cx: &mut compositor::Context) -> EventResult {
+        if let Event::Key(key_event) = event {
+            match key_event.code {
+                KeyCode::Char('a') if key_event.modifiers.is_empty() => {
+                    // Apply stash (keep in list)
+                    if let Some(entry) = self.selection() {
+                        let index = entry.index.clone();
+                        match git::stash_apply(&self.cwd, &index) {
+                            Ok(()) => {
+                                cx.editor
+                                    .set_status(format!("Applied {}", index));
+                            }
+                            Err(e) => {
+                                cx.editor
+                                    .set_error(format!("Failed to apply stash: {}", e));
+                            }
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Enter | KeyCode::Char('p')
+                    if key_event.modifiers.is_empty() =>
+                {
+                    // Pop stash (apply + remove)
+                    if let Some(entry) = self.selection() {
+                        let index = entry.index.clone();
+                        match git::stash_pop(&self.cwd, &index) {
+                            Ok(()) => {
+                                cx.editor
+                                    .set_status(format!("Popped {}", index));
+                                if let Some(callback) = self.refresh() {
+                                    return EventResult::Consumed(Some(callback));
+                                }
+                            }
+                            Err(e) => {
+                                cx.editor
+                                    .set_error(format!("Failed to pop stash: {}", e));
+                            }
+                        }
+                    }
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Char('d') if key_event.modifiers.is_empty() => {
+                    // Drop stash (with confirmation prompt)
+                    if let Some(entry) = self.selection() {
+                        let index = entry.index.clone();
+                        let message = entry.message.clone();
+                        let cwd = self.cwd.clone();
+
+                        let callback: compositor::Callback = Box::new(
+                            move |compositor: &mut Compositor, _cx: &mut compositor::Context| {
+                                let cwd = cwd.clone();
+                                let index = index.clone();
+                                let prompt = Prompt::new(
+                                    format!(
+                                        "Drop {} \"{}\"? [y/N] ",
+                                        index, message
+                                    )
+                                    .into(),
+                                    None,
+                                    |_editor: &Editor, _input: &str| Vec::new(),
+                                    move |cx: &mut compositor::Context,
+                                          input: &str,
+                                          event: PromptEvent| {
+                                        if event != PromptEvent::Validate {
+                                            return;
+                                        }
+                                        let input = input.trim().to_lowercase();
+                                        if input == "y" || input == "yes" {
+                                            match git::stash_drop(&cwd, &index) {
+                                                Ok(()) => {
+                                                    cx.editor.set_status(format!(
+                                                        "Dropped {}",
+                                                        index
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    cx.editor.set_error(format!(
+                                                        "Failed to drop stash: {}",
+                                                        e
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    },
+                                );
+                                compositor.push(Box::new(prompt));
+                            },
+                        );
+                        return EventResult::Consumed(Some(callback));
+                    }
+                    return EventResult::Consumed(None);
+                }
+                _ => {}
+            }
+        }
+
+        // Pass other events to the inner picker
+        self.picker.handle_event(event, cx)
+    }
+
+    fn cursor(
+        &self,
+        area: helix_view::graphics::Rect,
+        editor: &Editor,
+    ) -> (Option<Position>, helix_view::graphics::CursorKind) {
+        self.picker.cursor(area, editor)
+    }
+
+    fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
+        self.picker.required_size(viewport)
+    }
+
+    fn id(&self) -> Option<&'static str> {
+        Some("git_stash_picker")
+    }
 }
 
 fn git_blame_view(cx: &mut Context) {

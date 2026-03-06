@@ -2847,6 +2847,62 @@ fn git_status_picker(
     Ok(())
 }
 
+fn stash_push(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let cwd = helix_stdx::env::current_working_dir();
+    let message = args.first().map(|s| s.as_ref());
+
+    match helix_vcs::git::stash_push(&cwd, message) {
+        Ok(()) => {
+            let msg = if let Some(m) = message {
+                format!("Stashed changes: {}", m)
+            } else {
+                "Stashed changes".to_string()
+            };
+            cx.editor.set_status(msg);
+        }
+        Err(e) => {
+            cx.editor.set_error(format!("Failed to stash: {}", e));
+        }
+    }
+
+    Ok(())
+}
+
+fn stash_pop_cmd(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let cwd = helix_stdx::env::current_working_dir();
+    let index = args
+        .first()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "stash@{0}".to_string());
+
+    match helix_vcs::git::stash_pop(&cwd, &index) {
+        Ok(()) => {
+            cx.editor.set_status(format!("Popped {}", index));
+        }
+        Err(e) => {
+            cx.editor.set_error(format!("Failed to pop stash: {}", e));
+        }
+    }
+
+    Ok(())
+}
+
 /// This command accepts a single boolean --skip-visible flag and no positionals.
 const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
     positionals: (0, Some(0)),
@@ -3950,6 +4006,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stash-push",
+        aliases: &[],
+        doc: "Stash current changes with optional message",
+        fun: stash_push,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stash-pop",
+        aliases: &[],
+        doc: "Pop a stash entry (default: stash@{0})",
+        fun: stash_pop_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

@@ -83,3 +83,14 @@ pub struct BlameLine {
     /// Whether this is a boundary commit (root of the file's history)
     pub is_boundary: bool,
 }
+
+/// Represents a git stash entry.
+#[derive(Clone)]
+pub struct StashEntry {
+    /// Stash reference (e.g., "stash@{0}")
+    pub index: String,
+    /// Stash message
+    pub message: String,
+    /// Relative date (e.g., "2 hours ago")
+    pub relative_date: String,
+}
