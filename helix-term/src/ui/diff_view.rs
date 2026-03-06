@@ -1481,6 +1481,136 @@ pub struct DiffView {
     staged_hunks: HashSet<usize>,
 }
 
+/// Re-open the diff view for a file after a successful revert.
+///
+/// Reads the file from disk, computes a fresh diff against HEAD,
+/// and pushes a new DiffView. If no hunks remain, returns to the
+/// git status picker instead.
+fn reopen_diff_after_revert(
+    editor: &mut helix_view::Editor,
+    compositor: &mut Compositor,
+    absolute_path: &std::path::Path,
+    file_path: PathBuf,
+    file_name: String,
+    files: Vec<StatusEntry>,
+    file_index: usize,
+) {
+    use imara_diff::{Algorithm, Diff, InternedInput};
+
+    // Read the reverted file from disk to get fresh content
+    let doc_bytes = match std::fs::read(absolute_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Can't read file - fall back to picker
+            crate::commands::push_git_status_picker_with_selection(
+                editor, compositor, files, file_index,
+            );
+            return;
+        }
+    };
+    let doc_text = Rope::from(String::from_utf8_lossy(&doc_bytes));
+
+    // Get diff base (HEAD version) from the diff provider
+    let diff_base = match editor.diff_providers.get_diff_base(absolute_path) {
+        Some(base_bytes) => Rope::from(String::from_utf8_lossy(&base_bytes)),
+        None => {
+            // No diff base means file is untracked or fully reverted
+            editor.set_status(format!("No more changes in {}", file_name));
+            crate::commands::push_git_status_picker_with_selection(
+                editor, compositor, files, file_index,
+            );
+            return;
+        }
+    };
+
+    // Compute fresh hunks using imara_diff
+    struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+    impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+        type Token = helix_core::RopeSlice<'a>;
+        type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+        fn tokenize(&self) -> Self::Tokenizer {
+            self.0.lines()
+        }
+
+        fn estimate_tokens(&self) -> u32 {
+            self.0.len_lines() as u32
+        }
+    }
+
+    let input = InternedInput::new(
+        RopeLines(diff_base.slice(..)),
+        RopeLines(doc_text.slice(..)),
+    );
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    let hunks: Vec<Hunk> = diff.hunks().collect();
+
+    // If no hunks remain, the file is fully reverted - return to picker
+    if hunks.is_empty() {
+        editor.set_status(format!("No more changes in {}", file_name));
+        crate::commands::push_git_status_picker_with_selection(
+            editor, compositor, files, file_index,
+        );
+        return;
+    }
+
+    // Open/switch to the document to get doc_id and syntax
+    let doc_id = match editor.open(absolute_path, Action::Replace) {
+        Ok(id) => id,
+        Err(_) => {
+            crate::commands::push_git_status_picker_with_selection(
+                editor, compositor, files, file_index,
+            );
+            return;
+        }
+    };
+
+    // Reload the document from disk so the buffer matches the reverted file
+    {
+        let (view, doc) = helix_view::current!(editor);
+        let diff_providers = editor.diff_providers.clone();
+        let _ = doc.reload(view, &diff_providers);
+    }
+
+    let doc = helix_view::doc_mut!(editor, &doc_id);
+    let existing_syntax = doc.syntax_arc();
+    let is_modified = doc.is_modified();
+
+    // Check if file on disk is newer than the buffer
+    let is_stale = if let Some(path) = doc.path() {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if let Ok(disk_mtime) = metadata.modified() {
+                disk_mtime > doc.last_saved_time()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let diff_view = DiffView::new(
+        diff_base,
+        doc_text,
+        hunks,
+        file_name,
+        file_path,
+        absolute_path.to_path_buf(),
+        doc_id,
+        existing_syntax,
+        0, // Start at first hunk
+        files,
+        file_index,
+        is_modified,
+        is_stale,
+    );
+
+    compositor.push(Box::new(overlaid(diff_view)));
+}
+
 impl DiffView {
     pub fn new(
         diff_base: Rope,
@@ -3770,6 +3900,7 @@ impl Component for DiffView {
                         // Get the absolute file path for revert operation
                         let absolute_path = self.absolute_path.clone();
                         let file_name = self.file_name.clone();
+                        let file_path = self.file_path.clone();
                         let has_unsaved = self.is_modified;
                         let files = self.files.clone();
                         let file_index = self.file_index;
@@ -3803,29 +3934,49 @@ impl Component for DiffView {
                                                         "Reverted hunk in {}",
                                                         file_name
                                                     ));
+
+                                                    // Re-open diff view with fresh content
+                                                    let absolute_path = absolute_path.clone();
+                                                    let file_path = file_path.clone();
+                                                    let file_name = file_name.clone();
+                                                    let files = files.clone();
+                                                    job::dispatch_blocking(
+                                                        move |editor, compositor: &mut Compositor| {
+                                                            compositor.pop(); // Pop the diff view
+
+                                                            reopen_diff_after_revert(
+                                                                editor,
+                                                                compositor,
+                                                                &absolute_path,
+                                                                file_path,
+                                                                file_name,
+                                                                files,
+                                                                file_index,
+                                                            );
+                                                        },
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     cx.editor.set_error(format!(
                                                         "Failed to revert hunk: {}",
                                                         e
                                                     ));
+
+                                                    // On error, pop diff view and return to picker
+                                                    let files = files.clone();
+                                                    job::dispatch_blocking(
+                                                        move |editor, compositor: &mut Compositor| {
+                                                            compositor.pop(); // Pop the diff view
+                                                            crate::commands::push_git_status_picker_with_selection(
+                                                                editor,
+                                                                compositor,
+                                                                files,
+                                                                file_index,
+                                                            );
+                                                        },
+                                                    );
                                                 }
                                             }
-
-                                            // Pop the diff view (prompt auto-closes itself)
-                                            // and return to the git status picker
-                                            let files = files.clone();
-                                            job::dispatch_blocking(
-                                                move |editor, compositor: &mut Compositor| {
-                                                    compositor.pop(); // Pop the diff view
-                                                    crate::commands::push_git_status_picker_with_selection(
-                                                        editor,
-                                                        compositor,
-                                                        files,
-                                                        file_index,
-                                                    );
-                                                },
-                                            );
                                         }
                                     },
                                 );
