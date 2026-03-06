@@ -55,6 +55,7 @@ View the diff for the current file or selected file.
 - **Line numbers** - Both old and new line numbers displayed
 - **3-line box decoration** - Delta-style hunk headers
 - **Staged hunk indicators** - Staged hunks shown dimmed with ✓ badge
+- **Inline blame** - Bottom bar shows who last changed the selected line
 
 ---
 
@@ -108,9 +109,7 @@ Each entry displays the correct diff independently.
 | `Space+g+s` | Open git status picker |
 | `Space+g+l` | Open git log browser |
 | `Space+g+t` | Open git stash picker |
-| `Space+g+b` | Open blame view for current file |
 | `gv` | Open diff view for current file |
-| `gB` | Open blame view for current file |
 | `]d` | Go to next diff hunk |
 | `[d` | Go to previous diff hunk |
 
@@ -131,21 +130,17 @@ Preview pane shows commit stat summary.
 
 ---
 
-## Git Blame (`gB`)
+## Inline Blame (in Diff View)
 
-View blame annotations for the current file.
+When viewing a diff (`gv` or from log/stash), the bottom of the view shows blame information for the currently selected line:
 
-| Key | Action |
-|-----|--------|
-| `j/k` | Navigate lines |
-| `g/G` | Jump to top/bottom |
-| `PageUp/PageDown` | Scroll by page |
-| `q/Esc` | Close |
+```
+ a1b2c3d Alice, 2 hours ago • Fix parser edge case
+```
 
-Features:
-- Consecutive lines from same commit are collapsed
-- Each commit gets a unique color based on its hash
-- Shows warning if file has unsaved changes
+- Automatically loaded when opening a diff view for a real file
+- Shows: commit hash, author, relative date, and commit subject
+- Updates as you navigate lines with j/k
 
 ---
 
@@ -180,5 +175,5 @@ Preview pane shows stash diff.
 4. **Navigate efficiently**: Use `J/K` to jump between hunks, `n/p` for files
 5. **Partial staging**: Files with both staged and unstaged changes appear twice
 6. **Browse history**: Use `Space+g+l` to explore commit log with stat preview
-7. **Blame a line**: Use `gB` to see who last changed each line
+7. **Blame a line**: Inline blame shows automatically in diff view
 8. **Stash work**: Use `Space+g+t` to manage stashes, `:stash-push` to create
