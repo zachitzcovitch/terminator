@@ -18,7 +18,7 @@ pub use diff::{DiffHandle, Hunk};
 
 mod status;
 
-pub use status::{FileChange, StatusEntry};
+pub use status::{FileChange, LogEntry, StatusEntry};
 
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.

@@ -10,7 +10,7 @@ use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{git, FileChange, Hunk, StatusEntry};
+use helix_vcs::{git, FileChange, Hunk, LogEntry, StatusEntry};
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -414,6 +414,7 @@ impl MappableCommand {
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
         git_status_picker, "Open git status picker",
+        git_log_picker, "Open git log picker",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
@@ -4263,6 +4264,100 @@ impl Component for GitStatusPicker {
     fn id(&self) -> Option<&'static str> {
         Some("git_status_picker")
     }
+}
+
+fn git_log_picker(cx: &mut Context) {
+    let cwd = helix_stdx::env::current_working_dir();
+    if !cwd.exists() {
+        cx.editor
+            .set_error("Current working directory does not exist");
+        return;
+    }
+
+    let entries = match git::get_log(&cwd, 100, None) {
+        Ok(entries) if entries.is_empty() => {
+            cx.editor.set_status("No commits found");
+            return;
+        }
+        Ok(entries) => entries,
+        Err(err) => {
+            cx.editor
+                .set_error(format!("Failed to get git log: {}", err));
+            return;
+        }
+    };
+
+    let cwd_for_preview = cwd.clone();
+
+    let columns = [
+        PickerColumn::new(
+            "hash",
+            |entry: &LogEntry, _data: &PathBuf| {
+                Span::styled(
+                    entry.short_hash.clone(),
+                    Style::default().fg(helix_view::graphics::Color::Yellow),
+                )
+                .into()
+            },
+        ),
+        PickerColumn::new(
+            "author",
+            |entry: &LogEntry, _data: &PathBuf| {
+                Span::styled(
+                    entry.author.clone(),
+                    Style::default().fg(helix_view::graphics::Color::Green),
+                )
+                .into()
+            },
+        ),
+        PickerColumn::new(
+            "date",
+            |entry: &LogEntry, _data: &PathBuf| {
+                Span::styled(
+                    entry.relative_date.clone(),
+                    Style::default().fg(helix_view::graphics::Color::Cyan),
+                )
+                .into()
+            },
+        ),
+        PickerColumn::new(
+            "subject",
+            |entry: &LogEntry, _data: &PathBuf| {
+                entry.subject.clone().into()
+            },
+        ),
+    ];
+
+    let picker = Picker::new(
+        columns,
+        3, // subject column for fuzzy search
+        [],
+        cwd.clone(),
+        |_cx, _entry: &LogEntry, _action| {
+            // TODO: Enter will open commit diff view in a future task
+        },
+    )
+    .with_custom_preview(move |_editor, entry: &LogEntry| {
+        match git::get_commit_diff(&cwd_for_preview, &entry.hash) {
+            Ok(diff_text) => Some(CachedPreview::CustomText {
+                content: diff_text,
+                is_diff: false,
+            }),
+            Err(_) => Some(CachedPreview::CustomText {
+                content: format!("Failed to load diff for {}", entry.short_hash),
+                is_diff: false,
+            }),
+        }
+    });
+
+    let injector = picker.injector();
+    for entry in &entries {
+        if injector.push(entry.clone()).is_err() {
+            break;
+        }
+    }
+
+    cx.push_layer(Box::new(overlaid(picker)));
 }
 
 // Helper function to extract hunk data to avoid borrow issues with cx.editor

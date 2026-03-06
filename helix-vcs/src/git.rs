@@ -772,6 +772,82 @@ pub fn get_diff_stats(
     Ok(Some((additions, deletions, false))) // Normal file
 }
 
+/// Get git log entries for the repository.
+/// Returns up to `limit` entries, optionally filtered to a specific file.
+pub fn get_log(
+    cwd: &Path,
+    limit: usize,
+    file_path: Option<&Path>,
+) -> Result<Vec<crate::status::LogEntry>> {
+    // Use NUL byte (%x00) as field separator to avoid ambiguity
+    let format = "%H%x00%h%x00%s%x00%an%x00%ad%x00%ar";
+
+    let mut cmd = Command::new("git");
+    cmd.arg("log")
+        .arg(format!("--format={}", format))
+        .arg("--date=short")
+        .arg(format!("-n{}", limit))
+        .current_dir(cwd);
+
+    // If a file path is provided, filter log to that file
+    if let Some(path) = file_path {
+        cmd.arg("--").arg(path);
+    }
+
+    let output = cmd.output().context("failed to execute git log")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git log failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(6, '\0').collect();
+        if parts.len() < 6 {
+            continue; // Skip malformed lines
+        }
+
+        entries.push(crate::status::LogEntry {
+            hash: parts[0].to_string(),
+            short_hash: parts[1].to_string(),
+            subject: parts[2].to_string(),
+            author: parts[3].to_string(),
+            date: parts[4].to_string(),
+            relative_date: parts[5].to_string(),
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Get the stat summary and diff for a specific commit.
+/// Returns the output of `git show --stat <hash>` for preview display.
+pub fn get_commit_diff(cwd: &Path, hash: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("show")
+        .arg("--stat")
+        .arg("--format=%H%n%s%n%an <%ae>%n%ad%n")
+        .arg("--date=short")
+        .arg(hash)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Finds the object that contains the contents of a file at a specific commit.
 fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;

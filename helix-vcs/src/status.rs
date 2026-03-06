@@ -45,3 +45,20 @@ pub struct StatusEntry {
     /// Whether this file is binary (detected by git)
     pub is_binary: bool,
 }
+
+/// Represents a single git log entry (commit).
+#[derive(Clone)]
+pub struct LogEntry {
+    /// Full commit hash (40 chars)
+    pub hash: String,
+    /// Short commit hash (7 chars)
+    pub short_hash: String,
+    /// Commit subject (first line of message)
+    pub subject: String,
+    /// Author name
+    pub author: String,
+    /// Date in short format (YYYY-MM-DD)
+    pub date: String,
+    /// Relative date (e.g., "2 hours ago")
+    pub relative_date: String,
+}
