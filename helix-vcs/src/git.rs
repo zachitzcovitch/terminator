@@ -848,6 +848,93 @@ pub fn get_commit_diff(cwd: &Path, hash: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Get the list of files changed in a specific commit with stats.
+/// Returns tuples of (status, file_path, additions, deletions).
+pub fn get_commit_files(cwd: &Path, hash: &str) -> Result<Vec<(String, String, usize, usize)>> {
+    let output = Command::new("git")
+        .arg("diff-tree")
+        .arg("--no-commit-id")
+        .arg("-r")
+        .arg("--numstat")
+        .arg(hash)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git diff-tree --numstat")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff-tree failed: {}", stderr);
+    }
+
+    let numstat_stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Also get name-status for the change type (A/M/D/R)
+    let status_output = Command::new("git")
+        .arg("diff-tree")
+        .arg("--no-commit-id")
+        .arg("-r")
+        .arg("--name-status")
+        .arg(hash)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git diff-tree --name-status")?;
+
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+
+    // Parse name-status into a map: path -> status
+    let mut status_map = std::collections::HashMap::new();
+    for line in status_stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() >= 2 {
+            status_map.insert(parts[1].to_string(), parts[0].to_string());
+        }
+    }
+
+    // Parse numstat
+    let mut files = Vec::new();
+    for line in numstat_stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let additions = parts[0].parse::<usize>().unwrap_or(0);
+            let deletions = parts[1].parse::<usize>().unwrap_or(0);
+            let path = parts[2].to_string();
+            let status = status_map
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| "M".to_string());
+            files.push((status, path, additions, deletions));
+        }
+    }
+
+    Ok(files)
+}
+
+/// Get the diff for a specific file in a commit.
+pub fn get_commit_file_diff(cwd: &Path, hash: &str, file_path: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("diff")
+        .arg(format!("{}~1", hash))
+        .arg(hash)
+        .arg("--")
+        .arg(file_path)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git diff for commit file")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Get blame information for a file.
 /// Parses `git blame --porcelain` output into structured BlameLine entries.
 pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {

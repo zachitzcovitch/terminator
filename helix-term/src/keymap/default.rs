@@ -240,7 +240,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => { "Git"
                 "s" => git_status_picker,
                 "l" => git_log_picker,
-                "S" => git_stash_picker,
+                "b" => git_blame_view,
+                "t" => git_stash_picker,
             },
             "\\" => hunk_picker,
             "a" => code_action,

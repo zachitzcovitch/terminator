@@ -4268,6 +4268,24 @@ impl Component for GitStatusPicker {
     }
 }
 
+/// Represents a file changed in a specific commit.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct CommitFileEntry {
+    /// Change type: "M", "A", "D", "R"
+    status: String,
+    /// File path relative to repo root
+    path: String,
+    /// Number of added lines
+    additions: usize,
+    /// Number of deleted lines
+    deletions: usize,
+    /// Full hash of the commit this file belongs to
+    commit_hash: String,
+    /// Subject line of the commit
+    commit_subject: String,
+}
+
 fn git_log_picker(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
@@ -4335,8 +4353,131 @@ fn git_log_picker(cx: &mut Context) {
         3, // subject column for fuzzy search
         [],
         cwd.clone(),
-        |_cx, _entry: &LogEntry, _action| {
-            // TODO: Enter will open commit diff view in a future task
+        |cx, entry: &LogEntry, _action| {
+            let hash = entry.hash.clone();
+            let subject = entry.subject.clone();
+            let cwd = helix_stdx::env::current_working_dir();
+
+            let files = match git::get_commit_files(&cwd, &hash) {
+                Ok(files) if files.is_empty() => {
+                    cx.editor.set_status("No files changed in this commit");
+                    return;
+                }
+                Ok(files) => files,
+                Err(err) => {
+                    cx.editor
+                        .set_error(format!("Failed to get commit files: {}", err));
+                    return;
+                }
+            };
+
+            let entries: Vec<CommitFileEntry> = files
+                .into_iter()
+                .map(|(status, path, adds, dels)| CommitFileEntry {
+                    status,
+                    path,
+                    additions: adds,
+                    deletions: dels,
+                    commit_hash: hash.clone(),
+                    commit_subject: subject.clone(),
+                })
+                .collect();
+
+            // Schedule the commit file picker to be pushed after the log picker closes
+            cx.jobs.callback(async move {
+                Ok(job::Callback::EditorCompositor(Box::new(
+                    move |_editor, compositor| {
+                        let cwd_for_preview = helix_stdx::env::current_working_dir();
+
+                        let columns = [
+                            PickerColumn::new(
+                                "status",
+                                |entry: &CommitFileEntry, _data: &()| {
+                                    let color = match entry.status.as_str() {
+                                        "A" => helix_view::graphics::Color::Green,
+                                        "D" => helix_view::graphics::Color::Red,
+                                        "M" => helix_view::graphics::Color::Yellow,
+                                        "R" => helix_view::graphics::Color::Cyan,
+                                        _ => helix_view::graphics::Color::White,
+                                    };
+                                    Span::styled(
+                                        entry.status.clone(),
+                                        Style::default().fg(color),
+                                    )
+                                    .into()
+                                },
+                            ),
+                            PickerColumn::new(
+                                "path",
+                                |entry: &CommitFileEntry, _data: &()| {
+                                    entry.path.clone().into()
+                                },
+                            ),
+                            PickerColumn::new(
+                                "stats",
+                                |entry: &CommitFileEntry, _data: &()| {
+                                    let stats =
+                                        format!("+{} -{}", entry.additions, entry.deletions);
+                                    Span::styled(
+                                        stats,
+                                        Style::default()
+                                            .fg(helix_view::graphics::Color::Gray),
+                                    )
+                                    .into()
+                                },
+                            ),
+                        ];
+
+                        let picker = Picker::new(
+                            columns,
+                            1, // path column for fuzzy search
+                            [],
+                            (),
+                            |_cx, _entry: &CommitFileEntry, _action| {
+                                // Opening a full diff view on Enter is reserved for a future task
+                            },
+                        )
+                        .with_custom_preview(move |_editor, entry: &CommitFileEntry| {
+                            let cwd = helix_stdx::env::current_working_dir();
+                            match git::get_commit_file_diff(
+                                &cwd,
+                                &entry.commit_hash,
+                                &entry.path,
+                            ) {
+                                Ok(diff_text) if !diff_text.is_empty() => {
+                                    Some(CachedPreview::CustomText {
+                                        content: diff_text,
+                                        is_diff: true,
+                                    })
+                                }
+                                Ok(_) => Some(CachedPreview::CustomText {
+                                    content: format!(
+                                        "No diff available for {}",
+                                        entry.path
+                                    ),
+                                    is_diff: false,
+                                }),
+                                Err(_) => Some(CachedPreview::CustomText {
+                                    content: format!(
+                                        "Failed to load diff for {}",
+                                        entry.path
+                                    ),
+                                    is_diff: false,
+                                }),
+                            }
+                        });
+
+                        let injector = picker.injector();
+                        for entry in &entries {
+                            if injector.push(entry.clone()).is_err() {
+                                break;
+                            }
+                        }
+
+                        compositor.push(Box::new(overlaid(picker)));
+                    },
+                )))
+            });
         },
     )
     .with_custom_preview(move |_editor, entry: &LogEntry| {
