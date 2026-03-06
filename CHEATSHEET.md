@@ -44,6 +44,7 @@ View the diff for the current file or selected file.
 | Key | Action |
 |-----|--------|
 | `s` | Stage selected hunk (stays in view, shows ✓ staged) |
+| `u` | Unstage selected hunk (stays in view, removes ✓) |
 | `r` | Revert selected hunk (confirms first) |
 | `R` | Reload file from disk |
 

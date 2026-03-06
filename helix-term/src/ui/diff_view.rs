@@ -1571,7 +1571,66 @@ impl DiffView {
             }
         }
 
+        // Detect which hunks are already staged
+        view.detect_staged_hunks();
+
         view
+    }
+
+    /// Detect which hunks are already staged by comparing HEAD vs INDEX.
+    ///
+    /// A hunk is considered "staged" if the diff between HEAD and the git index
+    /// contains a hunk with the same `before` range (same lines changed in HEAD).
+    fn detect_staged_hunks(&mut self) {
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+        if self.hunks.is_empty() {
+            return;
+        }
+
+        // Get index (staged) content for this file
+        let index_bytes = match git::get_index_content(&self.absolute_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return, // Can't detect staged hunks without index content
+        };
+
+        let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        // Wrapper for RopeSlice to implement TokenSource (needed for imara_diff)
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+
+            fn estimate_tokens(&self) -> u32 {
+                self.0.len_lines() as u32
+            }
+        }
+
+        // Compute diff between HEAD (diff_base) and INDEX to find staged changes
+        let input = InternedInput::new(
+            RopeLines(self.diff_base.slice(..)),
+            RopeLines(index_rope.slice(..)),
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let staged_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        // A hunk is staged if a staged hunk has the exact same `before` range
+        for (i, hunk) in self.hunks.iter().enumerate() {
+            for staged_hunk in &staged_hunks {
+                if staged_hunk.before.start == hunk.before.start
+                    && staged_hunk.before.end == hunk.before.end
+                {
+                    self.staged_hunks.insert(i);
+                    break;
+                }
+            }
+        }
     }
 
     /// Find the hunk whose `after.start` is closest to the cursor line
@@ -3808,6 +3867,45 @@ impl Component for DiffView {
                             }
                             Err(e) => {
                                 cx.editor.set_error(format!("Failed to stage hunk: {}", e));
+                            }
+                        }
+                        return EventResult::Consumed(None);
+                    }
+                }
+                KeyCode::Char('u') => {
+                    // Unstage the selected hunk
+                    if !self.hunks.is_empty() {
+                        let selected = self.selected_hunk.min(self.hunks.len().saturating_sub(1));
+
+                        // Only unstage if the hunk is currently staged
+                        if !self.staged_hunks.contains(&selected) {
+                            cx.editor.set_status("Hunk is not staged");
+                            return EventResult::Consumed(None);
+                        }
+
+                        let hunk = self.hunks[selected].clone();
+                        let patch = self.generate_hunk_patch(&hunk, ContextSource::Index);
+
+                        if patch.is_empty() {
+                            cx.editor.set_status("Cannot unstage empty hunk");
+                            return EventResult::Consumed(None);
+                        }
+
+                        // Unstage the hunk synchronously
+                        match git::unstage_hunk(&self.absolute_path, &patch) {
+                            Ok(()) => {
+                                // Remove from staged set and stay in the view
+                                self.staged_hunks.remove(&selected);
+                                cx.editor.set_status(format!(
+                                    "Unstaged hunk {}/{} in {}",
+                                    selected + 1,
+                                    self.hunks.len(),
+                                    self.file_name
+                                ));
+                            }
+                            Err(e) => {
+                                cx.editor
+                                    .set_error(format!("Failed to unstage hunk: {}", e));
                             }
                         }
                         return EventResult::Consumed(None);

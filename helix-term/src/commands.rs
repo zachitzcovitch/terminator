@@ -3800,6 +3800,15 @@ pub fn push_git_status_picker_with_selection(
         return;
     }
 
+    // Refresh git status to get current staged/unstaged state
+    let refreshed_files = match git::get_status_porcelain(&cwd, true) {
+        Ok(entries) => entries,
+        Err(_) => files, // Fallback to stale list if refresh fails
+    };
+
+    // Clamp selection index to valid range after refresh
+    let initial_selection = initial_selection.min(refreshed_files.len().saturating_sub(1));
+
     let staged = editor.theme.get("diff.plus");
     let unstaged = editor.theme.get("diff.delta");
     let deleted = editor.theme.get("diff.minus");
@@ -3847,13 +3856,13 @@ pub fn push_git_status_picker_with_selection(
     .with_initial_cursor(initial_selection as u32);
 
     let injector = picker.injector();
-    for entry in &files {
+    for entry in &refreshed_files {
         if injector.push(entry.clone()).is_err() {
             break;
         }
     }
 
-    let git_status_picker = GitStatusPicker::new(picker, cwd, files);
+    let git_status_picker = GitStatusPicker::new(picker, cwd, refreshed_files);
     compositor.push(Box::new(overlaid(git_status_picker)));
 }
 

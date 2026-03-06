@@ -262,6 +262,47 @@ pub fn stage_hunk(file_path: &Path, patch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unstage a hunk by reverse-applying a patch to the index.
+/// Uses `git apply --cached -R` to remove the change from the staging area.
+pub fn unstage_hunk(file_path: &Path, patch: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let file = gix::path::realpath(file_path).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    // Use git apply --cached -R with stdin to reverse-apply the patch
+    // --cached applies to the index, -R reverses the patch
+    let mut child = Command::new("git")
+        .arg("apply")
+        .arg("--cached")
+        .arg("-R") // Reverse apply
+        .arg("--")
+        .arg("-")
+        .current_dir(repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git apply --cached -R")?;
+
+    // Write the patch to stdin
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(patch.as_bytes())?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git apply --cached -R")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git apply --cached -R failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
 /// Commit staged changes with the given message (equivalent to `git commit -m <message>`).
 pub fn commit(cwd: &Path, message: &str) -> Result<()> {
     use std::io::Write;
