@@ -1001,7 +1001,7 @@ use helix_vcs::Hunk;
 use helix_view::editor::Action;
 use helix_view::graphics::{Margin, Rect, Style};
 use helix_view::DocumentId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
@@ -1477,6 +1477,8 @@ pub struct DiffView {
     is_stale: bool,
     /// Detected indentation style (for tab/space mixing warnings)
     indent_style: IndentStyle,
+    /// Set of hunk indices that have been staged in this session
+    staged_hunks: HashSet<usize>,
 }
 
 impl DiffView {
@@ -1535,6 +1537,7 @@ impl DiffView {
             is_modified,
             is_stale,
             indent_style: IndentStyle::Unknown,
+            staged_hunks: HashSet::new(),
         };
 
         view.compute_diff_lines();
@@ -2021,6 +2024,12 @@ impl DiffView {
             // Check if this line is the currently selected line (for cursor indicator)
             let is_selected_line = current_line_index == self.selected_line;
 
+            // Determine if this line belongs to a staged hunk (for visual dimming)
+            let is_staged_hunk = self
+                .hunk_index_for_line(current_line_index)
+                .map(|idx| self.staged_hunks.contains(&idx))
+                .unwrap_or(false);
+
             // Check if this line is part of the selected hunk (for future use)
             let _is_in_selected_hunk = selected_hunk_range
                 .map(|range| current_line_index >= range.start && current_line_index < range.end)
@@ -2077,20 +2086,68 @@ impl DiffView {
                 style_context_base // No change for hunk selection
             };
 
+            // Apply muted/dimmed styles for staged hunks to visually distinguish them
+            // Staged hunks use desaturated colors to indicate they're already in the index
+            let style_plus = if is_staged_hunk {
+                helix_view::graphics::Style {
+                    fg: Some(helix_view::graphics::Color::Rgb(80, 120, 80)), // muted green
+                    bg: Some(helix_view::graphics::Color::Rgb(30, 50, 30)),  // very dark green
+                    ..style_plus
+                }
+            } else {
+                style_plus
+            };
+            let style_minus = if is_staged_hunk {
+                helix_view::graphics::Style {
+                    fg: Some(helix_view::graphics::Color::Rgb(120, 80, 80)), // muted red
+                    bg: Some(helix_view::graphics::Color::Rgb(50, 30, 30)),  // very dark red
+                    ..style_minus
+                }
+            } else {
+                style_minus
+            };
+            let style_context = if is_staged_hunk {
+                helix_view::graphics::Style {
+                    fg: Some(helix_view::graphics::Color::Rgb(80, 80, 80)), // dimmer gray
+                    ..style_context
+                }
+            } else {
+                style_context
+            };
+
             // Create word emphasis styles DERIVED from selection-patched styles
             // Uses darker, more saturated colors + underline for better contrast with comments
-            let style_minus_emph = style_minus.patch(helix_view::graphics::Style {
-                bg: Some(helix_view::graphics::Color::Rgb(140, 40, 40)), // darker saturated red
-                underline_style: Some(UnderlineStyle::Line),
-                add_modifier: Modifier::BOLD | style_minus.add_modifier,
-                ..Default::default()
-            });
-            let style_plus_emph = style_plus.patch(helix_view::graphics::Style {
-                bg: Some(helix_view::graphics::Color::Rgb(40, 140, 40)), // darker saturated green
-                underline_style: Some(UnderlineStyle::Line),
-                add_modifier: Modifier::BOLD | style_plus.add_modifier,
-                ..Default::default()
-            });
+            // For staged hunks, emphasis colors are also muted
+            let style_minus_emph = if is_staged_hunk {
+                style_minus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(90, 40, 40)), // muted dark red
+                    underline_style: Some(UnderlineStyle::Line),
+                    add_modifier: Modifier::BOLD | style_minus.add_modifier,
+                    ..Default::default()
+                })
+            } else {
+                style_minus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(140, 40, 40)), // darker saturated red
+                    underline_style: Some(UnderlineStyle::Line),
+                    add_modifier: Modifier::BOLD | style_minus.add_modifier,
+                    ..Default::default()
+                })
+            };
+            let style_plus_emph = if is_staged_hunk {
+                style_plus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(40, 90, 40)), // muted dark green
+                    underline_style: Some(UnderlineStyle::Line),
+                    add_modifier: Modifier::BOLD | style_plus.add_modifier,
+                    ..Default::default()
+                })
+            } else {
+                style_plus.patch(helix_view::graphics::Style {
+                    bg: Some(helix_view::graphics::Color::Rgb(40, 140, 40)), // darker saturated green
+                    underline_style: Some(UnderlineStyle::Line),
+                    add_modifier: Modifier::BOLD | style_plus.add_modifier,
+                    ..Default::default()
+                })
+            };
 
             // Get syntax highlighting for this line from cache
             // Returns Vec of (byte_start, byte_end, Style) tuples for each highlighted segment
@@ -2132,6 +2189,16 @@ impl DiffView {
                         border_style.patch(helix_view::graphics::Style {
                             bg: style_selected.bg,
                             add_modifier: Modifier::BOLD,
+                            ..Default::default()
+                        })
+                    } else {
+                        border_style
+                    };
+
+                    // Apply blue/cyan tint for staged hunks to distinguish from unstaged
+                    let border_style = if is_staged_hunk {
+                        border_style.patch(helix_view::graphics::Style {
+                            fg: Some(helix_view::graphics::Color::Rgb(100, 160, 200)), // blue-ish
                             ..Default::default()
                         })
                     } else {
@@ -2244,6 +2311,17 @@ impl DiffView {
                             // Build content spans for this line: indentation + text with highlights
                             let mut line_spans = Vec::new();
 
+                            // Add staged indicator on the first context line
+                            if line_idx == 0 && is_staged_hunk {
+                                let staged_style =
+                                    border_style.patch(helix_view::graphics::Style {
+                                        fg: Some(helix_view::graphics::Color::Rgb(100, 180, 220)),
+                                        add_modifier: Modifier::BOLD,
+                                        ..Default::default()
+                                    });
+                                line_spans.push(Span::styled("✓ staged ", staged_style));
+                            }
+
                             // Add indentation (spaces before text)
                             if ctx_line.indent > 0 {
                                 line_spans
@@ -2341,6 +2419,16 @@ impl DiffView {
                         // Single-line rendering (backward compat)
                         // Build content spans first (without box decoration)
                         let mut content_spans = Vec::new();
+
+                        // Add staged indicator at the beginning if this hunk is staged
+                        if is_staged_hunk {
+                            let staged_style = border_style.patch(helix_view::graphics::Style {
+                                fg: Some(helix_view::graphics::Color::Rgb(100, 180, 220)), // bright blue
+                                add_modifier: Modifier::BOLD,
+                                ..Default::default()
+                            });
+                            content_spans.push(Span::styled("✓ staged ", staged_style));
+                        }
 
                         // Add file path at the beginning (relative to cwd)
                         let cwd = helix_stdx::env::current_working_dir();
@@ -3238,6 +3326,14 @@ impl DiffView {
         self.selected_hunk = self.hunk_boundaries.len().saturating_sub(1);
     }
 
+    /// Find which hunk index a diff line belongs to, if any.
+    /// Used to determine staged status during rendering.
+    fn hunk_index_for_line(&self, line_index: usize) -> Option<usize> {
+        self.hunk_boundaries
+            .iter()
+            .position(|boundary| line_index >= boundary.start && line_index < boundary.end)
+    }
+
     /// Generate a unified diff patch for a single hunk
     /// context_source: specifies whether to use working copy (doc) or index (diff_base) for context lines
     fn generate_hunk_patch(&self, hunk: &Hunk, context_source: ContextSource) -> String {
@@ -3679,6 +3775,13 @@ impl Component for DiffView {
                     // Stage the selected hunk
                     if !self.hunks.is_empty() {
                         let selected = self.selected_hunk.min(self.hunks.len().saturating_sub(1));
+
+                        // Skip if already staged
+                        if self.staged_hunks.contains(&selected) {
+                            cx.editor.set_status("Hunk already staged");
+                            return EventResult::Consumed(None);
+                        }
+
                         let hunk = self.hunks[selected].clone();
 
                         // Generate patch for the selected hunk
@@ -3691,36 +3794,23 @@ impl Component for DiffView {
                             return EventResult::Consumed(None);
                         }
 
-                        // Get the absolute file path for stage operation
-                        let absolute_path = self.absolute_path.clone();
-                        let files = self.files.clone();
-                        let file_index = self.file_index;
-
-                        // Create a callback to perform the stage
-                        let file_name = self.file_name.clone();
-                        let stage_fn: Callback =
-                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
-                                // Stage the hunk using git apply --cached
-                                match git::stage_hunk(&absolute_path, &patch) {
-                                    Ok(()) => {
-                                        // Show success message
-                                        cx.editor
-                                            .set_status(format!("Staged hunk in {}", file_name));
-                                    }
-                                    Err(e) => {
-                                        // Show error message
-                                        cx.editor.set_error(format!("Failed to stage hunk: {}", e));
-                                    }
-                                }
-
-                                // Pop the diff view and return to git status picker
-                                compositor.pop();
-                                crate::commands::push_git_status_picker_with_selection(
-                                    cx.editor, compositor, files, file_index,
-                                );
-                            });
-
-                        return EventResult::Consumed(Some(stage_fn));
+                        // Stage the hunk synchronously and stay in the view
+                        match git::stage_hunk(&self.absolute_path, &patch) {
+                            Ok(()) => {
+                                // Mark hunk as staged and stay in the view
+                                self.staged_hunks.insert(selected);
+                                cx.editor.set_status(format!(
+                                    "Staged hunk {}/{} in {}",
+                                    selected + 1,
+                                    self.hunks.len(),
+                                    self.file_name
+                                ));
+                            }
+                            Err(e) => {
+                                cx.editor.set_error(format!("Failed to stage hunk: {}", e));
+                            }
+                        }
+                        return EventResult::Consumed(None);
                     }
                 }
                 KeyCode::Char('n') => {
