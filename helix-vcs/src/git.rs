@@ -915,6 +915,26 @@ pub fn get_commit_files(cwd: &Path, hash: &str) -> Result<Vec<(String, String, u
     Ok(files)
 }
 
+/// Get the content of a file at a specific git revision.
+///
+/// Runs `git show <revision>:<file_path>` and returns the raw bytes.
+/// Returns an empty Vec for revisions where the file doesn't exist (e.g. parent of a newly added file).
+pub fn get_file_at_revision(cwd: &Path, revision: &str, file_path: &str) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("show")
+        .arg(format!("{}:{}", revision, file_path))
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show failed: {}", stderr);
+    }
+
+    Ok(output.stdout)
+}
+
 /// Get the diff for a specific file in a commit.
 pub fn get_commit_file_diff(cwd: &Path, hash: &str, file_path: &str) -> Result<String> {
     let output = Command::new("git")
@@ -1159,6 +1179,65 @@ pub fn stash_drop(cwd: &Path, index: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Get the list of files changed in a stash entry with line stats.
+/// Returns tuples of (status, path, additions, deletions).
+pub fn get_stash_files(cwd: &Path, index: &str) -> Result<Vec<(String, String, usize, usize)>> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("show")
+        .arg("--numstat")
+        .arg(index)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash show --numstat")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash show failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let additions = parts[0].parse::<usize>().unwrap_or(0);
+            let deletions = parts[1].parse::<usize>().unwrap_or(0);
+            let path = parts[2].to_string();
+            // stash show --numstat doesn't provide status; assume modified
+            let status = "M".to_string();
+            files.push((status, path, additions, deletions));
+        }
+    }
+
+    Ok(files)
+}
+
+/// Get the diff for a specific file in a stash entry.
+pub fn get_stash_file_diff(cwd: &Path, index: &str, file_path: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("show")
+        .arg("-p")
+        .arg(index)
+        .arg("--")
+        .arg(file_path)
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute git stash show -p")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash show failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Convert a duration in seconds to a human-readable relative time string.

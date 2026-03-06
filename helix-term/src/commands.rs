@@ -4433,8 +4433,93 @@ fn git_log_picker(cx: &mut Context) {
                             1, // path column for fuzzy search
                             [],
                             (),
-                            |_cx, _entry: &CommitFileEntry, _action| {
-                                // Opening a full diff view on Enter is reserved for a future task
+                            |cx, entry: &CommitFileEntry, _action| {
+                                let hash = entry.commit_hash.clone();
+                                let path = entry.path.clone();
+                                let file_name = entry
+                                    .path
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&entry.path)
+                                    .to_string();
+
+                                cx.jobs.callback(async move {
+                                    Ok(job::Callback::EditorCompositor(Box::new(
+                                        move |editor, compositor| {
+                                            let cwd = helix_stdx::env::current_working_dir();
+
+                                            // Get file content at parent commit (empty for newly added files)
+                                            let parent_rev = format!("{}~1", hash);
+                                            let base_bytes =
+                                                git::get_file_at_revision(&cwd, &parent_rev, &path)
+                                                    .unwrap_or_default();
+                                            let doc_bytes =
+                                                match git::get_file_at_revision(&cwd, &hash, &path) {
+                                                    Ok(bytes) => bytes,
+                                                    Err(e) => {
+                                                        editor.set_error(format!(
+                                                            "Failed to get file content: {}",
+                                                            e
+                                                        ));
+                                                        return;
+                                                    }
+                                                };
+
+                                            let diff_base =
+                                                Rope::from(String::from_utf8_lossy(&base_bytes));
+                                            let doc_text =
+                                                Rope::from(String::from_utf8_lossy(&doc_bytes));
+
+                                            // Compute diff hunks between parent and commit versions
+                                            use imara_diff::{Algorithm, Diff, InternedInput};
+
+                                            struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+                                            impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+                                                type Token = helix_core::RopeSlice<'a>;
+                                                type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+                                                fn tokenize(&self) -> Self::Tokenizer {
+                                                    self.0.lines()
+                                                }
+
+                                                fn estimate_tokens(&self) -> u32 {
+                                                    self.0.len_lines() as u32
+                                                }
+                                            }
+
+                                            let input = InternedInput::new(
+                                                RopeLines(diff_base.slice(..)),
+                                                RopeLines(doc_text.slice(..)),
+                                            );
+                                            let diff = Diff::compute(Algorithm::Histogram, &input);
+                                            let hunks: Vec<Hunk> = diff.hunks().collect();
+
+                                            if hunks.is_empty() {
+                                                editor.set_status("No changes in this file");
+                                                return;
+                                            }
+
+                                            let diff_view = DiffView::new(
+                                                diff_base,
+                                                doc_text,
+                                                hunks,
+                                                file_name,
+                                                PathBuf::from(&path),
+                                                PathBuf::from(&path),
+                                                helix_view::DocumentId::default(),
+                                                None,  // No syntax reuse for historical commits
+                                                0,     // Start at first hunk
+                                                Vec::new(),
+                                                0,
+                                                false, // Not modified (read-only historical view)
+                                                false, // Not stale
+                                            );
+
+                                            compositor.push(Box::new(overlaid(diff_view)));
+                                        },
+                                    )))
+                                });
                             },
                         )
                         .with_custom_preview(move |_editor, entry: &CommitFileEntry| {
@@ -4657,9 +4742,140 @@ impl Component for StashPicker {
                     }
                     return EventResult::Consumed(None);
                 }
-                KeyCode::Enter | KeyCode::Char('p')
-                    if key_event.modifiers.is_empty() =>
-                {
+                KeyCode::Enter if key_event.modifiers.is_empty() => {
+                    // Drill down into stash — show changed files with diff preview
+                    if let Some(entry) = self.selection() {
+                        let index = entry.index.clone();
+                        let message = entry.message.clone();
+                        let cwd = self.cwd.clone();
+
+                        let callback: compositor::Callback = Box::new(
+                            move |compositor: &mut Compositor,
+                                  cx: &mut compositor::Context| {
+                                let files = match git::get_stash_files(&cwd, &index) {
+                                    Ok(files) if files.is_empty() => {
+                                        cx.editor.set_status("No files in stash");
+                                        return;
+                                    }
+                                    Ok(files) => files,
+                                    Err(err) => {
+                                        cx.editor.set_error(format!(
+                                            "Failed to get stash files: {}",
+                                            err
+                                        ));
+                                        return;
+                                    }
+                                };
+
+                                let entries: Vec<CommitFileEntry> = files
+                                    .into_iter()
+                                    .map(|(status, path, adds, dels)| CommitFileEntry {
+                                        status,
+                                        path,
+                                        additions: adds,
+                                        deletions: dels,
+                                        commit_hash: index.clone(),
+                                        commit_subject: message.clone(),
+                                    })
+                                    .collect();
+
+                                let cwd_for_preview = cwd.clone();
+                                let index_for_preview = index.clone();
+
+                                let columns = [
+                                    PickerColumn::new(
+                                        "status",
+                                        |entry: &CommitFileEntry, _data: &()| {
+                                            let color = match entry.status.as_str() {
+                                                "A" => helix_view::graphics::Color::Green,
+                                                "D" => helix_view::graphics::Color::Red,
+                                                "M" => helix_view::graphics::Color::Yellow,
+                                                "R" => helix_view::graphics::Color::Cyan,
+                                                _ => helix_view::graphics::Color::White,
+                                            };
+                                            Span::styled(
+                                                entry.status.clone(),
+                                                Style::default().fg(color),
+                                            )
+                                            .into()
+                                        },
+                                    ),
+                                    PickerColumn::new(
+                                        "path",
+                                        |entry: &CommitFileEntry, _data: &()| {
+                                            entry.path.clone().into()
+                                        },
+                                    ),
+                                    PickerColumn::new(
+                                        "stats",
+                                        |entry: &CommitFileEntry, _data: &()| {
+                                            let stats = format!(
+                                                "+{} -{}",
+                                                entry.additions, entry.deletions
+                                            );
+                                            Span::styled(
+                                                stats,
+                                                Style::default()
+                                                    .fg(helix_view::graphics::Color::Gray),
+                                            )
+                                            .into()
+                                        },
+                                    ),
+                                ];
+
+                                let picker = Picker::new(
+                                    columns,
+                                    1, // path column for fuzzy search
+                                    [],
+                                    (),
+                                    |_cx, _entry: &CommitFileEntry, _action| {},
+                                )
+                                .with_custom_preview(
+                                    move |_editor, entry: &CommitFileEntry| {
+                                        match git::get_stash_file_diff(
+                                            &cwd_for_preview,
+                                            &index_for_preview,
+                                            &entry.path,
+                                        ) {
+                                            Ok(diff_text) if !diff_text.is_empty() => {
+                                                Some(CachedPreview::CustomText {
+                                                    content: diff_text,
+                                                    is_diff: true,
+                                                })
+                                            }
+                                            Ok(_) => Some(CachedPreview::CustomText {
+                                                content: format!(
+                                                    "No diff for {}",
+                                                    entry.path
+                                                ),
+                                                is_diff: false,
+                                            }),
+                                            Err(_) => Some(CachedPreview::CustomText {
+                                                content: format!(
+                                                    "Failed to load diff for {}",
+                                                    entry.path
+                                                ),
+                                                is_diff: false,
+                                            }),
+                                        }
+                                    },
+                                );
+
+                                let injector = picker.injector();
+                                for entry in &entries {
+                                    if injector.push(entry.clone()).is_err() {
+                                        break;
+                                    }
+                                }
+
+                                compositor.push(Box::new(overlaid(picker)));
+                            },
+                        );
+                        return EventResult::Consumed(Some(callback));
+                    }
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Char('p') if key_event.modifiers.is_empty() => {
                     // Pop stash (apply + remove)
                     if let Some(entry) = self.selection() {
                         let index = entry.index.clone();
