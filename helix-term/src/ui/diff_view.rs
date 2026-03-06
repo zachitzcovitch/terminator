@@ -3244,19 +3244,12 @@ impl DiffView {
         let base_len = self.diff_base.len_lines();
         let doc_len = self.doc.len_lines();
 
-        // Determine which rope to use for context lines
-        let context_rope = match context_source {
-            ContextSource::WorkingCopy => &self.doc,
-            ContextSource::Index => &self.diff_base,
-        };
-        let context_len = context_rope.len_lines();
-
-        // Calculate line counts for hunk header
-        let old_count = hunk.before.end.saturating_sub(hunk.before.start);
-        let new_count = hunk.after.end.saturating_sub(hunk.after.start);
+        // Raw deletion/addition counts (without context)
+        let del_count = hunk.before.end.saturating_sub(hunk.before.start);
+        let add_count = hunk.after.end.saturating_sub(hunk.after.start);
 
         // Skip empty hunks
-        if old_count == 0 && new_count == 0 {
+        if del_count == 0 && add_count == 0 {
             return String::new();
         }
 
@@ -3269,29 +3262,66 @@ impl DiffView {
             .replace('\r', "\\r")
             .replace('\t', "\\t");
 
-        // Note: imara-diff uses 0-indexed, but unified diff format typically uses 1-indexed
-        let old_start = hunk.before.start + 1;
-        let new_start = hunk.after.start + 1;
-
-        let mut patch = format!(
-            "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
-            escaped_file_path, escaped_file_path, old_start, old_count, new_start, new_count
-        );
-
         // Helper to strip line endings from Rope line content
         let strip_line_ending = |content: helix_core::RopeSlice| -> String {
             let s = content.as_str().unwrap_or("");
             s.trim_end_matches('\n').trim_end_matches('\r').to_string()
         };
 
-        // Context before: 3 lines from context source before hunk.after.start
-        let context_before_start = (hunk.after.start as usize).saturating_sub(3);
-        let context_before_end = hunk.after.start as usize;
-        for line_num in context_before_start..context_before_end {
-            if line_num >= context_len {
-                break;
-            }
-            let content = context_rope.line(line_num);
+        // Context source determines which rope provides context lines and which
+        // side's ranges to use for context boundaries:
+        // - Staging (Index): patch applies to the index, so context must match
+        //   diff_base; ranges come from hunk.before (the old/index side)
+        // - Revert (WorkingCopy): patch applies reversed to working copy, so
+        //   context must match doc; ranges come from hunk.after (the new/doc side)
+        let (ctx_hunk_start, ctx_hunk_end, ctx_rope, ctx_len) = match context_source {
+            ContextSource::Index => (
+                hunk.before.start as usize,
+                hunk.before.end as usize,
+                &self.diff_base,
+                base_len,
+            ),
+            ContextSource::WorkingCopy => (
+                hunk.after.start as usize,
+                hunk.after.end as usize,
+                &self.doc,
+                doc_len,
+            ),
+        };
+
+        // Calculate context ranges (clamped to file bounds)
+        let ctx_before_start = ctx_hunk_start.saturating_sub(3).min(ctx_len);
+        let ctx_before_end = ctx_hunk_start.min(ctx_len);
+        let ctx_before_count = ctx_before_end - ctx_before_start;
+
+        let ctx_after_start = ctx_hunk_end.min(ctx_len);
+        let ctx_after_end = (ctx_hunk_end + 3).min(ctx_len);
+        let ctx_after_count = ctx_after_end - ctx_after_start;
+
+        // Line counts for the hunk header must include context lines
+        let old_total = ctx_before_count + del_count as usize + ctx_after_count;
+        let new_total = ctx_before_count + add_count as usize + ctx_after_count;
+
+        // Start lines (1-indexed, accounting for context before)
+        let old_start = if ctx_before_count > 0 {
+            (hunk.before.start as usize).saturating_sub(ctx_before_count) + 1
+        } else {
+            hunk.before.start as usize + 1
+        };
+        let new_start = if ctx_before_count > 0 {
+            (hunk.after.start as usize).saturating_sub(ctx_before_count) + 1
+        } else {
+            hunk.after.start as usize + 1
+        };
+
+        let mut patch = format!(
+            "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+            escaped_file_path, escaped_file_path, old_start, old_total, new_start, new_total
+        );
+
+        // Context before: lines from context rope before the changed region
+        for line_num in ctx_before_start..ctx_before_end {
+            let content = ctx_rope.line(line_num);
             patch.push_str(&format!(" {}\n", strip_line_ending(content)));
         }
 
@@ -3313,10 +3343,9 @@ impl DiffView {
             patch.push_str(&format!("+{}\n", strip_line_ending(content)));
         }
 
-        // Context after: 3 lines from context source after hunk.after.end
-        let context_after_end = (hunk.after.end.saturating_add(3) as usize).min(context_len);
-        for line_num in hunk.after.end as usize..context_after_end {
-            let content = context_rope.line(line_num);
+        // Context after: lines from context rope after the changed region
+        for line_num in ctx_after_start..ctx_after_end {
+            let content = ctx_rope.line(line_num);
             patch.push_str(&format!(" {}\n", strip_line_ending(content)));
         }
 
@@ -4657,10 +4686,10 @@ mod diff_view_tests {
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
 
-        // Line numbers in hunk header should be 1-indexed
+        // Line numbers in hunk header should be 1-indexed and include context lines in counts
         assert!(
-            patch.contains("@@ -2,1 +2,1 @@"),
-            "Hunk header should use 1-indexed line numbers, got: {}",
+            patch.contains("@@ -1,4 +1,4 @@"),
+            "Hunk header should include context lines in counts, got: {}",
             patch
         );
     }
