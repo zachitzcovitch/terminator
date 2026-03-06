@@ -43,7 +43,7 @@ View the diff for the current file or selected file.
 ### Hunk Actions
 | Key | Action |
 |-----|--------|
-| `s` | Stage selected hunk |
+| `s` | Stage selected hunk (stays in view, shows ✓ staged) |
 | `r` | Revert selected hunk (confirms first) |
 | `R` | Reload file from disk |
 
@@ -53,6 +53,7 @@ View the diff for the current file or selected file.
 - **Function context** - Hunk headers show containing function/class
 - **Line numbers** - Both old and new line numbers displayed
 - **3-line box decoration** - Delta-style hunk headers
+- **Staged hunk indicators** - Staged hunks shown dimmed with ✓ badge
 
 ---
 
