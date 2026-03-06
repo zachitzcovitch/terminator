@@ -848,6 +848,121 @@ pub fn get_commit_diff(cwd: &Path, hash: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Get blame information for a file.
+/// Parses `git blame --porcelain` output into structured BlameLine entries.
+pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let work_dir = repo.workdir().context("bare repository has no worktree")?;
+    let rela_path = file.strip_prefix(work_dir)?;
+
+    let output = Command::new("git")
+        .arg("blame")
+        .arg("--porcelain")
+        .arg(rela_path)
+        .current_dir(work_dir)
+        .output()
+        .context("failed to execute git blame")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git blame failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+
+    // Parse porcelain format: each block starts with a hash line and ends
+    // with a tab-prefixed content line.
+    let mut current_hash = String::new();
+    let mut current_author = String::new();
+    let mut current_date = String::new();
+    let mut current_line_no: usize = 0;
+    let mut is_boundary = false;
+
+    for line in stdout.lines() {
+        if line.starts_with('\t') {
+            // Content line — ends the current block
+            let content = line[1..].to_string();
+
+            entries.push(crate::status::BlameLine {
+                hash: current_hash.clone(),
+                short_hash: if current_hash.len() >= 7 {
+                    current_hash[..7].to_string()
+                } else {
+                    current_hash.clone()
+                },
+                author: current_author.clone(),
+                date: current_date.clone(),
+                relative_date: String::new(),
+                line_no: current_line_no,
+                content,
+                is_boundary,
+            });
+        } else if let Some(author) = line.strip_prefix("author ") {
+            current_author = author.to_string();
+        } else if let Some(timestamp_str) = line.strip_prefix("author-time ") {
+            if let Ok(timestamp) = timestamp_str.trim().parse::<i64>() {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let diff_secs = now_secs - timestamp;
+
+                current_date = compute_relative_time(diff_secs);
+            }
+        } else if line == "boundary" {
+            is_boundary = true;
+        } else if !line.starts_with("author-")
+            && !line.starts_with("committer")
+            && !line.starts_with("summary ")
+            && !line.starts_with("previous ")
+            && !line.starts_with("filename ")
+            && !line.is_empty()
+        {
+            // Hash line: "<hash> <orig_line> <final_line> [<num_lines>]"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                current_hash = parts[0].to_string();
+                if let Ok(line_no) = parts[2].parse::<usize>() {
+                    current_line_no = line_no;
+                }
+                is_boundary = false;
+            }
+        }
+    }
+
+    // Fill in relative_date from the stored date (already relative)
+    for entry in &mut entries {
+        entry.relative_date = entry.date.clone();
+    }
+
+    Ok(entries)
+}
+
+/// Convert a duration in seconds to a human-readable relative time string.
+fn compute_relative_time(diff_secs: i64) -> String {
+    if diff_secs < 60 {
+        "just now".to_string()
+    } else if diff_secs < 3600 {
+        format!("{} min ago", diff_secs / 60)
+    } else if diff_secs < 86400 {
+        format!("{} hours ago", diff_secs / 3600)
+    } else if diff_secs < 604_800 {
+        format!("{} days ago", diff_secs / 86400)
+    } else if diff_secs < 2_592_000 {
+        format!("{} weeks ago", diff_secs / 604_800)
+    } else if diff_secs < 31_536_000 {
+        format!("{} months ago", diff_secs / 2_592_000)
+    } else {
+        format!("{} years ago", diff_secs / 31_536_000)
+    }
+}
+
 /// Finds the object that contains the contents of a file at a specific commit.
 fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;

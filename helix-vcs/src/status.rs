@@ -62,3 +62,24 @@ pub struct LogEntry {
     /// Relative date (e.g., "2 hours ago")
     pub relative_date: String,
 }
+
+/// Represents a single line of git blame output.
+#[derive(Clone, Debug)]
+pub struct BlameLine {
+    /// Full commit hash
+    pub hash: String,
+    /// Short commit hash (7 chars)
+    pub short_hash: String,
+    /// Author name
+    pub author: String,
+    /// Date in short format (YYYY-MM-DD)
+    pub date: String,
+    /// Relative date (e.g., "2 hours ago")
+    pub relative_date: String,
+    /// Line number in the current file (1-indexed)
+    pub line_no: usize,
+    /// Line content
+    pub content: String,
+    /// Whether this is a boundary commit (root of the file's history)
+    pub is_boundary: bool,
+}

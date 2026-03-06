@@ -61,6 +61,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "." => goto_last_modification,
             "w" => goto_word,
             "v" => diff_view,
+            "B" => git_blame_view,
         },
         ":" => command_mode,
 

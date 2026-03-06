@@ -1,3 +1,4 @@
+pub(crate) mod blame;
 mod completion;
 pub(crate) mod diff_view;
 mod document;
@@ -19,6 +20,7 @@ mod text_decorations;
 use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
+pub use blame::BlameView;
 pub use completion::Completion;
 pub use diff_view::DiffView;
 pub use editor::EditorView;

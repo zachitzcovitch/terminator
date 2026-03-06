@@ -415,6 +415,7 @@ impl MappableCommand {
         changed_file_picker, "Open changed file picker",
         git_status_picker, "Open git status picker",
         git_log_picker, "Open git log picker",
+        git_blame_view, "Open git blame view",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
@@ -4358,6 +4359,51 @@ fn git_log_picker(cx: &mut Context) {
     }
 
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn git_blame_view(cx: &mut Context) {
+    // Extract everything we need from the editor in one block to satisfy the
+    // borrow checker — `current!` borrows `cx.editor` mutably.
+    let (path, file_name, cursor_line, is_modified) = {
+        let (view, doc) = current!(cx.editor);
+        let path = match doc.path() {
+            Some(p) => p.clone(),
+            None => {
+                cx.editor.set_error("Buffer has no file path");
+                return;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        let cursor_line =
+            doc.selection(view.id).primary().cursor_line(doc.text().slice(..)) as usize;
+        let is_modified = doc.is_modified();
+        (path, file_name, cursor_line, is_modified)
+    };
+
+    // Warn about unsaved changes that may cause blame mismatch
+    if is_modified {
+        cx.editor
+            .set_status("⚠ File has unsaved changes — blame may not match");
+    }
+
+    let blame_lines = match git::get_blame(&path) {
+        Ok(lines) if lines.is_empty() => {
+            cx.editor.set_status("No blame data available");
+            return;
+        }
+        Ok(lines) => lines,
+        Err(err) => {
+            cx.editor
+                .set_error(format!("Failed to get blame: {}", err));
+            return;
+        }
+    };
+
+    let blame_view = ui::BlameView::new(blame_lines, file_name, cursor_line);
+    cx.push_layer(Box::new(overlaid(blame_view)));
 }
 
 // Helper function to extract hunk data to avoid borrow issues with cx.editor
