@@ -13,6 +13,150 @@ use std::sync::Arc;
 // Word-Level Diff Highlighting (Delta-style minus-emph/plus-emph)
 // =============================================================================
 
+/// Find trailing whitespace in a line (spaces and tabs at the end before newline)
+/// Returns the byte range (start, end) of trailing whitespace, or None if none exists
+fn find_trailing_whitespace(content: &str) -> Option<(usize, usize)> {
+    let trimmed = content.trim_end_matches(|c| c == ' ' || c == '\t');
+    if trimmed.len() < content.len() {
+        // There is trailing whitespace
+        let start = trimmed.len();
+        let end = content.len();
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// Check if a line is empty (no content, just the diff prefix)
+/// Used to add a visual marker for empty lines (like delta's ⏎)
+fn is_empty_line(content: &str) -> bool {
+    content.is_empty()
+}
+
+// =============================================================================
+// Indentation Style Detection (for tab/space mixing warnings)
+// =============================================================================
+
+/// Detected indentation style in a file
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IndentStyle {
+    /// File uses spaces for indentation
+    Space,
+    /// File uses tabs for indentation
+    Tab,
+    /// File has mixed indentation (no clear majority)
+    Mixed,
+    /// Not enough lines to determine style
+    Unknown,
+}
+
+/// Detect the dominant indentation style in a file
+/// Returns Space, Tab, Mixed, or Unknown based on the most common leading whitespace
+fn detect_indent_style(doc: &Rope) -> IndentStyle {
+    let mut space_count = 0usize;
+    let mut tab_count = 0usize;
+    let mut lines_checked = 0usize;
+
+    for (i, line) in doc.lines().enumerate() {
+        if i > 100 {
+            break;
+        } // Check first 100 lines max
+
+        let line_str = line.to_string();
+        let leading_ws: String = line_str
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+
+        if leading_ws.is_empty() {
+            continue; // Skip lines with no indentation
+        }
+
+        lines_checked += 1;
+
+        if leading_ws.contains('\t') && !leading_ws.contains(' ') {
+            tab_count += 1;
+        } else if leading_ws.contains(' ') && !leading_ws.contains('\t') {
+            space_count += 1;
+        }
+        // Mixed indentation on this line - don't count toward either
+    }
+
+    if lines_checked < 3 {
+        return IndentStyle::Unknown;
+    }
+
+    // Require 2:1 majority to declare a style
+    if space_count > tab_count * 2 {
+        IndentStyle::Space
+    } else if tab_count > space_count * 2 {
+        IndentStyle::Tab
+    } else {
+        IndentStyle::Mixed
+    }
+}
+
+/// Find characters that don't match the file's indentation style
+/// Returns byte ranges of inconsistent characters (tabs in space-indented files, spaces in tab-indented files)
+fn find_inconsistent_indent_chars(content: &str, indent_style: IndentStyle) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    match indent_style {
+        IndentStyle::Space => {
+            // Highlight tabs anywhere in the line
+            let mut pos = 0;
+            for ch in content.chars() {
+                if ch == '\t' {
+                    let start = pos;
+                    let end = pos + 1;
+                    // Merge with previous range if adjacent
+                    if let Some(last) = ranges.last_mut() {
+                        if last.1 == start {
+                            last.1 = end;
+                        } else {
+                            ranges.push((start, end));
+                        }
+                    } else {
+                        ranges.push((start, end));
+                    }
+                }
+                pos += ch.len_utf8();
+            }
+        }
+        IndentStyle::Tab => {
+            // Highlight spaces in leading indentation only
+            let leading_end = content
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count();
+            let leading = &content[..leading_end];
+
+            let mut pos = 0;
+            for ch in leading.chars() {
+                if ch == ' ' {
+                    let start = pos;
+                    let end = pos + 1;
+                    if let Some(last) = ranges.last_mut() {
+                        if last.1 == start {
+                            last.1 = end;
+                        } else {
+                            ranges.push((start, end));
+                        }
+                    } else {
+                        ranges.push((start, end));
+                    }
+                }
+                pos += ch.len_utf8();
+            }
+        }
+        IndentStyle::Mixed | IndentStyle::Unknown => {
+            // Don't highlight anything
+        }
+    }
+
+    ranges
+}
+
 /// Operation type for word-level diff alignment
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WordOp {
@@ -1331,6 +1475,8 @@ pub struct DiffView {
     is_modified: bool,
     /// Whether the file on disk is newer than the buffer (external changes)
     is_stale: bool,
+    /// Detected indentation style (for tab/space mixing warnings)
+    indent_style: IndentStyle,
 }
 
 impl DiffView {
@@ -1388,6 +1534,7 @@ impl DiffView {
             file_index,
             is_modified,
             is_stale,
+            indent_style: IndentStyle::Unknown,
         };
 
         view.compute_diff_lines();
@@ -1483,6 +1630,11 @@ impl DiffView {
                     self.cached_syntax_base = Some(Arc::new(syntax));
                 }
             }
+        }
+
+        // Detect indentation style from the document (for tab/space mixing warnings)
+        if self.indent_style == IndentStyle::Unknown {
+            self.indent_style = detect_indent_style(&self.doc);
         }
 
         // DON'T pre-compute word diffs, highlights, function context
@@ -1720,6 +1872,21 @@ impl DiffView {
             } else {
                 theme_style
             }
+        };
+
+        // Whitespace error style: dark red background to highlight trailing whitespace
+        // Only applied to added lines (not deleted or context) to match delta's behavior
+        let style_whitespace_error = helix_view::graphics::Style {
+            bg: Some(helix_view::graphics::Color::Rgb(139, 0, 0)), // Dark red background
+            ..Default::default()
+        };
+
+        // Inconsistent indentation style: yellow/orange background to highlight tab/space mixing
+        // Applied to additions and context lines (not deletions)
+        // Uses warning color to distinguish from trailing whitespace errors (which are red)
+        let style_indent_warning = helix_view::graphics::Style {
+            bg: Some(helix_view::graphics::Color::Rgb(139, 119, 0)), // Dark yellow/orange background
+            ..Default::default()
         };
 
         // Word emphasis styles are created inline during rendering, derived from the
@@ -2382,6 +2549,64 @@ impl DiffView {
                         }
                     }
 
+                    // Apply inconsistent indentation highlighting for context lines
+                    let indent_ranges =
+                        find_inconsistent_indent_chars(content_str, self.indent_style);
+                    if !indent_ranges.is_empty() {
+                        let mut new_content_spans = Vec::new();
+                        let mut byte_pos = 0;
+
+                        for span in content_spans {
+                            let span_start = byte_pos;
+                            let span_end = byte_pos + span.content.len();
+
+                            // Find all indent ranges that overlap with this span
+                            let mut span_parts: Vec<(usize, usize, bool)> = Vec::new();
+                            let mut pos = 0;
+
+                            for (range_start, range_end) in &indent_ranges {
+                                if *range_end <= span_start || *range_start >= span_end {
+                                    continue;
+                                }
+
+                                let rel_start = (*range_start).saturating_sub(span_start);
+                                let rel_end = (*range_end)
+                                    .saturating_sub(span_start)
+                                    .min(span.content.len());
+
+                                if rel_start > pos {
+                                    span_parts.push((pos, rel_start, false));
+                                }
+                                span_parts.push((rel_start, rel_end, true));
+                                pos = rel_end;
+                            }
+
+                            if pos < span.content.len() {
+                                span_parts.push((pos, span.content.len(), false));
+                            }
+
+                            if span_parts.is_empty() {
+                                new_content_spans.push(span);
+                            } else {
+                                for (start, end, is_indent_warning) in span_parts {
+                                    if end > start {
+                                        let text = span.content[start..end].to_string();
+                                        let style = if is_indent_warning {
+                                            span.style.patch(style_indent_warning)
+                                        } else {
+                                            span.style
+                                        };
+                                        new_content_spans.push(Span::styled(text, style));
+                                    }
+                                }
+                            }
+
+                            byte_pos = span_end;
+                        }
+
+                        content_spans = new_content_spans;
+                    }
+
                     // Build full line: line numbers + separator + content
                     // Issue 3: Add separator for consistent indentation
                     // Context lines: NNNN NNNN  │ content (2 spaces before │ to align at position 10)
@@ -2393,6 +2618,12 @@ impl DiffView {
                         Span::styled(" ", style_context),
                     ];
                     all_spans.extend(content_spans);
+
+                    // Add empty line marker for truly empty lines
+                    if is_empty_line(content_str) {
+                        let marker_style = cx.editor.theme.get("ui.virtual.whitespace");
+                        all_spans.push(Span::styled("⏎", marker_style));
+                    }
 
                     Spans::from(all_spans)
                 }
@@ -2539,6 +2770,12 @@ impl DiffView {
                     // Extend with individual content spans to preserve styling
                     all_spans.extend(content_spans);
 
+                    // Add empty line marker for truly empty lines
+                    if is_empty_line(content_str) {
+                        let marker_style = cx.editor.theme.get("ui.virtual.whitespace");
+                        all_spans.push(Span::styled("⏎", marker_style));
+                    }
+
                     Spans::from(all_spans)
                 }
                 DiffLine::Addition { doc_line, content } => {
@@ -2671,6 +2908,137 @@ impl DiffView {
                     let content_width = content_area.width.saturating_sub(12) as usize;
                     let display_width = content.width().min(content_width);
 
+                    // Apply trailing whitespace highlighting (only for added lines)
+                    // Check if the content has trailing whitespace and highlight it
+                    if let Some((ws_start, ws_end)) = find_trailing_whitespace(content_str) {
+                        // We need to split the last span(s) to highlight trailing whitespace
+                        // Iterate through spans and track byte position to find which spans contain the trailing whitespace
+                        let mut new_content_spans = Vec::new();
+                        let mut byte_pos = 0;
+
+                        for span in content_spans {
+                            let span_start = byte_pos;
+                            let span_end = byte_pos + span.content.len();
+
+                            if span_end <= ws_start {
+                                // This span is entirely before the trailing whitespace
+                                new_content_spans.push(span);
+                            } else if span_start >= ws_end {
+                                // This span is entirely after the trailing whitespace (shouldn't happen)
+                                new_content_spans.push(span);
+                            } else {
+                                // This span overlaps with trailing whitespace
+                                // Calculate the relative positions within this span
+                                let ws_rel_start = ws_start.saturating_sub(span_start);
+                                let ws_rel_end =
+                                    ws_end.saturating_sub(span_start).min(span.content.len());
+
+                                // Part before trailing whitespace
+                                if ws_rel_start > 0 {
+                                    new_content_spans.push(Span::styled(
+                                        span.content[..ws_rel_start].to_string(),
+                                        span.style,
+                                    ));
+                                }
+
+                                // Trailing whitespace with error style (patched onto existing style)
+                                if ws_rel_end > ws_rel_start {
+                                    let ws_error_style = span.style.patch(style_whitespace_error);
+                                    new_content_spans.push(Span::styled(
+                                        span.content[ws_rel_start..ws_rel_end].to_string(),
+                                        ws_error_style,
+                                    ));
+                                }
+
+                                // Part after trailing whitespace (shouldn't exist, but handle it)
+                                if ws_rel_end < span.content.len() {
+                                    new_content_spans.push(Span::styled(
+                                        span.content[ws_rel_end..].to_string(),
+                                        span.style,
+                                    ));
+                                }
+                            }
+
+                            byte_pos = span_end;
+                        }
+
+                        content_spans = new_content_spans;
+                    }
+
+                    // Apply inconsistent indentation highlighting (tabs in space-indented files, spaces in tab-indented files)
+                    // Only for additions and context lines (not deletions)
+                    let mut indent_ranges =
+                        find_inconsistent_indent_chars(content_str, self.indent_style);
+
+                    // Filter out indent ranges that overlap with trailing whitespace
+                    // Trailing whitespace errors take precedence over indent warnings
+                    if let Some((ws_start, ws_end)) = find_trailing_whitespace(content_str) {
+                        indent_ranges.retain(|(start, end)| *end <= ws_start || *start >= ws_end);
+                    }
+
+                    if !indent_ranges.is_empty() {
+                        // We need to split spans to highlight inconsistent indentation
+                        let mut new_content_spans = Vec::new();
+                        let mut byte_pos = 0;
+
+                        for span in content_spans {
+                            let span_start = byte_pos;
+                            let span_end = byte_pos + span.content.len();
+
+                            // Find all indent ranges that overlap with this span
+                            let mut span_parts: Vec<(usize, usize, bool)> = Vec::new();
+                            let mut pos = 0;
+
+                            for (range_start, range_end) in &indent_ranges {
+                                // Skip ranges that don't overlap with this span
+                                if *range_end <= span_start || *range_start >= span_end {
+                                    continue;
+                                }
+
+                                // Calculate relative positions within this span
+                                let rel_start = (*range_start).saturating_sub(span_start);
+                                let rel_end = (*range_end)
+                                    .saturating_sub(span_start)
+                                    .min(span.content.len());
+
+                                // Add gap before this range
+                                if rel_start > pos {
+                                    span_parts.push((pos, rel_start, false));
+                                }
+                                // Add the range itself
+                                span_parts.push((rel_start, rel_end, true));
+                                pos = rel_end;
+                            }
+
+                            // Add trailing part after last range
+                            if pos < span.content.len() {
+                                span_parts.push((pos, span.content.len(), false));
+                            }
+
+                            // If no overlapping ranges, keep the span as-is
+                            if span_parts.is_empty() {
+                                new_content_spans.push(span);
+                            } else {
+                                // Split the span into parts
+                                for (start, end, is_indent_warning) in span_parts {
+                                    if end > start {
+                                        let text = span.content[start..end].to_string();
+                                        let style = if is_indent_warning {
+                                            span.style.patch(style_indent_warning)
+                                        } else {
+                                            span.style
+                                        };
+                                        new_content_spans.push(Span::styled(text, style));
+                                    }
+                                }
+                            }
+
+                            byte_pos = span_end;
+                        }
+
+                        content_spans = new_content_spans;
+                    }
+
                     // Issue 3: Add padding and separator for consistent indentation
                     // Addition lines:      NNNN+ │ content (5 spaces padding + separator)
                     let mut all_spans = vec![
@@ -2683,6 +3051,12 @@ impl DiffView {
 
                     // Extend with individual content spans to preserve styling
                     all_spans.extend(content_spans);
+
+                    // Add empty line marker for truly empty lines
+                    if is_empty_line(content_str) {
+                        let marker_style = cx.editor.theme.get("ui.virtual.whitespace");
+                        all_spans.push(Span::styled("⏎", marker_style));
+                    }
 
                     Spans::from(all_spans)
                 }
