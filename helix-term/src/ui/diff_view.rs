@@ -3400,7 +3400,7 @@ impl Component for DiffView {
 
                             // Re-push the git status picker with the correct selection
                             crate::commands::push_git_status_picker_with_selection(
-                                cx,
+                                cx.editor,
                                 compositor,
                                 files.clone(),
                                 file_index,
@@ -3611,6 +3611,8 @@ impl Component for DiffView {
                         let absolute_path = self.absolute_path.clone();
                         let file_name = self.file_name.clone();
                         let has_unsaved = self.is_modified;
+                        let files = self.files.clone();
+                        let file_index = self.file_index;
 
                         // Always show confirmation for destructive revert operation
                         let prompt_msg = if has_unsaved {
@@ -3622,8 +3624,8 @@ impl Component for DiffView {
                             format!("Revert hunk in '{}'? [y/N]", file_name)
                         };
 
-                        let callback: Callback =
-                            Box::new(move |compositor: &mut Compositor, _cx: &mut Context| {
+                        let callback: Callback = Box::new(
+                            move |compositor: &mut Compositor, _cx: &mut Context| {
                                 let prompt = Prompt::new(
                                     prompt_msg.into(),
                                     None,
@@ -3650,18 +3652,26 @@ impl Component for DiffView {
                                                 }
                                             }
 
-                                            // Close the diff view
+                                            // Pop the diff view (prompt auto-closes itself)
+                                            // and return to the git status picker
+                                            let files = files.clone();
                                             job::dispatch_blocking(
-                                                |_editor, compositor: &mut Compositor| {
-                                                    compositor.pop(); // Pop the prompt
+                                                move |editor, compositor: &mut Compositor| {
                                                     compositor.pop(); // Pop the diff view
+                                                    crate::commands::push_git_status_picker_with_selection(
+                                                        editor,
+                                                        compositor,
+                                                        files,
+                                                        file_index,
+                                                    );
                                                 },
                                             );
                                         }
                                     },
                                 );
                                 compositor.push(Box::new(prompt));
-                            });
+                            },
+                        );
                         return EventResult::Consumed(Some(callback));
                     }
                 }
@@ -3683,6 +3693,8 @@ impl Component for DiffView {
 
                         // Get the absolute file path for stage operation
                         let absolute_path = self.absolute_path.clone();
+                        let files = self.files.clone();
+                        let file_index = self.file_index;
 
                         // Create a callback to perform the stage
                         let file_name = self.file_name.clone();
@@ -3701,8 +3713,11 @@ impl Component for DiffView {
                                     }
                                 }
 
-                                // Pop the diff view overlay
+                                // Pop the diff view and return to git status picker
                                 compositor.pop();
+                                crate::commands::push_git_status_picker_with_selection(
+                                    cx.editor, compositor, files, file_index,
+                                );
                             });
 
                         return EventResult::Consumed(Some(stage_fn));
@@ -3964,10 +3979,9 @@ impl Component for DiffView {
                                                 }
                                             }
 
-                                            // Close the diff view - user will need to reopen it to see updated diff
+                                            // Pop the diff view (prompt auto-closes itself)
                                             job::dispatch_blocking(
                                                 |_editor, compositor: &mut Compositor| {
-                                                    compositor.pop(); // Pop the prompt
                                                     compositor.pop(); // Pop the diff view
                                                 },
                                             );

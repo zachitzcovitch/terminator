@@ -3789,26 +3789,25 @@ pub(crate) fn make_git_status_picker_callback() -> std::pin::Pin<Box<dyn std::fu
 /// Push a git status picker with a specific file list and selection.
 /// This is used when returning from DiffView to restore the picker state.
 pub fn push_git_status_picker_with_selection(
-    cx: &mut compositor::Context,
+    editor: &mut Editor,
     compositor: &mut Compositor,
     files: Vec<StatusEntry>,
     initial_selection: usize,
 ) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
-        cx.editor.set_error("Current working directory does not exist");
+        editor.set_error("Current working directory does not exist");
         return;
     }
 
-    let staged = cx.editor.theme.get("diff.plus");
-    let unstaged = cx.editor.theme.get("diff.delta");
-    let deleted = cx.editor.theme.get("diff.minus");
-    let untracked = cx.editor.theme.get("diff.delta.moved");
-    let conflict = cx.editor.theme.get("diff.delta.conflict");
+    let staged = editor.theme.get("diff.plus");
+    let unstaged = editor.theme.get("diff.delta");
+    let deleted = editor.theme.get("diff.minus");
+    let untracked = editor.theme.get("diff.delta.moved");
+    let conflict = editor.theme.get("diff.delta.conflict");
 
     // Collect paths of documents with unsaved changes
-    let modified_paths: HashSet<PathBuf> = cx
-        .editor
+    let modified_paths: HashSet<PathBuf> = editor
         .documents
         .values()
         .filter(|doc| doc.is_modified())
