@@ -80,6 +80,8 @@ pub struct BlameLine {
     pub line_no: usize,
     /// Line content
     pub content: String,
+    /// Commit subject (first line of commit message)
+    pub subject: String,
     /// Whether this is a boundary commit (root of the file's history)
     pub is_boundary: bool,
 }

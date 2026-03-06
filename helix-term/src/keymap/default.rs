@@ -61,7 +61,6 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "." => goto_last_modification,
             "w" => goto_word,
             "v" => diff_view,
-            "B" => git_blame_view,
         },
         ":" => command_mode,
 
@@ -240,7 +239,6 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => { "Git"
                 "s" => git_status_picker,
                 "l" => git_log_picker,
-                "b" => git_blame_view,
                 "t" => git_stash_picker,
             },
             "\\" => hunk_picker,

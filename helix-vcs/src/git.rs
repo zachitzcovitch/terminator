@@ -852,32 +852,30 @@ pub fn get_commit_diff(cwd: &Path, hash: &str) -> Result<String> {
 /// Returns tuples of (status, file_path, additions, deletions).
 pub fn get_commit_files(cwd: &Path, hash: &str) -> Result<Vec<(String, String, usize, usize)>> {
     let output = Command::new("git")
-        .arg("diff-tree")
-        .arg("--no-commit-id")
-        .arg("-r")
+        .arg("show")
         .arg("--numstat")
+        .arg("--format=")
         .arg(hash)
         .current_dir(cwd)
         .output()
-        .context("failed to execute git diff-tree --numstat")?;
+        .context("failed to execute git show --numstat")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git diff-tree failed: {}", stderr);
+        bail!("git show --numstat failed: {}", stderr);
     }
 
     let numstat_stdout = String::from_utf8_lossy(&output.stdout);
 
     // Also get name-status for the change type (A/M/D/R)
     let status_output = Command::new("git")
-        .arg("diff-tree")
-        .arg("--no-commit-id")
-        .arg("-r")
+        .arg("show")
         .arg("--name-status")
+        .arg("--format=")
         .arg(hash)
         .current_dir(cwd)
         .output()
-        .context("failed to execute git diff-tree --name-status")?;
+        .context("failed to execute git show --name-status")?;
 
     let status_stdout = String::from_utf8_lossy(&status_output.stdout);
 
@@ -988,6 +986,7 @@ pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
     let mut current_hash = String::new();
     let mut current_author = String::new();
     let mut current_date = String::new();
+    let mut current_subject = String::new();
     let mut current_line_no: usize = 0;
     let mut is_boundary = false;
 
@@ -1008,8 +1007,11 @@ pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
                 relative_date: String::new(),
                 line_no: current_line_no,
                 content,
+                subject: current_subject.clone(),
                 is_boundary,
             });
+        } else if let Some(summary) = line.strip_prefix("summary ") {
+            current_subject = summary.to_string();
         } else if let Some(author) = line.strip_prefix("author ") {
             current_author = author.to_string();
         } else if let Some(timestamp_str) = line.strip_prefix("author-time ") {
@@ -1026,7 +1028,6 @@ pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
             is_boundary = true;
         } else if !line.starts_with("author-")
             && !line.starts_with("committer")
-            && !line.starts_with("summary ")
             && !line.starts_with("previous ")
             && !line.starts_with("filename ")
             && !line.is_empty()

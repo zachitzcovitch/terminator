@@ -5,7 +5,7 @@ use crate::ui::{Prompt, PromptEvent};
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::tree_sitter::Node;
 use helix_core::{unicode::width::UnicodeWidthStr, Rope};
-use helix_vcs::{git, StatusEntry};
+use helix_vcs::{git, BlameLine, StatusEntry};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -1479,6 +1479,10 @@ pub struct DiffView {
     indent_style: IndentStyle,
     /// Set of hunk indices that have been staged in this session
     staged_hunks: HashSet<usize>,
+    /// Cached blame data for the file (loaded lazily on first render)
+    blame_data: Option<Vec<BlameLine>>,
+    /// Whether blame data has been loaded (prevents repeated attempts)
+    blame_loaded: bool,
 }
 
 /// Re-open the diff view for a file after a successful revert.
@@ -1668,6 +1672,8 @@ impl DiffView {
             is_stale,
             indent_style: IndentStyle::Unknown,
             staged_hunks: HashSet::new(),
+            blame_data: None,
+            blame_loaded: false,
         };
 
         view.compute_diff_lines();
@@ -2023,6 +2029,52 @@ impl DiffView {
                     }
                 }
             }
+        }
+    }
+
+    // =========================================================================
+    // Blame Footer Support
+    // =========================================================================
+
+    /// Get the file line number for the currently selected diff line.
+    /// Returns the 1-indexed line number in the working copy (for additions/context)
+    /// or the base file (for deletions). Returns None for hunk headers.
+    fn get_selected_line_number(&self) -> Option<usize> {
+        let diff_line = self.diff_lines.get(self.selected_line)?;
+        match diff_line {
+            DiffLine::Addition { doc_line, .. } => Some(*doc_line as usize),
+            DiffLine::Context {
+                doc_line,
+                base_line,
+                ..
+            } => {
+                // Prefer doc_line (new file), fall back to base_line (old file)
+                if let Some(dl) = doc_line {
+                    Some(*dl as usize)
+                } else {
+                    base_line.map(|bl| bl as usize)
+                }
+            }
+            DiffLine::Deletion { base_line, .. } => Some(*base_line as usize),
+            DiffLine::HunkHeader { .. } => None,
+        }
+    }
+
+    /// Load blame data for the file if not already loaded.
+    /// Only attempts loading once; silently skips if blame fails or path is not absolute.
+    fn load_blame_if_needed(&mut self) {
+        if self.blame_loaded {
+            return;
+        }
+        self.blame_loaded = true;
+
+        if !self.absolute_path.is_absolute() {
+            return;
+        }
+
+        match git::get_blame(&self.absolute_path) {
+            Ok(lines) => self.blame_data = Some(lines),
+            Err(_) => {} // Silently skip if blame fails (e.g., untracked files)
         }
     }
 
@@ -3368,6 +3420,56 @@ impl DiffView {
             rendered_rows += 1;
             line_index += 1;
         }
+
+        // =====================================================================
+        // Blame Footer: show blame info for the selected line at the bottom
+        // =====================================================================
+        self.load_blame_if_needed();
+
+        if let Some(ref blame_data) = self.blame_data {
+            if let Some(line_no) = self.get_selected_line_number() {
+                if let Some(blame) = blame_data.iter().find(|b| b.line_no == line_no) {
+                    // Reserve the last row of the content area for the blame footer
+                    let footer_y = content_area.y + content_area.height.saturating_sub(1);
+
+                    // Only render if footer_y is within the surface bounds
+                    if footer_y < surface.area.y + surface.area.height {
+                        // Truncate subject to fit available width (char-safe)
+                        let max_subject_chars = 40;
+                        let subject: String =
+                            blame.subject.chars().take(max_subject_chars).collect();
+                        let subject = if blame.subject.chars().count() > max_subject_chars {
+                            format!("{}…", subject)
+                        } else {
+                            subject
+                        };
+
+                        let blame_text = format!(
+                            " {} {}, {} • {}",
+                            blame.short_hash, blame.author, blame.relative_date, subject,
+                        );
+
+                        let blame_style = helix_view::graphics::Style {
+                            fg: Some(helix_view::graphics::Color::Rgb(100, 100, 100)),
+                            ..Default::default()
+                        };
+
+                        // Clear the footer row first with the blame style background
+                        for x in content_area.x..content_area.x + content_area.width {
+                            surface.set_string(x, footer_y, " ", blame_style);
+                        }
+
+                        surface.set_stringn(
+                            content_area.x,
+                            footer_y,
+                            &blame_text,
+                            content_area.width as usize,
+                            blame_style,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Get the height (in screen rows) for a HunkHeader line
@@ -3679,24 +3781,31 @@ impl Component for DiffView {
 
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    // Return to git status picker (back navigation)
-                    let files = self.files.clone();
-                    let file_index = self.file_index;
+                    if self.files.is_empty() {
+                        // Opened from log/stash — just pop back to the underlying picker
+                        let back_fn: Callback =
+                            Box::new(move |compositor: &mut Compositor, _cx: &mut Context| {
+                                compositor.pop();
+                            });
+                        return EventResult::Consumed(Some(back_fn));
+                    } else {
+                        // Opened from status picker — pop and re-push refreshed picker
+                        let files = self.files.clone();
+                        let file_index = self.file_index;
 
-                    let back_fn: Callback =
-                        Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
-                            // Pop the diff view
-                            compositor.pop();
+                        let back_fn: Callback =
+                            Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                                compositor.pop();
 
-                            // Re-push the git status picker with the correct selection
-                            crate::commands::push_git_status_picker_with_selection(
-                                cx.editor,
-                                compositor,
-                                files.clone(),
-                                file_index,
-                            );
-                        });
-                    return EventResult::Consumed(Some(back_fn));
+                                crate::commands::push_git_status_picker_with_selection(
+                                    cx.editor,
+                                    compositor,
+                                    files.clone(),
+                                    file_index,
+                                );
+                            });
+                        return EventResult::Consumed(Some(back_fn));
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('K') => {
                     // Move to previous hunk (Shift+k)
