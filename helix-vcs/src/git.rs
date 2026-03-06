@@ -1221,21 +1221,21 @@ pub fn get_stash_files(cwd: &Path, index: &str) -> Result<Vec<(String, String, u
 }
 
 /// Get the diff for a specific file in a stash entry.
+/// Uses `git diff <stash>^..<stash> -- <file>` because `git stash show -p`
+/// does not support per-file filtering via `--`.
 pub fn get_stash_file_diff(cwd: &Path, index: &str, file_path: &str) -> Result<String> {
     let output = Command::new("git")
-        .arg("stash")
-        .arg("show")
-        .arg("-p")
-        .arg(index)
+        .arg("diff")
+        .arg(format!("{}^..{}", index, index))
         .arg("--")
         .arg(file_path)
         .current_dir(cwd)
         .output()
-        .context("failed to execute git stash show -p")?;
+        .context("failed to execute git diff for stash file")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git stash show failed: {}", stderr);
+        bail!("git diff for stash file failed: {}", stderr);
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

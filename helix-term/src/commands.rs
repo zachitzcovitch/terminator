@@ -3612,6 +3612,75 @@ fn contains_binary(rope: &Rope) -> bool {
     false
 }
 
+/// Compute a `CachedPreview::Diff` by fetching file contents at two git revisions.
+///
+/// `parent_rev` is the base revision (e.g. `"abc123~1"` or `"stash@{0}^"`).
+/// `commit_rev` is the target revision (e.g. `"abc123"` or `"stash@{0}"`).
+/// `file_path` is the repo-relative path of the file.
+fn compute_revision_diff_preview(
+    cwd: &std::path::Path,
+    parent_rev: &str,
+    commit_rev: &str,
+    file_path: &str,
+) -> Option<CachedPreview> {
+    use imara_diff::{Algorithm, Diff, InternedInput};
+
+    struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+    impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+        type Token = helix_core::RopeSlice<'a>;
+        type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+        fn tokenize(&self) -> Self::Tokenizer {
+            self.0.lines()
+        }
+
+        fn estimate_tokens(&self) -> u32 {
+            self.0.len_lines() as u32
+        }
+    }
+
+    let base_bytes = git::get_file_at_revision(cwd, parent_rev, file_path).unwrap_or_default();
+    let doc_bytes = match git::get_file_at_revision(cwd, commit_rev, file_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Some(CachedPreview::CustomText {
+                content: format!("Failed to load {}", file_path),
+                is_diff: false,
+            });
+        }
+    };
+
+    let diff_base = Rope::from(String::from_utf8_lossy(&base_bytes));
+    let doc = Rope::from(String::from_utf8_lossy(&doc_bytes));
+
+    // Check for binary content
+    if (diff_base.len_chars() > 0 && contains_binary(&diff_base)) || contains_binary(&doc) {
+        return Some(CachedPreview::CustomText {
+            content: "[Binary file]".to_string(),
+            is_diff: false,
+        });
+    }
+
+    let input = InternedInput::new(RopeLines(diff_base.slice(..)), RopeLines(doc.slice(..)));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    let hunks: Vec<Hunk> = diff.hunks().collect();
+
+    let file_name = file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(file_path)
+        .to_string();
+
+    Some(CachedPreview::Diff {
+        diff_base,
+        doc,
+        hunks,
+        file_path: PathBuf::from(file_path),
+        file_name,
+    })
+}
+
 fn git_status_picker(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
@@ -4286,6 +4355,148 @@ struct CommitFileEntry {
     commit_subject: String,
 }
 
+/// Custom wrapper for commit/stash file pickers that opens DiffView on Enter
+/// without closing the picker (so Escape returns to it).
+struct CommitFilePicker {
+    picker: Picker<CommitFileEntry, ()>,
+}
+
+impl CommitFilePicker {
+    fn new(picker: Picker<CommitFileEntry, ()>) -> Self {
+        Self { picker }
+    }
+
+    fn selection(&self) -> Option<&CommitFileEntry> {
+        self.picker.selection()
+    }
+}
+
+impl Component for CommitFilePicker {
+    fn render(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        frame: &mut tui::buffer::Buffer,
+        cx: &mut compositor::Context,
+    ) {
+        self.picker.render(area, frame, cx);
+    }
+
+    fn handle_event(&mut self, event: &Event, cx: &mut compositor::Context) -> EventResult {
+        if let Event::Key(key_event) = event {
+            if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
+                if let Some(entry) = self.selection() {
+                    let commit_hash = entry.commit_hash.clone();
+                    let path = entry.path.clone();
+                    let file_name = entry
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&entry.path)
+                        .to_string();
+
+                    // Open DiffView on top of this picker (don't close picker)
+                    let callback: compositor::Callback = Box::new(
+                        move |compositor: &mut Compositor, cx: &mut compositor::Context| {
+                            let cwd = helix_stdx::env::current_working_dir();
+
+                            // Get file content at parent commit (empty for newly added files)
+                            let parent_rev = format!("{}~1", commit_hash);
+                            let base_bytes =
+                                git::get_file_at_revision(&cwd, &parent_rev, &path)
+                                    .unwrap_or_default();
+                            let doc_bytes =
+                                match git::get_file_at_revision(&cwd, &commit_hash, &path) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        cx.editor.set_error(format!(
+                                            "Failed to get file content: {}",
+                                            e
+                                        ));
+                                        return;
+                                    }
+                                };
+
+                            let diff_base =
+                                Rope::from(String::from_utf8_lossy(&base_bytes));
+                            let doc_text =
+                                Rope::from(String::from_utf8_lossy(&doc_bytes));
+
+                            // Compute diff hunks between parent and commit versions
+                            use imara_diff::{Algorithm, Diff, InternedInput};
+
+                            struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+                            impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+                                type Token = helix_core::RopeSlice<'a>;
+                                type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+                                fn tokenize(&self) -> Self::Tokenizer {
+                                    self.0.lines()
+                                }
+
+                                fn estimate_tokens(&self) -> u32 {
+                                    self.0.len_lines() as u32
+                                }
+                            }
+
+                            let input = InternedInput::new(
+                                RopeLines(diff_base.slice(..)),
+                                RopeLines(doc_text.slice(..)),
+                            );
+                            let diff = Diff::compute(Algorithm::Histogram, &input);
+                            let hunks: Vec<Hunk> = diff.hunks().collect();
+
+                            if hunks.is_empty() {
+                                cx.editor.set_status("No changes in this file");
+                                return;
+                            }
+
+                            let diff_view = DiffView::new(
+                                diff_base,
+                                doc_text,
+                                hunks,
+                                file_name,
+                                PathBuf::from(&path),
+                                PathBuf::from(&path),
+                                helix_view::DocumentId::default(),
+                                None,
+                                0,
+                                Vec::new(),
+                                0,
+                                false,
+                                false,
+                            );
+
+                            // Push DiffView on top of the file picker
+                            compositor.push(Box::new(overlaid(diff_view)));
+                        },
+                    );
+                    return EventResult::Consumed(Some(callback));
+                }
+                return EventResult::Consumed(None);
+            }
+        }
+        // Delegate all other events to the inner picker
+        self.picker.handle_event(event, cx)
+    }
+
+    fn cursor(
+        &self,
+        area: helix_view::graphics::Rect,
+        editor: &Editor,
+    ) -> (Option<Position>, helix_view::graphics::CursorKind) {
+        self.picker.cursor(area, editor)
+    }
+
+    fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
+        self.picker.required_size(viewport)
+    }
+
+    fn id(&self) -> Option<&'static str> {
+        Some("commit_file_picker")
+    }
+}
+
 fn git_log_picker(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
@@ -4433,123 +4644,18 @@ fn git_log_picker(cx: &mut Context) {
                             1, // path column for fuzzy search
                             [],
                             (),
-                            |cx, entry: &CommitFileEntry, _action| {
-                                let hash = entry.commit_hash.clone();
-                                let path = entry.path.clone();
-                                let file_name = entry
-                                    .path
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(&entry.path)
-                                    .to_string();
-
-                                cx.jobs.callback(async move {
-                                    Ok(job::Callback::EditorCompositor(Box::new(
-                                        move |editor, compositor| {
-                                            let cwd = helix_stdx::env::current_working_dir();
-
-                                            // Get file content at parent commit (empty for newly added files)
-                                            let parent_rev = format!("{}~1", hash);
-                                            let base_bytes =
-                                                git::get_file_at_revision(&cwd, &parent_rev, &path)
-                                                    .unwrap_or_default();
-                                            let doc_bytes =
-                                                match git::get_file_at_revision(&cwd, &hash, &path) {
-                                                    Ok(bytes) => bytes,
-                                                    Err(e) => {
-                                                        editor.set_error(format!(
-                                                            "Failed to get file content: {}",
-                                                            e
-                                                        ));
-                                                        return;
-                                                    }
-                                                };
-
-                                            let diff_base =
-                                                Rope::from(String::from_utf8_lossy(&base_bytes));
-                                            let doc_text =
-                                                Rope::from(String::from_utf8_lossy(&doc_bytes));
-
-                                            // Compute diff hunks between parent and commit versions
-                                            use imara_diff::{Algorithm, Diff, InternedInput};
-
-                                            struct RopeLines<'a>(helix_core::RopeSlice<'a>);
-
-                                            impl<'a> imara_diff::TokenSource for RopeLines<'a> {
-                                                type Token = helix_core::RopeSlice<'a>;
-                                                type Tokenizer = helix_core::ropey::iter::Lines<'a>;
-
-                                                fn tokenize(&self) -> Self::Tokenizer {
-                                                    self.0.lines()
-                                                }
-
-                                                fn estimate_tokens(&self) -> u32 {
-                                                    self.0.len_lines() as u32
-                                                }
-                                            }
-
-                                            let input = InternedInput::new(
-                                                RopeLines(diff_base.slice(..)),
-                                                RopeLines(doc_text.slice(..)),
-                                            );
-                                            let diff = Diff::compute(Algorithm::Histogram, &input);
-                                            let hunks: Vec<Hunk> = diff.hunks().collect();
-
-                                            if hunks.is_empty() {
-                                                editor.set_status("No changes in this file");
-                                                return;
-                                            }
-
-                                            let diff_view = DiffView::new(
-                                                diff_base,
-                                                doc_text,
-                                                hunks,
-                                                file_name,
-                                                PathBuf::from(&path),
-                                                PathBuf::from(&path),
-                                                helix_view::DocumentId::default(),
-                                                None,  // No syntax reuse for historical commits
-                                                0,     // Start at first hunk
-                                                Vec::new(),
-                                                0,
-                                                false, // Not modified (read-only historical view)
-                                                false, // Not stale
-                                            );
-
-                                            compositor.push(Box::new(overlaid(diff_view)));
-                                        },
-                                    )))
-                                });
-                            },
+                            // Enter is handled by CommitFilePicker wrapper
+                            |_cx, _entry: &CommitFileEntry, _action| {},
                         )
                         .with_custom_preview(move |_editor, entry: &CommitFileEntry| {
                             let cwd = helix_stdx::env::current_working_dir();
-                            match git::get_commit_file_diff(
+                            let parent_rev = format!("{}~1", entry.commit_hash);
+                            compute_revision_diff_preview(
                                 &cwd,
+                                &parent_rev,
                                 &entry.commit_hash,
                                 &entry.path,
-                            ) {
-                                Ok(diff_text) if !diff_text.is_empty() => {
-                                    Some(CachedPreview::CustomText {
-                                        content: diff_text,
-                                        is_diff: true,
-                                    })
-                                }
-                                Ok(_) => Some(CachedPreview::CustomText {
-                                    content: format!(
-                                        "No diff available for {}",
-                                        entry.path
-                                    ),
-                                    is_diff: false,
-                                }),
-                                Err(_) => Some(CachedPreview::CustomText {
-                                    content: format!(
-                                        "Failed to load diff for {}",
-                                        entry.path
-                                    ),
-                                    is_diff: false,
-                                }),
-                            }
+                            )
                         });
 
                         let injector = picker.injector();
@@ -4559,7 +4665,8 @@ fn git_log_picker(cx: &mut Context) {
                             }
                         }
 
-                        compositor.push(Box::new(overlaid(picker)));
+                        let commit_file_picker = CommitFilePicker::new(picker);
+                        compositor.push(Box::new(overlaid(commit_file_picker)));
                     },
                 )))
             });
@@ -4832,32 +4939,14 @@ impl Component for StashPicker {
                                 )
                                 .with_custom_preview(
                                     move |_editor, entry: &CommitFileEntry| {
-                                        match git::get_stash_file_diff(
+                                        let parent_rev =
+                                            format!("{}^", index_for_preview);
+                                        compute_revision_diff_preview(
                                             &cwd_for_preview,
+                                            &parent_rev,
                                             &index_for_preview,
                                             &entry.path,
-                                        ) {
-                                            Ok(diff_text) if !diff_text.is_empty() => {
-                                                Some(CachedPreview::CustomText {
-                                                    content: diff_text,
-                                                    is_diff: true,
-                                                })
-                                            }
-                                            Ok(_) => Some(CachedPreview::CustomText {
-                                                content: format!(
-                                                    "No diff for {}",
-                                                    entry.path
-                                                ),
-                                                is_diff: false,
-                                            }),
-                                            Err(_) => Some(CachedPreview::CustomText {
-                                                content: format!(
-                                                    "Failed to load diff for {}",
-                                                    entry.path
-                                                ),
-                                                is_diff: false,
-                                            }),
-                                        }
+                                        )
                                     },
                                 );
 
@@ -4868,7 +4957,8 @@ impl Component for StashPicker {
                                     }
                                 }
 
-                                compositor.push(Box::new(overlaid(picker)));
+                                let commit_file_picker = CommitFilePicker::new(picker);
+                                compositor.push(Box::new(overlaid(commit_file_picker)));
                             },
                         );
                         return EventResult::Consumed(Some(callback));
