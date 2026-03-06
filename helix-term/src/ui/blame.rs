@@ -329,11 +329,19 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
     }
 }
 
-/// Pad or truncate `s` to exactly `width` characters (left-aligned).
+/// Pad or truncate `s` to exactly `width` display characters (left-aligned).
 fn fit_to_width(s: &str, width: usize) -> String {
-    if s.len() > width {
-        s[..width].to_string()
+    let char_count = s.chars().count();
+    if char_count > width {
+        // Truncate to width characters using char boundary
+        let end = s
+            .char_indices()
+            .nth(width)
+            .map(|(idx, _)| idx)
+            .unwrap_or(s.len());
+        s[..end].to_string()
     } else {
+        // Pad with spaces to reach width
         format!("{:<width$}", s, width = width)
     }
 }
