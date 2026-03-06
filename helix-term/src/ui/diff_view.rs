@@ -3612,81 +3612,57 @@ impl Component for DiffView {
                         let file_name = self.file_name.clone();
                         let has_unsaved = self.is_modified;
 
-                        if has_unsaved {
-                            // Show confirmation prompt for unsaved changes
-                            let callback: Callback = Box::new(
-                                move |compositor: &mut Compositor, _cx: &mut Context| {
-                                    let prompt = Prompt::new(
-                                        format!(
-                                            "Revert hunk in '{}'? Unsaved changes will be discarded. [y/N]",
-                                            file_name
-                                        )
-                                        .into(),
-                                        None,
-                                        |_editor: &helix_view::Editor, _input: &str| Vec::new(),
-                                        move |cx: &mut Context, input: &str, event: PromptEvent| {
-                                            if event != PromptEvent::Validate {
-                                                return;
-                                            }
-
-                                            let input = input.trim().to_lowercase();
-                                            if input == "y" || input == "yes" {
-                                                // Proceed with revert
-                                                match git::revert_hunk(&absolute_path, &patch) {
-                                                    Ok(()) => {
-                                                        cx.editor.set_status(format!(
-                                                            "Reverted hunk in {}",
-                                                            file_name
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        cx.editor.set_error(format!(
-                                                            "Failed to revert hunk: {}",
-                                                            e
-                                                        ));
-                                                    }
-                                                }
-
-                                                // Close the diff view
-                                                job::dispatch_blocking(
-                                                    |_editor, compositor: &mut Compositor| {
-                                                        compositor.pop(); // Pop the prompt
-                                                        compositor.pop(); // Pop the diff view
-                                                    },
-                                                );
-                                            }
-                                        },
-                                    );
-                                    compositor.push(Box::new(prompt));
-                                },
-                            );
-                            return EventResult::Consumed(Some(callback));
+                        // Always show confirmation for destructive revert operation
+                        let prompt_msg = if has_unsaved {
+                            format!(
+                                "Revert hunk in '{}'? Unsaved changes will be discarded. [y/N]",
+                                file_name
+                            )
                         } else {
-                            // No unsaved changes - revert directly
-                            let revert_fn: Callback =
-                                Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
-                                    // Revert the hunk using git apply -R
-                                    match git::revert_hunk(&absolute_path, &patch) {
-                                        Ok(()) => {
-                                            // Show success message
-                                            cx.editor.set_status(format!(
-                                                "Reverted hunk in {}",
-                                                file_name
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            // Show error message
-                                            cx.editor
-                                                .set_error(format!("Failed to revert hunk: {}", e));
-                                        }
-                                    }
+                            format!("Revert hunk in '{}'? [y/N]", file_name)
+                        };
 
-                                    // Pop the diff view overlay
-                                    compositor.pop();
-                                });
+                        let callback: Callback =
+                            Box::new(move |compositor: &mut Compositor, _cx: &mut Context| {
+                                let prompt = Prompt::new(
+                                    prompt_msg.into(),
+                                    None,
+                                    |_editor: &helix_view::Editor, _input: &str| Vec::new(),
+                                    move |cx: &mut Context, input: &str, event: PromptEvent| {
+                                        if event != PromptEvent::Validate {
+                                            return;
+                                        }
 
-                            return EventResult::Consumed(Some(revert_fn));
-                        }
+                                        let input = input.trim().to_lowercase();
+                                        if input == "y" || input == "yes" {
+                                            match git::revert_hunk(&absolute_path, &patch) {
+                                                Ok(()) => {
+                                                    cx.editor.set_status(format!(
+                                                        "Reverted hunk in {}",
+                                                        file_name
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    cx.editor.set_error(format!(
+                                                        "Failed to revert hunk: {}",
+                                                        e
+                                                    ));
+                                                }
+                                            }
+
+                                            // Close the diff view
+                                            job::dispatch_blocking(
+                                                |_editor, compositor: &mut Compositor| {
+                                                    compositor.pop(); // Pop the prompt
+                                                    compositor.pop(); // Pop the diff view
+                                                },
+                                            );
+                                        }
+                                    },
+                                );
+                                compositor.push(Box::new(prompt));
+                            });
+                        return EventResult::Consumed(Some(callback));
                     }
                 }
                 KeyCode::Char('s') => {

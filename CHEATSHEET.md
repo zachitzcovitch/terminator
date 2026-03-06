@@ -44,7 +44,7 @@ View the diff for the current file or selected file.
 | Key | Action |
 |-----|--------|
 | `s` | Stage selected hunk |
-| `r` | Revert selected hunk |
+| `r` | Revert selected hunk (confirms first) |
 | `R` | Reload file from disk |
 
 ### Visual Features
