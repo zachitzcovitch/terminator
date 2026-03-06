@@ -107,7 +107,8 @@ Each entry displays the correct diff independently.
 |---------|--------|
 | `Space+g+s` | Open git status picker |
 | `Space+g+l` | Open git log browser |
-| `Space+g+S` | Open git stash picker |
+| `Space+g+t` | Open git stash picker |
+| `Space+g+b` | Open blame view for current file |
 | `gv` | Open diff view for current file |
 | `gB` | Open blame view for current file |
 | `]d` | Go to next diff hunk |
@@ -122,8 +123,8 @@ Browse commit history with diff preview.
 | Key | Action |
 |-----|--------|
 | `j/k` | Navigate commits |
-| `Enter` | (Coming soon) Open commit diff |
-| `y` | (Coming soon) Yank commit hash |
+| `Enter` | Open commit file picker (shows changed files with diff preview) |
+| `y` | Yank commit hash |
 | `q/Esc` | Close |
 
 Preview pane shows commit stat summary.
@@ -148,7 +149,7 @@ Features:
 
 ---
 
-## Git Stash (`Space+g+S`)
+## Git Stash (`Space+g+t`)
 
 Manage git stashes with preview.
 
@@ -180,4 +181,4 @@ Preview pane shows stash diff.
 5. **Partial staging**: Files with both staged and unstaged changes appear twice
 6. **Browse history**: Use `Space+g+l` to explore commit log with stat preview
 7. **Blame a line**: Use `gB` to see who last changed each line
-8. **Stash work**: Use `Space+g+S` to manage stashes, `:stash-push` to create
+8. **Stash work**: Use `Space+g+t` to manage stashes, `:stash-push` to create
