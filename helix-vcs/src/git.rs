@@ -197,8 +197,6 @@ pub fn revert_hunk(file_path: &Path, patch: &str) -> Result<()> {
     let mut child = Command::new("git")
         .arg("apply")
         .arg("-R") // Reverse patch
-        .arg("--")
-        .arg("-")
         .current_dir(repo_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -233,11 +231,11 @@ pub fn stage_hunk(file_path: &Path, patch: &str) -> Result<()> {
 
     // Use git apply --cached with stdin to pass the patch
     // --cached applies the patch to the index (staging area) without modifying the worktree
+    // --unidiff-zero accepts patches with zero context lines, avoiding context mismatch errors
     let mut child = Command::new("git")
         .arg("apply")
         .arg("--cached") // Apply to index (staging area)
-        .arg("--")
-        .arg("-")
+        .arg("--unidiff-zero") // Accept zero-context patches
         .current_dir(repo_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -273,12 +271,12 @@ pub fn unstage_hunk(file_path: &Path, patch: &str) -> Result<()> {
 
     // Use git apply --cached -R with stdin to reverse-apply the patch
     // --cached applies to the index, -R reverses the patch
+    // --unidiff-zero accepts patches with zero context lines, avoiding context mismatch errors
     let mut child = Command::new("git")
         .arg("apply")
         .arg("--cached")
         .arg("-R") // Reverse apply
-        .arg("--")
-        .arg("-")
+        .arg("--unidiff-zero") // Accept zero-context patches
         .current_dir(repo_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -376,6 +374,7 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
     let output = Command::new("git")
         .arg("status")
         .arg("--porcelain=v1")
+        .arg("-uall")
         .current_dir(cwd)
         .output()
         .context("failed to execute git status --porcelain=v1")?;

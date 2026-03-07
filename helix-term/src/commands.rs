@@ -4063,6 +4063,7 @@ impl GitStatusPicker {
     fn open_diff_view(&mut self, _cx: &mut compositor::Context) -> Option<compositor::Callback> {
         if let Some(entry) = self.selection() {
             let file_path = entry.change.path().to_path_buf();
+            let is_staged_entry = entry.staged;
             let cwd = self.cwd.clone();
 
             // Use the stored files list for n/p navigation
@@ -4191,6 +4192,7 @@ impl GitStatusPicker {
                         file_index,
                         is_modified,
                         is_stale,
+                        is_staged_entry,
                     );
 
                     // Pop the picker and push the diff view
@@ -4465,6 +4467,7 @@ impl Component for CommitFilePicker {
                                 0,
                                 false,
                                 false,
+                                false, // Historical commits don't have staging
                             );
 
                             // Push DiffView on top of the file picker
@@ -6022,6 +6025,7 @@ fn diff_view(cx: &mut Context) {
         0,          // No file index
         is_modified,
         false,      // Not stale for standalone diff view
+        false,      // Standalone diff view is not a staged entry
     );
 
     cx.push_layer(Box::new(overlaid(diff_view)));

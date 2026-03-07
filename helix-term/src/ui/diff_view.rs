@@ -1479,6 +1479,9 @@ pub struct DiffView {
     is_stale: bool,
     /// Detected indentation style (for tab/space mixing warnings)
     indent_style: IndentStyle,
+    /// Whether this diff view was opened for a staged entry (HEAD→INDEX).
+    /// When true, staged hunk detection is skipped since all hunks are staged by definition.
+    is_staged_entry: bool,
     /// Set of hunk indices that have been staged in this session
     staged_hunks: HashSet<usize>,
     /// Cached blame data for the file (loaded lazily on first render)
@@ -1612,6 +1615,7 @@ fn reopen_diff_after_revert(
         file_index,
         is_modified,
         is_stale,
+        false, // Reverts are always unstaged
     );
 
     compositor.push(Box::new(overlaid(diff_view)));
@@ -1632,6 +1636,7 @@ impl DiffView {
         file_index: usize,                    // Current file index in the files list
         is_modified: bool,                    // Whether the document has unsaved changes
         is_stale: bool,                       // Whether the file on disk is newer than the buffer
+        is_staged_entry: bool, // Whether this is a staged entry (skip staged hunk detection)
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -1673,6 +1678,7 @@ impl DiffView {
             is_modified,
             is_stale,
             indent_style: IndentStyle::Unknown,
+            is_staged_entry,
             staged_hunks: HashSet::new(),
             blame_data: None,
             blame_loaded: false,
@@ -1722,7 +1728,21 @@ impl DiffView {
     fn detect_staged_hunks(&mut self) {
         use imara_diff::{Algorithm, Diff, InternedInput};
 
+        log::info!(
+            "detect_staged_hunks: file={}, is_staged_entry={}, hunks={}",
+            self.file_path.display(),
+            self.is_staged_entry,
+            self.hunks.len()
+        );
+
         if self.hunks.is_empty() {
+            return;
+        }
+
+        // Skip staged hunk detection for staged entries — all hunks are staged by
+        // definition, and running HEAD→INDEX detection would mark every hunk as
+        // staged, causing the entire diff to render with muted colors.
+        if self.is_staged_entry {
             return;
         }
 
@@ -1731,10 +1751,37 @@ impl DiffView {
             return;
         }
 
+        // Get HEAD content to compare against INDEX
+        // Fetch HEAD content to compare against INDEX for staged hunk detection
+        let head_bytes = match git::get_diff_base(&self.absolute_path) {
+            Ok(bytes) => {
+                log::info!(
+                    "detect_staged_hunks: got HEAD content, {} bytes",
+                    bytes.len()
+                );
+                bytes
+            }
+            Err(_) => {
+                log::info!("detect_staged_hunks: failed to get HEAD content");
+                return; // Can't detect staged hunks without HEAD content
+            }
+        };
+
+        let head_rope = Rope::from(String::from_utf8_lossy(&head_bytes));
+
         // Get index (staged) content for this file
         let index_bytes = match git::get_index_content(&self.absolute_path) {
-            Ok(bytes) => bytes,
-            Err(_) => return, // Can't detect staged hunks without index content
+            Ok(bytes) => {
+                log::info!(
+                    "detect_staged_hunks: got INDEX content, {} bytes",
+                    bytes.len()
+                );
+                bytes
+            }
+            Err(_) => {
+                log::info!("detect_staged_hunks: failed to get INDEX content");
+                return; // Can't detect staged hunks without index content
+            }
         };
 
         let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
@@ -1755,13 +1802,18 @@ impl DiffView {
             }
         }
 
-        // Compute diff between HEAD (diff_base) and INDEX to find staged changes
+        // Compute diff between HEAD and INDEX to find staged changes
         let input = InternedInput::new(
-            RopeLines(self.diff_base.slice(..)),
+            RopeLines(head_rope.slice(..)),
             RopeLines(index_rope.slice(..)),
         );
         let diff = Diff::compute(Algorithm::Histogram, &input);
         let staged_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        log::info!(
+            "detect_staged_hunks: found {} staged hunks (HEAD→INDEX)",
+            staged_hunks.len()
+        );
 
         // A hunk is staged if a staged hunk has the exact same `before` range
         for (i, hunk) in self.hunks.iter().enumerate() {
@@ -1769,11 +1821,22 @@ impl DiffView {
                 if staged_hunk.before.start == hunk.before.start
                     && staged_hunk.before.end == hunk.before.end
                 {
+                    log::info!(
+                        "detect_staged_hunks: hunk {} matched staged hunk (before {:?})",
+                        i,
+                        hunk.before
+                    );
                     self.staged_hunks.insert(i);
                     break;
                 }
             }
         }
+
+        log::info!(
+            "detect_staged_hunks: total {} hunks marked as staged out of {}",
+            self.staged_hunks.len(),
+            self.hunks.len()
+        );
     }
 
     /// Find the hunk whose `after.start` is closest to the cursor line
@@ -1809,99 +1872,23 @@ impl DiffView {
         }
     }
 
-    /// Refresh the diff view after staging a hunk.
+    /// Refresh the diff view after staging/unstaging a hunk.
     ///
-    /// After staging, the index changes but diff_base (which represents the index)
-    /// is stale. This method fetches the new index content and recomputes the diff.
-    ///
-    /// Returns true if refresh succeeded, false if there are no more unstaged changes.
-    fn refresh_after_staging(&mut self) -> bool {
-        use imara_diff::{Algorithm, Diff, InternedInput};
+    /// The diff view always shows HEAD→workdir (all changes). Staging/unstaging
+    /// only changes which hunks are marked as staged (rendered with muted colors).
+    /// We keep diff_base and hunks unchanged and just re-detect staged hunks.
+    #[allow(dead_code)]
+    fn refresh_after_staging(&mut self) {
+        // Don't change diff_base or hunks — keep showing HEAD→workdir
+        // Just re-detect which hunks are staged
+        self.staged_hunks.clear();
+        self.detect_staged_hunks();
 
-
-        let index_bytes = match git::get_index_content(&self.absolute_path) {
-            Ok(bytes) => bytes,
-            Err(_) => return false, // Can't refresh without index content
-        };
-
-        let new_diff_base = Rope::from(String::from_utf8_lossy(&index_bytes));
-
-        // Wrapper for RopeSlice to implement TokenSource (needed for imara_diff)
-        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
-
-        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
-            type Token = helix_core::RopeSlice<'a>;
-            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
-
-            fn tokenize(&self) -> Self::Tokenizer {
-                self.0.lines()
-            }
-
-            fn estimate_tokens(&self) -> u32 {
-                self.0.len_lines() as u32
-            }
-        }
-
-        // Compute new hunks between new diff_base (index) and doc (working copy)
-        let input = InternedInput::new(
-            RopeLines(new_diff_base.slice(..)),
-
-        );
-        let diff = Diff::compute(Algorithm::Histogram, &input);
-        let new_hunks: Vec<Hunk> = diff.hunks().collect();
-
-        // If no hunks remain, all changes are staged
-        if new_hunks.is_empty() {
-            return false;
-        }
-
-        // Try to preserve the selected hunk by finding a hunk with similar position
-        let old_hunk = self.hunks.get(self.selected_hunk);
-        let new_selected_hunk = if let Some(old) = old_hunk {
-            // Find a hunk in the new set with a similar `after.start` position
-            new_hunks
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, h)| h.after.start.abs_diff(old.after.start))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        // Update all relevant fields
-        self.diff_base = new_diff_base;
-        self.hunks = new_hunks;
-
-
-        self.added = 0;
-        self.removed = 0;
-        for hunk in &self.hunks {
-            self.added += (hunk.after.end.saturating_sub(hunk.after.start)) as usize;
-            self.removed += (hunk.before.end.saturating_sub(hunk.before.start)) as usize;
-        }
-
-        // Recompute diff lines and boundaries
-        self.compute_diff_lines();
-
-        // Clear caches since diff_base changed
+        // Clear rendering caches so muted styling updates
         self.word_diff_cache.borrow_mut().clear();
         self.syntax_highlight_cache.borrow_mut().clear();
         self.function_context_cache.borrow_mut().clear();
         self.function_context_highlight_cache.borrow_mut().clear();
-        self.cached_syntax_base = None; // Need to re-parse syntax for new diff_base
-
-        // Reset staged hunks tracking and re-detect
-        self.staged_hunks.clear();
-        self.detect_staged_hunks();
-
-        // Update selection
-        self.selected_hunk = new_selected_hunk.min(self.hunk_boundaries.len().saturating_sub(1));
-
-            self.selected_line = boundary.start;
-        }
-
-        true
     }
 
     /// Initialize Syntax objects once on first render
@@ -4204,27 +4191,19 @@ impl Component for DiffView {
                         }
 
                         let hunk = self.hunks[selected].clone();
-
-                        // Generate patch for the selected hunk
-                        // For stage (git apply --cached), context must match index/HEAD
                         let patch = self.generate_hunk_patch(&hunk, ContextSource::Index);
-
-                        // Validate: skip empty hunks
                         if patch.is_empty() {
                             cx.editor.set_status("Cannot stage empty hunk");
                             return EventResult::Consumed(None);
                         }
 
-                        // Stage the hunk synchronously and refresh the diff view
                         match git::stage_hunk(&self.absolute_path, &patch) {
                             Ok(()) => {
-                                // Mark hunk as staged and stay in the view
                                 self.staged_hunks.insert(selected);
+                                let unstaged_count = self.hunks.len() - self.staged_hunks.len();
                                 cx.editor.set_status(format!(
-                                    "Staged hunk {}/{} in {}",
-                                    selected + 1,
-                                    self.hunks.len(),
-                                    self.file_name
+                                    "Staged hunk in {} ({} unstaged hunks remaining)",
+                                    self.file_name, unstaged_count
                                 ));
                             }
                             Err(e) => {
@@ -4247,22 +4226,18 @@ impl Component for DiffView {
 
                         let hunk = self.hunks[selected].clone();
                         let patch = self.generate_hunk_patch(&hunk, ContextSource::Index);
-
                         if patch.is_empty() {
                             cx.editor.set_status("Cannot unstage empty hunk");
                             return EventResult::Consumed(None);
                         }
 
-                        // Unstage the hunk synchronously
                         match git::unstage_hunk(&self.absolute_path, &patch) {
                             Ok(()) => {
-                                // Remove from staged set and stay in the view
                                 self.staged_hunks.remove(&selected);
                                 cx.editor.set_status(format!(
-                                    "Unstaged hunk {}/{} in {}",
-                                    selected + 1,
-                                    self.hunks.len(),
-                                    self.file_name
+                                    "Unstaged hunk in {} ({} staged hunks remaining)",
+                                    self.file_name,
+                                    self.staged_hunks.len()
                                 ));
                             }
                             Err(e) => {
@@ -4279,6 +4254,7 @@ impl Component for DiffView {
                         let next_index = self.file_index + 1;
                         let next_entry = self.files[next_index].clone();
                         let file_path = next_entry.change.path().to_path_buf();
+                        let is_staged_entry = next_entry.staged;
                         let files = self.files.clone();
 
                         // Create a callback that closes current diff and opens next file's diff
@@ -4363,6 +4339,7 @@ impl Component for DiffView {
                                     next_index,
                                     is_modified,
                                     is_stale,
+                                    is_staged_entry,
                                 );
 
                                 // Push new diff view
@@ -4381,6 +4358,7 @@ impl Component for DiffView {
                         let prev_index = self.file_index - 1;
                         let prev_entry = self.files[prev_index].clone();
                         let file_path = prev_entry.change.path().to_path_buf();
+                        let is_staged_entry = prev_entry.staged;
                         let files = self.files.clone();
 
                         // Create a callback that closes current diff and opens prev file's diff
@@ -4465,6 +4443,7 @@ impl Component for DiffView {
                                     prev_index,
                                     is_modified,
                                     is_stale,
+                                    is_staged_entry,
                                 );
 
                                 // Push new diff view
@@ -4982,6 +4961,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -5033,6 +5013,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -5071,6 +5052,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5113,6 +5095,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -5147,6 +5130,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5194,6 +5178,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let patch = view.generate_hunk_patch(&view.hunks[0], ContextSource::WorkingCopy);
@@ -5226,6 +5211,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5291,6 +5277,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5373,6 +5360,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let esc_event = Event::Key(helix_view::input::KeyEvent {
@@ -5421,6 +5409,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5494,6 +5483,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Send Enter key
@@ -5550,6 +5540,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // The hunk's after.start should be 5 (0-indexed line number in working copy)
@@ -5603,6 +5594,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5662,6 +5654,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -5789,6 +5782,7 @@ mod diff_view_tests {
             0, // file_index = 0 (first file)
             false,
             false,
+            false,
         );
 
         // Verify initial state
@@ -5831,6 +5825,7 @@ mod diff_view_tests {
             0,
             files,
             1, // file_index = 1 (second file)
+            false,
             false,
             false,
         );
@@ -5878,6 +5873,7 @@ mod diff_view_tests {
             1, // file_index = 1 (middle file)
             false,
             false,
+            false,
         );
 
         // At index 1 of 3:
@@ -5913,6 +5909,7 @@ mod diff_view_tests {
             0,
             files,
             0,
+            false,
             false,
             false,
         );
@@ -5960,6 +5957,7 @@ mod diff_view_tests {
             0,
             files,
             0,
+            false,
             false,
             false,
         );
@@ -6011,6 +6009,7 @@ mod diff_view_tests {
             0,
             files,
             0, // Start at first file
+            false,
             false,
             false,
         );
@@ -6084,6 +6083,7 @@ mod diff_view_tests {
                 expected_index,
                 false,
                 false,
+                false,
             );
 
             assert_eq!(
@@ -6122,6 +6122,7 @@ mod diff_view_tests {
             1, // Start at second file
             false,
             false,
+            false,
         );
 
         // Verify files are preserved
@@ -6155,6 +6156,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6249,6 +6251,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should show all base lines as deletions
@@ -6290,6 +6293,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6369,6 +6373,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Check hunk header format: @@ -1,N +0,0 @@ (deleted)
@@ -6422,6 +6427,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should NOT be treated as deleted file
@@ -6454,6 +6460,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6505,6 +6512,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // With pre-computed hunks, the deleted file special logic should NOT trigger
@@ -6544,6 +6552,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6587,6 +6596,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Stats should show 0 added, N removed
@@ -6620,6 +6630,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6667,6 +6678,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should be treated as untracked
@@ -6710,6 +6722,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6763,6 +6776,7 @@ mod diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Stats should match the number of lines in the doc
@@ -6795,6 +6809,7 @@ mod diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6875,6 +6890,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
     }
 
@@ -6897,6 +6913,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6925,6 +6942,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert_eq!(diff_view.added, 0);
@@ -6949,6 +6967,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -6980,6 +6999,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic - test passes if we reach here
@@ -7007,6 +7027,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic - test passes if we reach here
@@ -7032,6 +7053,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7063,6 +7085,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -7088,6 +7111,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7121,6 +7145,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(diff_view.diff_lines.len() > 0);
@@ -7145,6 +7170,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7179,6 +7205,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         diff_view.scroll = 100;
@@ -7206,6 +7233,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7238,6 +7266,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         let content_area = Rect::new(0, 0, 0, 10)
@@ -7265,6 +7294,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7296,6 +7326,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         let content_area = Rect::new(0, 0, 80, 0)
@@ -7325,6 +7356,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         let inner_height = 1u16;
@@ -7351,6 +7383,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7382,6 +7415,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(true);
@@ -7405,6 +7439,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7433,6 +7468,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -7458,6 +7494,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -7481,6 +7518,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7517,6 +7555,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -7940,6 +7979,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // First line should be at screen row 0
@@ -7970,6 +8010,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8008,6 +8049,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic with usize::MAX
@@ -8042,6 +8084,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Screen row 0 should map to diff line 0
@@ -8072,6 +8115,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8110,6 +8154,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic with usize::MAX
@@ -8142,6 +8187,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8200,6 +8246,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Count HunkHeaders
@@ -8247,6 +8294,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8301,6 +8349,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Find HunkHeader and verify it handles long text
@@ -8342,6 +8391,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8393,6 +8443,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Set scroll to exactly max_scroll
@@ -8436,6 +8487,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8497,6 +8549,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // For each diff line, convert to screen row and verify it maps back
@@ -8532,6 +8585,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8583,6 +8637,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8647,6 +8702,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle wide unicode without issues
@@ -8692,6 +8748,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Set scroll to some value
@@ -8732,6 +8789,7 @@ mod adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle extreme line numbers without panic
@@ -8765,6 +8823,7 @@ mod adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -8840,6 +8899,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -8976,6 +9036,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Navigate to second hunk using J (Shift+j)
@@ -9068,6 +9129,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // With 1 hunk, indicator should be [1/1]
@@ -9125,6 +9187,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -9223,6 +9286,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "Should start at hunk 0");
@@ -9251,6 +9315,7 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
                 false,
                 false,
             )
@@ -9284,6 +9349,7 @@ mod selectable_diff_view_tests {
                 0,
                 false,
                 false,
+                false,
             )
         };
 
@@ -9313,6 +9379,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -9347,6 +9414,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert_eq!(diff_view.selected_hunk, 0, "selected_hunk should be 0");
@@ -9374,6 +9442,7 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
                 false,
                 false,
             )
@@ -9412,6 +9481,7 @@ mod selectable_diff_view_tests {
                 0,
                 false,
                 false,
+                false,
             )
         };
 
@@ -9448,6 +9518,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // For no hunks, indicator should show [0/0]
@@ -9474,6 +9545,7 @@ mod selectable_diff_view_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
                 false,
                 false,
             )
@@ -9587,6 +9659,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Verify hunk_boundaries is empty
@@ -9634,6 +9707,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -10028,6 +10102,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Verify diff_lines is empty
@@ -10078,6 +10153,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -10176,6 +10252,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -10292,6 +10369,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // ATTACK: Call update_selected_hunk_from_line with empty hunk_boundaries
@@ -10339,6 +10417,7 @@ mod selectable_diff_view_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Verify the path is stored as-is (no sanitization, but also no execution)
@@ -10381,6 +10460,7 @@ mod selectable_diff_view_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Navigate - should not panic with unicode content
@@ -10416,6 +10496,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -10862,6 +10943,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let hunk_start = diff_view.hunk_boundaries[0].start;
@@ -11016,6 +11098,7 @@ mod selectable_diff_view_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11219,6 +11302,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Verify empty state
@@ -11360,6 +11444,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Rapidly navigate through all adjacent hunks
@@ -11420,6 +11505,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -11452,6 +11538,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -11478,6 +11565,7 @@ mod selectable_diff_view_tests {
             1, // cursor on line 2 (0-indexed: 1), which is the addition
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11523,6 +11611,7 @@ mod selectable_diff_view_tests {
             3, // cursor on line 4 (0-indexed: 3), which is context after the hunk
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11573,6 +11662,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Find the Context line for line 5
@@ -11617,6 +11707,7 @@ mod selectable_diff_view_tests {
             0, // cursor_line = 0, should use hunk header
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11669,6 +11760,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(
@@ -11705,6 +11797,7 @@ mod selectable_diff_view_tests {
             1, // cursor on line 2 (0-indexed: 1)
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11751,6 +11844,7 @@ mod selectable_diff_view_tests {
             0,
             false,
             false,
+            false,
         );
 
         let selected = diff_view.diff_lines.get(diff_view.selected_line);
@@ -11774,6 +11868,7 @@ mod selectable_diff_view_tests {
             2, // cursor on line 3 (0-indexed: 2)
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11813,6 +11908,7 @@ mod selectable_diff_view_tests {
             7, // cursor on line 8 (0-indexed: 7)
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -11906,6 +12002,7 @@ mod stage_hunk_tests {
             0,
             false,
             false,
+            false,
         );
 
         // WorkingCopy context: should use doc for context lines
@@ -11970,6 +12067,7 @@ mod stage_hunk_tests {
             0,
             false,
             false,
+            false,
         );
 
         // This is how stage operation generates the patch (line 659)
@@ -12018,6 +12116,7 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -12072,6 +12171,7 @@ mod stage_hunk_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Stage uses Index context
@@ -12121,6 +12221,7 @@ mod stage_hunk_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Stage uses Index context
@@ -12164,6 +12265,7 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -12212,6 +12314,7 @@ mod stage_hunk_tests {
             0,
             false,
             false,
+            false,
         );
 
         let patch_working =
@@ -12254,6 +12357,7 @@ mod stage_hunk_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -12932,6 +13036,7 @@ mod syntax_highlighting_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -14236,6 +14341,7 @@ mod performance_caching_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -14839,6 +14945,7 @@ mod function_context_styling_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -15307,6 +15414,7 @@ mod box_decoration_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -16179,6 +16287,7 @@ mod phase7_adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Count hunk headers
@@ -16348,6 +16457,7 @@ mod phase7_adversarial_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle Unicode content without panicking
@@ -16380,6 +16490,7 @@ mod phase7_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -16463,6 +16574,7 @@ mod screen_row_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -16499,6 +16611,7 @@ mod screen_row_tests {
             0,
             false,
             false,
+            false,
         )
     }
 
@@ -16524,6 +16637,7 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -16776,6 +16890,7 @@ mod screen_row_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -18759,6 +18874,7 @@ mod phase7_ux_refinement_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Initial state: first hunk selected
@@ -18798,6 +18914,7 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -18846,6 +18963,7 @@ mod phase7_ux_refinement_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -19198,6 +19316,7 @@ mod phase7_ux_refinement_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Verify initial state: first line should be HunkHeader
@@ -19373,6 +19492,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Set scroll to 0
@@ -19406,6 +19526,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -19448,6 +19569,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Set scroll way beyond total
@@ -19482,6 +19604,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -19610,6 +19733,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Count HunkHeaders
@@ -19661,6 +19785,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         let mut context_storage: MaybeUninit<Context<'static>> = MaybeUninit::uninit();
@@ -19709,6 +19834,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -19988,6 +20114,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Set extreme scroll
@@ -20034,6 +20161,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic with extreme line numbers
@@ -20064,6 +20192,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20102,6 +20231,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20152,6 +20282,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20235,6 +20366,7 @@ mod adversarial_diff_view_fixes {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20434,6 +20566,7 @@ mod adversarial_diff_view_fixes {
             0,
             false,
             false,
+            false,
         );
 
         // Test scroll behavior
@@ -20540,6 +20673,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             false,
             false,
+            false,
         );
 
         // ATTACK: Set scroll to 0
@@ -20594,6 +20728,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20655,6 +20790,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20721,6 +20857,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Find the first HunkHeader
@@ -20784,6 +20921,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             false,
             false,
+            false,
         );
 
         diff_view.scroll = 0;
@@ -20823,6 +20961,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20867,6 +21006,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20920,6 +21060,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -20981,6 +21122,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             false,
             false,
+            false,
         );
 
         // ATTACK: Rapidly change scroll and navigate
@@ -21035,6 +21177,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -21119,6 +21262,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -21219,6 +21363,7 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Navigate - should not panic with unicode content
@@ -21273,6 +21418,7 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Verify file_name is stored correctly
@@ -21320,6 +21466,7 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 Vec::new(),
                 0,
+                false,
                 false,
                 false,
             );
@@ -21391,6 +21538,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Navigate through all hunks
@@ -21448,6 +21596,7 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Verify diff_lines are created
@@ -21500,6 +21649,7 @@ mod adversarial_scroll_indentation_tests {
                 0,
                 false,
                 false,
+                false,
             );
 
             // Verify no panic occurs
@@ -21534,6 +21684,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -21581,6 +21732,7 @@ mod adversarial_scroll_indentation_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -21644,6 +21796,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -22046,6 +22199,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should have context lines
@@ -22079,6 +22233,7 @@ mod hunkheader_scroll_and_context_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -22157,6 +22312,7 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -22298,6 +22454,7 @@ mod adversarial_scroll_selection_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Find the HunkHeader
@@ -22353,6 +22510,7 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -22484,6 +22642,7 @@ mod adversarial_scroll_selection_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Find a context line at the start
@@ -22525,6 +22684,7 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -22696,6 +22856,7 @@ mod adversarial_scroll_selection_tests {
             0,
             false,
             false,
+            false,
         );
 
         // All scroll operations should be safe
@@ -22729,6 +22890,7 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -22845,6 +23007,7 @@ mod adversarial_scroll_selection_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -22969,6 +23132,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Verify the DiffView was created successfully
@@ -23007,6 +23171,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle None gracefully
@@ -23040,6 +23205,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         let view2 = DiffView::new(
@@ -23056,6 +23222,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         let view3 = DiffView::new(
@@ -23070,6 +23237,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23105,6 +23273,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         let view2 = DiffView::new(
@@ -23119,6 +23288,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23153,6 +23323,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should not have cached syntax
@@ -23184,6 +23355,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         assert!(diff_view.diff_lines.is_empty());
@@ -23210,6 +23382,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23245,6 +23418,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle gracefully
@@ -23271,6 +23445,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23313,6 +23488,7 @@ mod adversarial_performance_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle large documents
@@ -23342,6 +23518,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23378,6 +23555,7 @@ mod adversarial_performance_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23431,6 +23609,7 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23493,6 +23672,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         // Word diff cache should be empty for empty diff
@@ -23520,6 +23700,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         // Syntax highlight cache should be empty before initialization
@@ -23545,6 +23726,7 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23578,6 +23760,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         // Caches should not be initialized on creation
@@ -23603,6 +23786,7 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23642,6 +23826,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -23668,6 +23853,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         assert!(!diff_view.diff_lines.is_empty());
@@ -23692,6 +23878,7 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23724,6 +23911,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         // Should handle hunks at boundaries
@@ -23753,6 +23941,7 @@ impl Foo {
             0,
             false,
             false,
+            false,
         );
 
         // Should not panic
@@ -23780,6 +23969,7 @@ impl Foo {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -23842,6 +24032,7 @@ mod lazy_evaluation_adversarial_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -24749,6 +24940,7 @@ mod adversarial_function_context_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         )
@@ -27202,6 +27394,7 @@ mod adversarial_whitespace_highlight_tests {
             0,
             false,
             false,
+            false,
         );
 
         // Get the actual length of diff_lines
@@ -27369,6 +27562,7 @@ mod adversarial_whitespace_highlight_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
@@ -28332,6 +28526,7 @@ mod diff_preview_tests {
             0,
             false,
             false,
+            false,
         );
 
         view.initialize_caches(&loader, &theme);
@@ -28390,6 +28585,7 @@ mod diff_preview_tests {
             0,
             Vec::new(),
             0,
+            false,
             false,
             false,
         );
