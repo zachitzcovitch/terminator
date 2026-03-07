@@ -707,7 +707,7 @@ pub fn get_relative_path(file_path: &Path) -> Option<std::path::PathBuf> {
 /// * `cwd` - Working directory to run git command in
 /// * `file` - File path to get diff stats for
 /// * `staged` - If true, get stats for staged changes (HEAD → index).
-///              If false, get stats for unstaged changes (index → working directory).
+///   If false, get stats for unstaged changes (index → working directory).
 ///
 /// Returns `Ok(Some((additions, deletions, is_binary)))` where:
 /// - `(additions, deletions)` are the line counts (0 for binary files)
@@ -991,9 +991,9 @@ pub fn get_blame(file: &Path) -> Result<Vec<crate::status::BlameLine>> {
     let mut is_boundary = false;
 
     for line in stdout.lines() {
-        if line.starts_with('\t') {
+        if let Some(content) = line.strip_prefix('\t') {
             // Content line — ends the current block
-            let content = line[1..].to_string();
+            let content = content.to_string();
 
             entries.push(crate::status::BlameLine {
                 hash: current_hash.clone(),

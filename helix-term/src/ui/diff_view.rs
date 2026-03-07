@@ -4,8 +4,10 @@ use crate::ui::overlay::overlaid;
 use crate::ui::{Prompt, PromptEvent};
 use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::tree_sitter::Node;
-use helix_core::{unicode::width::UnicodeWidthStr, Rope};
+use helix_core::{unicode::width::UnicodeWidthStr, Position, Rope};
 use helix_vcs::{git, BlameLine, StatusEntry};
+use helix_view::graphics::CursorKind;
+use helix_view::Editor;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -4478,6 +4480,12 @@ impl Component for DiffView {
             }
         }
         EventResult::Consumed(None)
+    }
+
+    fn cursor(&self, _area: Rect, _editor: &Editor) -> (Option<Position>, CursorKind) {
+        // Return a hidden cursor to prevent the compositor from falling through
+        // to lower layers (like pickers) which would show their search box cursor
+        (Some(Position::default()), CursorKind::Hidden)
     }
 
     fn id(&self) -> Option<&'static str> {

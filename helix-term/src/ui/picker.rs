@@ -93,6 +93,19 @@ type CustomPreviewCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
+/// A file entry in a file list preview (for git commit/stash previews)
+#[derive(Clone, Debug)]
+pub struct FileListEntry {
+    /// Status code: M (modified), A (added), D (deleted), R (renamed), C (copied), etc.
+    pub status: String,
+    /// File path
+    pub path: String,
+    /// Number of lines added (0 for deleted files)
+    pub additions: usize,
+    /// Number of lines deleted (0 for new files)
+    pub deletions: usize,
+}
+
 pub enum CachedPreview {
     Document(Box<Document>),
     Directory(Vec<(String, bool)>),
@@ -114,6 +127,22 @@ pub enum CachedPreview {
         file_path: std::path::PathBuf,
         /// File name for display
         file_name: String,
+    },
+    /// A list of files with status and line stats (for git commit/stash previews)
+    /// Rendered with color-coded status indicators
+    /// Optional commit info header: hash, author, date, subject
+    FileList {
+        files: Vec<FileListEntry>,
+        /// Commit hash (short form)
+        commit_hash: Option<String>,
+        /// Author name
+        author: Option<String>,
+        /// Date string (e.g., "2024-01-15")
+        date: Option<String>,
+        /// Relative date (e.g., "2 days ago")
+        relative_date: Option<String>,
+        /// Commit subject
+        subject: Option<String>,
     },
 }
 
@@ -152,6 +181,7 @@ impl Preview<'_, '_> {
                 CachedPreview::NotFound => "<File not found>",
                 CachedPreview::CustomText { .. } => "<No content>",
                 CachedPreview::Diff { .. } => "<No diff>",
+                CachedPreview::FileList { .. } => "<No files>",
             },
         }
     }
@@ -557,6 +587,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .map(|item| item.data)
     }
 
+    /// Force the matcher to process pending items. Useful for testing.
+    #[cfg(test)]
+    pub fn tick(&mut self) {
+        self.matcher.tick(100);
+    }
+
     fn primary_query(&self) -> Arc<str> {
         self.query
             .get(&self.columns[self.primary_column].name)
@@ -945,7 +981,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     /// Render custom text content in the preview pane.
-    /// If is_diff is true, applies diff-specific styling (green for +, red for -).
+    /// If is_diff is true, applies diff-specific styling with proper unified diff parsing:
+    /// - File headers (---, +++, diff --git): magenta
+    /// - Hunk headers (@@): cyan
+    /// - Additions (+): green
+    /// - Deletions (-): red
+    /// - Context lines: dimmed
     fn render_custom_text_preview_static(
         inner: &Rect,
         surface: &mut Surface,
@@ -953,39 +994,261 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         content: &str,
         is_diff: bool,
     ) {
+        use helix_view::graphics::Modifier;
+
         let text = cx.editor.theme.get("ui.text");
         let diff_plus = cx.editor.theme.get("diff.plus");
         let diff_minus = cx.editor.theme.get("diff.minus");
         let diff_delta = cx.editor.theme.get("diff.delta");
 
+        // Style for file headers and diff metadata (magenta/purple)
+        // Try diff.delta.moved first, fall back to diff.delta with italic modifier
+        let diff_file_header = {
+            let moved_style = cx.editor.theme.get("diff.delta.moved");
+            if moved_style.fg.is_some() || moved_style.bg.is_some() {
+                moved_style
+            } else {
+                // Fallback: use diff.delta with italic modifier to distinguish from hunk headers
+                diff_delta.add_modifier(Modifier::ITALIC)
+            }
+        };
+
+        // Dimmed style for context lines and metadata
+        let diff_context = {
+            let style = cx.editor.theme.get("diff.delta");
+            if style.fg.is_none() {
+                // Fallback to dimmed text
+                text.add_modifier(Modifier::DIM)
+            } else {
+                style
+            }
+        };
+
         // Render each line with appropriate styling
         for (i, line) in content.lines().take(inner.height as usize).enumerate() {
-            let (styled_line, style) = if is_diff {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with('+') {
-                    // Addition line - green
-                    (line, diff_plus)
-                } else if trimmed.starts_with('-') {
-                    // Deletion line - red
-                    (line, diff_minus)
-                } else if trimmed.starts_with('@') {
-                    // Hunk header - cyan/blue
-                    (line, diff_delta)
-                } else {
-                    // Context or other - default text
-                    (line, text)
+            let style = if is_diff {
+                // Use the categorize_diff_line function for consistent styling
+                match categorize_diff_line(line) {
+                    DiffLineCategory::DiffHeader => diff_file_header,
+                    DiffLineCategory::IndexLine => diff_context,
+                    DiffLineCategory::FileHeader => diff_file_header,
+                    DiffLineCategory::HunkHeader => diff_delta,
+                    DiffLineCategory::Addition => diff_plus,
+                    DiffLineCategory::Deletion => diff_minus,
+                    DiffLineCategory::BinaryNotice => diff_context,
+                    DiffLineCategory::FileModeChange => diff_context,
+                    DiffLineCategory::RenameMetadata => diff_file_header,
+                    DiffLineCategory::SimilarityIndex => diff_context,
+                    DiffLineCategory::Context => diff_context,
+                    DiffLineCategory::Unknown => text,
                 }
             } else {
-                (line, text)
+                text
             };
 
             surface.set_stringn(
                 inner.x,
                 inner.y + i as u16,
-                styled_line,
+                line,
                 inner.width as usize,
                 style,
             );
+        }
+    }
+
+    /// Render a file list preview with color-coded status indicators.
+    /// Format: "M  path/to/file.rs  +45 -12"
+    /// Colors: M=yellow, A=green, D=red, R=cyan, stats=dimmed
+    /// Optional commit info header shows: hash, author, date, subject
+    fn render_file_list_preview(
+        inner: &Rect,
+        surface: &mut Surface,
+        cx: &mut Context,
+        files: &[FileListEntry],
+        commit_hash: Option<&str>,
+        author: Option<&str>,
+        date: Option<&str>,
+        relative_date: Option<&str>,
+        subject: Option<&str>,
+    ) {
+        use helix_view::graphics::Modifier;
+
+        let text = cx.editor.theme.get("ui.text");
+        let diff_plus = cx.editor.theme.get("diff.plus");
+        let diff_minus = cx.editor.theme.get("diff.minus");
+        let diff_delta = cx.editor.theme.get("diff.delta");
+
+        // Calculate lines used by commit header
+        let mut header_lines: u16 = 0;
+        let has_commit_info = commit_hash.is_some()
+            || author.is_some()
+            || date.is_some()
+            || subject.is_some();
+
+        // Render commit info header if present
+        if has_commit_info {
+            let dimmed = text.add_modifier(Modifier::DIM);
+            let yellow = cx.editor.theme.get("string"); // Use string style for yellow-ish color
+            let cyan = cx.editor.theme.get("info"); // Use info style for cyan-ish color
+
+            let mut y = inner.y;
+            let mut x = inner.x;
+
+            // Line 1: commit <hash>
+            if let Some(hash) = commit_hash {
+                surface.set_stringn(x, y, "commit ", inner.width as usize, dimmed);
+                x += 7;
+                let hash_display = if hash.len() > 7 { &hash[..7] } else { hash };
+                surface.set_stringn(x, y, hash_display, inner.width.saturating_sub(7) as usize, yellow);
+                y += 1;
+                header_lines += 1;
+                x = inner.x;
+            }
+
+            // Line 2: Author: <name>
+            if let Some(author_name) = author {
+                surface.set_stringn(x, y, "Author: ", inner.width as usize, dimmed);
+                x += 8;
+                surface.set_stringn(x, y, author_name, inner.width.saturating_sub(8) as usize, text);
+                y += 1;
+                header_lines += 1;
+                x = inner.x;
+            }
+
+            // Line 3: Date: <date> (<relative>)
+            if let Some(d) = date {
+                surface.set_stringn(x, y, "Date:   ", inner.width as usize, dimmed);
+                x += 8;
+                let date_display = if let Some(rel) = relative_date {
+                    format!("{} ({})", d, rel)
+                } else {
+                    d.to_string()
+                };
+                surface.set_stringn(x, y, &date_display, inner.width.saturating_sub(8) as usize, cyan);
+                y += 1;
+                header_lines += 1;
+                x = inner.x;
+            }
+
+            // Line 4: <subject> (indented)
+            if let Some(subj) = subject {
+                let indented = format!("    {}", subj);
+                surface.set_stringn(x, y, &indented, inner.width as usize, text);
+                y += 1;
+                header_lines += 1;
+            }
+
+            // Line 5: separator line
+            let separator = "─".repeat(inner.width as usize);
+            surface.set_stringn(inner.x, y, &separator, inner.width as usize, dimmed);
+            header_lines += 1;
+        }
+
+        // Status colors based on git status codes
+        // M (modified) - yellow/delta
+        // A (added) - green/plus
+        // D (deleted) - red/minus
+        // R (renamed) - cyan (use delta with different shade)
+        // C (copied) - cyan
+        // ? (untracked) - dimmed
+        let style_modified = diff_delta;
+        let style_added = diff_plus;
+        let style_deleted = diff_minus;
+        let style_renamed = {
+            // Try to use a cyan-like color for renames
+            let style = cx.editor.theme.get("ui.virtual.whitespace");
+            if style.fg.is_some() {
+                style
+            } else {
+                diff_delta
+            }
+        };
+        let style_stats = text.add_modifier(Modifier::DIM);
+
+        // Calculate available height for files
+        let available_height = inner.height.saturating_sub(header_lines) as usize;
+
+        // Render each file entry
+        let start_y = inner.y + header_lines;
+        for (i, entry) in files.iter().take(available_height).enumerate() {
+            let y = start_y + i as u16;
+            let mut x = inner.x;
+
+            // Determine status style based on the first character of status
+            let status_char = entry.status.chars().next().unwrap_or(' ');
+            let status_style = match status_char {
+                'M' => style_modified,
+                'A' => style_added,
+                'D' => style_deleted,
+                'R' | 'C' => style_renamed,
+                _ => text,
+            };
+
+            // Render status (e.g., "M ", "A ", "D ", "R ")
+            let status_str = if entry.status.len() == 1 {
+                format!("{} ", entry.status)
+            } else {
+                format!("{} ", entry.status)
+            };
+            surface.set_stringn(x, y, &status_str, inner.width as usize, status_style);
+            x += status_str.len() as u16;
+
+            // Calculate remaining width for path and stats
+            let remaining_width = inner.width.saturating_sub(x - inner.x);
+
+            // Render path
+            let path_display = if entry.path.len() > remaining_width as usize {
+                // Truncate path if too long, showing the end (filename is more important)
+                let truncated = format!("...{}", &entry.path[entry.path.len().saturating_sub(remaining_width as usize - 3)..]);
+                truncated
+            } else {
+                entry.path.clone()
+            };
+
+            let path_width = path_display.len().min(remaining_width as usize);
+            surface.set_stringn(x, y, &path_display, path_width, text);
+            x += path_width as u16;
+
+            // Render stats if there's room and we have them
+            let stats = if entry.additions > 0 || entry.deletions > 0 {
+                let add_str = if entry.additions > 0 {
+                    format!("+{}", entry.additions)
+                } else {
+                    String::new()
+                };
+                let del_str = if entry.deletions > 0 {
+                    format!("-{}", entry.deletions)
+                } else {
+                    String::new()
+                };
+                if !add_str.is_empty() && !del_str.is_empty() {
+                    format!("  {} {}", add_str, del_str)
+                } else if !add_str.is_empty() {
+                    format!("  {}", add_str)
+                } else if !del_str.is_empty() {
+                    format!("  {}", del_str)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            if !stats.is_empty() {
+                let remaining = inner.width.saturating_sub(x - inner.x);
+                if remaining > stats.len() as u16 {
+                    surface.set_stringn(x, y, &stats, remaining as usize, style_stats);
+                }
+            }
+        }
+
+        // Show file count at the bottom if there are more files than displayed
+        if files.len() > available_height {
+            let remaining = files.len() - available_height;
+            let msg = format!("... and {} more file(s)", remaining);
+            let y = inner.y + inner.height - 1;
+            let style = text.add_modifier(Modifier::DIM);
+            surface.set_stringn(inner.x, y, &msg, inner.width as usize, style);
         }
     }
 
@@ -1510,6 +1773,27 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                             Self::render_custom_text_preview_static(&inner, surface, cx, &content, is_diff);
                             return;
                         }
+                        CachedPreview::FileList {
+                            files,
+                            commit_hash,
+                            author,
+                            date,
+                            relative_date,
+                            subject,
+                        } => {
+                            Self::render_file_list_preview(
+                                &inner,
+                                surface,
+                                cx,
+                                &files,
+                                commit_hash.as_deref(),
+                                author.as_deref(),
+                                date.as_deref(),
+                                relative_date.as_deref(),
+                                subject.as_deref(),
+                            );
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -1822,3 +2106,602 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+/// Categorizes a diff line for styling purposes.
+/// This enum represents the different categories of lines in a unified diff format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineCategory {
+    /// "diff --git a/file b/file" header
+    DiffHeader,
+    /// "index abc123..def456 100644" or "Index: abc123"
+    IndexLine,
+    /// "--- a/file" or "+++ b/file" file headers
+    FileHeader,
+    /// "@@ -1,4 +1,5 @@" hunk header
+    HunkHeader,
+    /// Addition line (starts with '+')
+    Addition,
+    /// Deletion line (starts with '-')
+    Deletion,
+    /// Binary file notice
+    BinaryNotice,
+    /// File mode changes (new file mode, deleted file mode, etc.)
+    FileModeChange,
+    /// Rename/copy metadata
+    RenameMetadata,
+    /// Similarity index for renames
+    SimilarityIndex,
+    /// Context line (starts with space or empty)
+    Context,
+    /// Unknown line type (use default text style)
+    Unknown,
+}
+
+/// Determines the category of a diff line for styling purposes.
+/// This function is used by `render_custom_text_preview_static` to apply
+/// appropriate styles to different types of diff lines.
+pub fn categorize_diff_line(line: &str) -> DiffLineCategory {
+    if line.starts_with("diff --git ") {
+        DiffLineCategory::DiffHeader
+    } else if line.starts_with("index ") || line.starts_with("Index: ") {
+        DiffLineCategory::IndexLine
+    } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+        DiffLineCategory::FileHeader
+    } else if line.starts_with("@@ ") {
+        DiffLineCategory::HunkHeader
+    } else if line.starts_with('+') {
+        DiffLineCategory::Addition
+    } else if line.starts_with('-') {
+        DiffLineCategory::Deletion
+    } else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+        DiffLineCategory::BinaryNotice
+    } else if line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+    {
+        DiffLineCategory::FileModeChange
+    } else if line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("copy from ")
+        || line.starts_with("copy to ")
+    {
+        DiffLineCategory::RenameMetadata
+    } else if line.starts_with("similarity index ") || line.starts_with("dissimilarity index ") {
+        DiffLineCategory::SimilarityIndex
+    } else if line.starts_with(' ') || line.is_empty() {
+        DiffLineCategory::Context
+    } else {
+        DiffLineCategory::Unknown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test suite for diff line categorization and styling.
+    /// 
+    /// These tests verify that the `categorize_diff_line` function correctly
+    /// identifies different types of diff lines according to the unified diff format.
+    /// The styling is then applied based on these categories in `render_custom_text_preview_static`.
+
+    mod diff_line_categorization {
+        use super::*;
+
+        // ========================================
+        // Test 1: File headers (`---`, `+++`, `diff --git`)
+        // ========================================
+
+        #[test]
+        fn test_diff_header_line() {
+            // Standard diff header
+            assert_eq!(
+                categorize_diff_line("diff --git a/src/main.rs b/src/main.rs"),
+                DiffLineCategory::DiffHeader
+            );
+            
+            // With different file paths
+            assert_eq!(
+                categorize_diff_line("diff --git a/old/path.txt b/new/path.txt"),
+                DiffLineCategory::DiffHeader
+            );
+            
+            // Should NOT match if not exactly "diff --git "
+            assert_ne!(
+                categorize_diff_line("diff --cc a/file.txt"),
+                DiffLineCategory::DiffHeader
+            );
+        }
+
+        #[test]
+        fn test_file_header_minus() {
+            // Standard --- header
+            assert_eq!(
+                categorize_diff_line("--- a/src/main.rs"),
+                DiffLineCategory::FileHeader
+            );
+            
+            // With different paths
+            assert_eq!(
+                categorize_diff_line("--- a/lib/module.rs"),
+                DiffLineCategory::FileHeader
+            );
+            
+            // /dev/null for new files
+            assert_eq!(
+                categorize_diff_line("--- /dev/null"),
+                DiffLineCategory::FileHeader
+            );
+        }
+
+        #[test]
+        fn test_file_header_plus() {
+            // Standard +++ header
+            assert_eq!(
+                categorize_diff_line("+++ b/src/main.rs"),
+                DiffLineCategory::FileHeader
+            );
+            
+            // With different paths
+            assert_eq!(
+                categorize_diff_line("+++ b/lib/module.rs"),
+                DiffLineCategory::FileHeader
+            );
+            
+            // /dev/null for deleted files
+            assert_eq!(
+                categorize_diff_line("+++ /dev/null"),
+                DiffLineCategory::FileHeader
+            );
+        }
+
+        // ========================================
+        // Test 2: Hunk headers (`@@`)
+        // ========================================
+
+        #[test]
+        fn test_hunk_header() {
+            // Standard hunk header
+            assert_eq!(
+                categorize_diff_line("@@ -1,4 +1,5 @@"),
+                DiffLineCategory::HunkHeader
+            );
+            
+            // With context
+            assert_eq!(
+                categorize_diff_line("@@ -10,7 +10,8 @@ fn main() {"),
+                DiffLineCategory::HunkHeader
+            );
+            
+            // Single line changes
+            assert_eq!(
+                categorize_diff_line("@@ -42 +42 @@"),
+                DiffLineCategory::HunkHeader
+            );
+            
+            // At start of file
+            assert_eq!(
+                categorize_diff_line("@@ -0,0 +1,5 @@"),
+                DiffLineCategory::HunkHeader
+            );
+        }
+
+        // ========================================
+        // Test 3: Additions (`+`)
+        // ========================================
+
+        #[test]
+        fn test_addition_lines() {
+            // Simple addition
+            assert_eq!(
+                categorize_diff_line("+new line"),
+                DiffLineCategory::Addition
+            );
+            
+            // Empty addition (just the +)
+            assert_eq!(
+                categorize_diff_line("+"),
+                DiffLineCategory::Addition
+            );
+            
+            // Addition with spaces
+            assert_eq!(
+                categorize_diff_line("+    indented code"),
+                DiffLineCategory::Addition
+            );
+            
+            // Addition with special characters
+            assert_eq!(
+                categorize_diff_line("+// comment with @@ symbols"),
+                DiffLineCategory::Addition
+            );
+            
+            // Multi-line string addition
+            assert_eq!(
+                categorize_diff_line("+    \"multi\""),
+                DiffLineCategory::Addition
+            );
+        }
+
+        #[test]
+        fn test_addition_not_confused_with_file_header() {
+            // A line starting with ++ should NOT be a file header
+            // (file headers are "+++ " with space after)
+            assert_eq!(
+                categorize_diff_line("++not a file header"),
+                DiffLineCategory::Addition
+            );
+            
+            // Single + followed by space is an addition
+            assert_eq!(
+                categorize_diff_line("+ added line"),
+                DiffLineCategory::Addition
+            );
+        }
+
+        // ========================================
+        // Test 4: Deletions (`-`)
+        // ========================================
+
+        #[test]
+        fn test_deletion_lines() {
+            // Simple deletion
+            assert_eq!(
+                categorize_diff_line("-old line"),
+                DiffLineCategory::Deletion
+            );
+            
+            // Empty deletion (just the -)
+            assert_eq!(
+                categorize_diff_line("-"),
+                DiffLineCategory::Deletion
+            );
+            
+            // Deletion with spaces
+            assert_eq!(
+                categorize_diff_line("-    indented code"),
+                DiffLineCategory::Deletion
+            );
+            
+            // Deletion with special characters
+            assert_eq!(
+                categorize_diff_line("-// comment"),
+                DiffLineCategory::Deletion
+            );
+        }
+
+        #[test]
+        fn test_deletion_not_confused_with_file_header() {
+            // A line starting with -- should NOT be a file header
+            // (file headers are "--- " with space after)
+            assert_eq!(
+                categorize_diff_line("--not a file header"),
+                DiffLineCategory::Deletion
+            );
+            
+            // Single - followed by space is a deletion
+            assert_eq!(
+                categorize_diff_line("- removed line"),
+                DiffLineCategory::Deletion
+            );
+        }
+
+        // ========================================
+        // Test 5: Context lines (space prefix)
+        // ========================================
+
+        #[test]
+        fn test_context_lines() {
+            // Context line with space prefix
+            assert_eq!(
+                categorize_diff_line(" unchanged line"),
+                DiffLineCategory::Context
+            );
+            
+            // Empty line (also context)
+            assert_eq!(
+                categorize_diff_line(""),
+                DiffLineCategory::Context
+            );
+            
+            // Context with indentation
+            assert_eq!(
+                categorize_diff_line("    indented context"),
+                DiffLineCategory::Context
+            );
+            
+            // Context that looks like code
+            assert_eq!(
+                categorize_diff_line(" fn main() {"),
+                DiffLineCategory::Context
+            );
+        }
+
+        // ========================================
+        // Test 6: Metadata lines (index, mode changes)
+        // ========================================
+
+        #[test]
+        fn test_index_line() {
+            // Standard index line
+            assert_eq!(
+                categorize_diff_line("index abc123..def456 100644"),
+                DiffLineCategory::IndexLine
+            );
+            
+            // Index with different mode
+            assert_eq!(
+                categorize_diff_line("index 1234567..89abcde 100755"),
+                DiffLineCategory::IndexLine
+            );
+            
+            // Index: format (SVN style)
+            assert_eq!(
+                categorize_diff_line("Index: src/main.rs"),
+                DiffLineCategory::IndexLine
+            );
+        }
+
+        #[test]
+        fn test_file_mode_changes() {
+            // New file
+            assert_eq!(
+                categorize_diff_line("new file mode 100644"),
+                DiffLineCategory::FileModeChange
+            );
+            
+            // Deleted file
+            assert_eq!(
+                categorize_diff_line("deleted file mode 100644"),
+                DiffLineCategory::FileModeChange
+            );
+            
+            // Mode change (old mode)
+            assert_eq!(
+                categorize_diff_line("old mode 100644"),
+                DiffLineCategory::FileModeChange
+            );
+            
+            // Mode change (new mode)
+            assert_eq!(
+                categorize_diff_line("new mode 100755"),
+                DiffLineCategory::FileModeChange
+            );
+        }
+
+        #[test]
+        fn test_binary_notice() {
+            // Binary files notice
+            assert_eq!(
+                categorize_diff_line("Binary files a/image.png and b/image.png differ"),
+                DiffLineCategory::BinaryNotice
+            );
+            
+            // GIT binary patch
+            assert_eq!(
+                categorize_diff_line("GIT binary patch"),
+                DiffLineCategory::BinaryNotice
+            );
+        }
+
+        #[test]
+        fn test_rename_metadata() {
+            // Rename from
+            assert_eq!(
+                categorize_diff_line("rename from old_name.rs"),
+                DiffLineCategory::RenameMetadata
+            );
+            
+            // Rename to
+            assert_eq!(
+                categorize_diff_line("rename to new_name.rs"),
+                DiffLineCategory::RenameMetadata
+            );
+            
+            // Copy from
+            assert_eq!(
+                categorize_diff_line("copy from template.rs"),
+                DiffLineCategory::RenameMetadata
+            );
+            
+            // Copy to
+            assert_eq!(
+                categorize_diff_line("copy to new_file.rs"),
+                DiffLineCategory::RenameMetadata
+            );
+        }
+
+        #[test]
+        fn test_similarity_index() {
+            // Similarity index
+            assert_eq!(
+                categorize_diff_line("similarity index 87%"),
+                DiffLineCategory::SimilarityIndex
+            );
+            
+            // Dissimilarity index
+            assert_eq!(
+                categorize_diff_line("dissimilarity index 50%"),
+                DiffLineCategory::SimilarityIndex
+            );
+        }
+
+        // ========================================
+        // Test 7: Unknown lines
+        // ========================================
+
+        #[test]
+        fn test_unknown_lines() {
+            // Lines that don't match any known pattern
+            assert_eq!(
+                categorize_diff_line("some random text"),
+                DiffLineCategory::Unknown
+            );
+            
+            // Lines starting with other characters
+            assert_eq!(
+                categorize_diff_line("# comment"),
+                DiffLineCategory::Unknown
+            );
+            
+            // Lines that look like code but not in diff format
+            assert_eq!(
+                categorize_diff_line("fn main() {}"),
+                DiffLineCategory::Unknown
+            );
+        }
+
+        // ========================================
+        // Test 8: Edge cases
+        // ========================================
+
+        #[test]
+        fn test_edge_cases() {
+            // Line with only whitespace starting with space (context in diff format)
+            assert_eq!(
+                categorize_diff_line("   "),
+                DiffLineCategory::Context
+            );
+            
+            // Very long line
+            let long_line = "+".repeat(1000);
+            assert_eq!(
+                categorize_diff_line(&format!("+{}", long_line)),
+                DiffLineCategory::Addition
+            );
+            
+            // Line with unicode
+            assert_eq!(
+                categorize_diff_line("+🎉 unicode addition"),
+                DiffLineCategory::Addition
+            );
+            
+            // Hunk header with complex context
+            assert_eq!(
+                categorize_diff_line("@@ -100,7 +100,7 @@ impl<T> SomeStruct<T> where T: Clone + Debug {"),
+                DiffLineCategory::HunkHeader
+            );
+        }
+
+        // ========================================
+        // Test 9: Complete diff example
+        // ========================================
+
+        #[test]
+        fn test_complete_diff_example() {
+            // A realistic diff example with all line types
+            let diff_lines = [
+                ("diff --git a/src/main.rs b/src/main.rs", DiffLineCategory::DiffHeader),
+                ("index abc123..def456 100644", DiffLineCategory::IndexLine),
+                ("--- a/src/main.rs", DiffLineCategory::FileHeader),
+                ("+++ b/src/main.rs", DiffLineCategory::FileHeader),
+                ("@@ -1,5 +1,6 @@", DiffLineCategory::HunkHeader),
+                (" fn main() {", DiffLineCategory::Context),
+                ("     println!(\"Hello\");", DiffLineCategory::Context),
+                ("-    let x = 1;", DiffLineCategory::Deletion),
+                ("+    let x = 2;", DiffLineCategory::Addition),
+                ("+    let y = 3;", DiffLineCategory::Addition),
+                (" }", DiffLineCategory::Context),
+            ];
+
+            for (line, expected) in diff_lines {
+                assert_eq!(
+                    categorize_diff_line(line),
+                    expected,
+                    "Failed for line: {:?}",
+                    line
+                );
+            }
+        }
+
+        #[test]
+        fn test_complete_new_file_diff() {
+            // Diff for a new file
+            let diff_lines = [
+                ("diff --git a/new_file.rs b/new_file.rs", DiffLineCategory::DiffHeader),
+                ("new file mode 100644", DiffLineCategory::FileModeChange),
+                ("index 0000000..abc1234", DiffLineCategory::IndexLine),
+                ("--- /dev/null", DiffLineCategory::FileHeader),
+                ("+++ b/new_file.rs", DiffLineCategory::FileHeader),
+                ("@@ -0,0 +1,3 @@", DiffLineCategory::HunkHeader),
+                ("+fn new_function() {", DiffLineCategory::Addition),
+                ("+    println!(\"New\");", DiffLineCategory::Addition),
+                ("+}", DiffLineCategory::Addition),
+            ];
+
+            for (line, expected) in diff_lines {
+                assert_eq!(
+                    categorize_diff_line(line),
+                    expected,
+                    "Failed for line: {:?}",
+                    line
+                );
+            }
+        }
+
+        #[test]
+        fn test_complete_deleted_file_diff() {
+            // Diff for a deleted file
+            let diff_lines = [
+                ("diff --git a/old_file.rs b/old_file.rs", DiffLineCategory::DiffHeader),
+                ("deleted file mode 100644", DiffLineCategory::FileModeChange),
+                ("index abc1234..0000000", DiffLineCategory::IndexLine),
+                ("--- a/old_file.rs", DiffLineCategory::FileHeader),
+                ("+++ /dev/null", DiffLineCategory::FileHeader),
+                ("@@ -1,3 +0,0 @@", DiffLineCategory::HunkHeader),
+                ("-fn old_function() {", DiffLineCategory::Deletion),
+                ("-    println!(\"Old\");", DiffLineCategory::Deletion),
+                ("-}", DiffLineCategory::Deletion),
+            ];
+
+            for (line, expected) in diff_lines {
+                assert_eq!(
+                    categorize_diff_line(line),
+                    expected,
+                    "Failed for line: {:?}",
+                    line
+                );
+            }
+        }
+
+        #[test]
+        fn test_complete_rename_diff() {
+            // Diff for a renamed file
+            let diff_lines = [
+                ("diff --git a/old_name.rs b/new_name.rs", DiffLineCategory::DiffHeader),
+                ("similarity index 100%", DiffLineCategory::SimilarityIndex),
+                ("rename from old_name.rs", DiffLineCategory::RenameMetadata),
+                ("rename to new_name.rs", DiffLineCategory::RenameMetadata),
+            ];
+
+            for (line, expected) in diff_lines {
+                assert_eq!(
+                    categorize_diff_line(line),
+                    expected,
+                    "Failed for line: {:?}",
+                    line
+                );
+            }
+        }
+
+        #[test]
+        fn test_complete_mode_change_diff() {
+            // Diff for a mode change (chmod)
+            let diff_lines = [
+                ("diff --git a/script.sh b/script.sh", DiffLineCategory::DiffHeader),
+                ("old mode 100644", DiffLineCategory::FileModeChange),
+                ("new mode 100755", DiffLineCategory::FileModeChange),
+            ];
+
+            for (line, expected) in diff_lines {
+                assert_eq!(
+                    categorize_diff_line(line),
+                    expected,
+                    "Failed for line: {:?}",
+                    line
+                );
+            }
+        }
+    }
+}
