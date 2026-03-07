@@ -38,6 +38,8 @@ pub struct StatusEntry {
     pub change: FileChange,
     /// Whether this change is staged (in the index)
     pub staged: bool,
+    /// Whether this file has both staged and unstaged changes (partially staged)
+    pub partially_staged: bool,
     /// Number of additions (from git diff --numstat), if available
     pub additions: Option<usize>,
     /// Number of deletions (from git diff --numstat), if available

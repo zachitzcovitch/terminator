@@ -4254,7 +4254,7 @@ impl Component for DiffView {
                         let next_index = self.file_index + 1;
                         let next_entry = self.files[next_index].clone();
                         let file_path = next_entry.change.path().to_path_buf();
-                        let is_staged_entry = next_entry.staged;
+                        let is_staged_entry = next_entry.staged && !next_entry.partially_staged;
                         let files = self.files.clone();
 
                         // Create a callback that closes current diff and opens next file's diff
@@ -4358,7 +4358,7 @@ impl Component for DiffView {
                         let prev_index = self.file_index - 1;
                         let prev_entry = self.files[prev_index].clone();
                         let file_path = prev_entry.change.path().to_path_buf();
-                        let is_staged_entry = prev_entry.staged;
+                        let is_staged_entry = prev_entry.staged && !prev_entry.partially_staged;
                         let files = self.files.clone();
 
                         // Create a callback that closes current diff and opens prev file's diff
@@ -5751,6 +5751,7 @@ mod diff_view_tests {
                 path: PathBuf::from(path),
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,

@@ -4063,7 +4063,7 @@ impl GitStatusPicker {
     fn open_diff_view(&mut self, _cx: &mut compositor::Context) -> Option<compositor::Callback> {
         if let Some(entry) = self.selection() {
             let file_path = entry.change.path().to_path_buf();
-            let is_staged_entry = entry.staged;
+            let is_staged_entry = entry.staged && !entry.partially_staged;
             let cwd = self.cwd.clone();
 
             // Use the stored files list for n/p navigation
@@ -8965,13 +8965,23 @@ pub struct GitStatusData {
     pub modified_paths: HashSet<PathBuf>,
 }
 
-/// Returns the status text ("staged" or "unstaged") for a StatusEntry
+/// Returns the status text ("staged", "partial", or "unstaged") for a StatusEntry
 pub fn git_status_text(entry: &StatusEntry) -> &'static str {
-    if entry.staged { "staged" } else { "unstaged" }
+    if entry.partially_staged {
+        "partial"
+    } else if entry.staged {
+        "staged"
+    } else {
+        "unstaged"
+    }
 }
 
 /// Returns the appropriate style for a StatusEntry based on its change type
 pub fn git_status_style(entry: &StatusEntry, data: &GitStatusData) -> Style {
+    // Partially staged files get unstaged (yellow/delta) style to indicate mixed state
+    if entry.partially_staged {
+        return data.style_unstaged;
+    }
     match &entry.change {
         FileChange::Untracked { .. } => data.style_untracked,
         FileChange::Modified { .. } => {
@@ -9079,6 +9089,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9100,6 +9111,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9121,6 +9133,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/new_file.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9142,6 +9155,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/deleted_file.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9162,6 +9176,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/conflicted.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9181,6 +9196,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(15),
             deletions: Some(8),
             is_binary: false,
@@ -9196,6 +9212,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(20),
             deletions: None,
             is_binary: false,
@@ -9211,6 +9228,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: Some(7),
             is_binary: false,
@@ -9229,6 +9247,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/new_file.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9265,6 +9284,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new_name.rs"),
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9283,6 +9303,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/lib/new.rs"),
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9305,6 +9326,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(5),
             deletions: Some(2),
             is_binary: false,
@@ -9326,6 +9348,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/deleted.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9341,6 +9364,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/conflict.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9357,6 +9381,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new.rs"),
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9372,6 +9397,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/modified.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9387,6 +9413,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/image.png") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: true,
@@ -9403,6 +9430,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/binary.dat") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(100),
             deletions: Some(50),
             is_binary: true,
@@ -9420,6 +9448,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new.rs"),
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9439,6 +9468,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new.rs"),
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9458,6 +9488,7 @@ mod git_status_tests {
                 path: PathBuf::from("/other/location/file.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9475,6 +9506,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/empty_change.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(0),
             deletions: Some(0),
             is_binary: false,
@@ -9498,6 +9530,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(5),
             deletions: Some(2),
             is_binary: false,
@@ -9517,6 +9550,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(5),
             deletions: Some(2),
             is_binary: false,
@@ -9538,6 +9572,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new_name.rs"),
             },
             staged: true,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9560,7 +9595,8 @@ mod git_status_tests {
             change: FileChange::Modified { 
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
-            staged: false,  // Unstaged - should be stageable
+            staged: false,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9583,7 +9619,8 @@ mod git_status_tests {
             change: FileChange::Modified { 
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
-            staged: true,  // Already staged
+            staged: true,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9606,7 +9643,8 @@ mod git_status_tests {
             change: FileChange::Modified { 
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
-            staged: true,  // Staged - should be unstageable
+            staged: true,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9629,7 +9667,8 @@ mod git_status_tests {
             change: FileChange::Modified { 
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
-            staged: false,  // Not staged
+            staged: false,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9653,6 +9692,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: true,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9671,6 +9711,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9691,6 +9732,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/src/main.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: Some(10),
             deletions: Some(5),
             is_binary: false,
@@ -9849,7 +9891,8 @@ mod git_status_tests {
             change: FileChange::Untracked { 
                 path: PathBuf::from("/test/repo/new_file.rs") 
             },
-            staged: false,  // Untracked files are never staged initially
+            staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9868,6 +9911,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/deleted_file.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9886,6 +9930,7 @@ mod git_status_tests {
                 path: PathBuf::from("/test/repo/conflict.rs") 
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,
@@ -9905,6 +9950,7 @@ mod git_status_tests {
                 to_path: PathBuf::from("/test/repo/new.rs"),
             },
             staged: false,
+            partially_staged: false,
             additions: None,
             deletions: None,
             is_binary: false,

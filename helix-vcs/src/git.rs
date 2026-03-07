@@ -446,6 +446,7 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
             entries.push(StatusEntry {
                 change: FileChange::Untracked { path: file_path },
                 staged: false,
+                partially_staged: false,
                 additions,
                 deletions,
                 is_binary,
@@ -471,6 +472,7 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
             entries.push(StatusEntry {
                 change: FileChange::Conflict { path: file_path },
                 staged: true,
+                partially_staged: false,
                 additions,
                 deletions,
                 is_binary,
@@ -502,39 +504,59 @@ pub fn get_status_porcelain(cwd: &Path, populate_stats: bool) -> Result<Vec<Stat
             }
         };
 
-        // Handle staged changes (X status)
-        // When Y='R' or Y='C', staged changes are at OLD path (from_path), not NEW path
-        if x != ' ' {
-            let staged_path = if (y == 'R' || y == 'C') && from_path.is_some() {
-                from_path.as_deref().unwrap_or(&path)
-            } else {
-                &path
-            };
-            if let Some(change) = make_change(x, staged_path, from_path.as_deref()) {
-                let file_path = change.path();
-                let (additions, deletions, is_binary) = get_stats(file_path, true);
-                entries.push(StatusEntry {
-                    change,
-                    staged: true,
-                    additions,
-                    deletions,
-                    is_binary,
-                });
-            }
-        }
+        let both_staged_and_unstaged = x != ' ' && y != ' ';
 
-        // Handle unstaged changes (Y status)
-        if y != ' ' {
+        if both_staged_and_unstaged {
+            // Partially staged: create ONE entry showing full (unstaged) diff
             if let Some(change) = make_change(y, &path, from_path.as_deref()) {
                 let file_path = change.path();
                 let (additions, deletions, is_binary) = get_stats(file_path, false);
                 entries.push(StatusEntry {
                     change,
                     staged: false,
+                    partially_staged: true,
                     additions,
                     deletions,
                     is_binary,
                 });
+            }
+        } else {
+            // Handle staged changes (X status)
+            // When Y='R' or Y='C', staged changes are at OLD path (from_path), not NEW path
+            if x != ' ' {
+                let staged_path = if (y == 'R' || y == 'C') && from_path.is_some() {
+                    from_path.as_deref().unwrap_or(&path)
+                } else {
+                    &path
+                };
+                if let Some(change) = make_change(x, staged_path, from_path.as_deref()) {
+                    let file_path = change.path();
+                    let (additions, deletions, is_binary) = get_stats(file_path, true);
+                    entries.push(StatusEntry {
+                        change,
+                        staged: true,
+                        partially_staged: false,
+                        additions,
+                        deletions,
+                        is_binary,
+                    });
+                }
+            }
+
+            // Handle unstaged changes (Y status)
+            if y != ' ' {
+                if let Some(change) = make_change(y, &path, from_path.as_deref()) {
+                    let file_path = change.path();
+                    let (additions, deletions, is_binary) = get_stats(file_path, false);
+                    entries.push(StatusEntry {
+                        change,
+                        staged: false,
+                        partially_staged: false,
+                        additions,
+                        deletions,
+                        is_binary,
+                    });
+                }
             }
         }
     }
