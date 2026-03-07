@@ -1809,6 +1809,101 @@ impl DiffView {
         }
     }
 
+    /// Refresh the diff view after staging a hunk.
+    ///
+    /// After staging, the index changes but diff_base (which represents the index)
+    /// is stale. This method fetches the new index content and recomputes the diff.
+    ///
+    /// Returns true if refresh succeeded, false if there are no more unstaged changes.
+    fn refresh_after_staging(&mut self) -> bool {
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+
+        let index_bytes = match git::get_index_content(&self.absolute_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return false, // Can't refresh without index content
+        };
+
+        let new_diff_base = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        // Wrapper for RopeSlice to implement TokenSource (needed for imara_diff)
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+
+            fn estimate_tokens(&self) -> u32 {
+                self.0.len_lines() as u32
+            }
+        }
+
+        // Compute new hunks between new diff_base (index) and doc (working copy)
+        let input = InternedInput::new(
+            RopeLines(new_diff_base.slice(..)),
+
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let new_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        // If no hunks remain, all changes are staged
+        if new_hunks.is_empty() {
+            return false;
+        }
+
+        // Try to preserve the selected hunk by finding a hunk with similar position
+        let old_hunk = self.hunks.get(self.selected_hunk);
+        let new_selected_hunk = if let Some(old) = old_hunk {
+            // Find a hunk in the new set with a similar `after.start` position
+            new_hunks
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, h)| h.after.start.abs_diff(old.after.start))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Update all relevant fields
+        self.diff_base = new_diff_base;
+        self.hunks = new_hunks;
+
+
+        self.added = 0;
+        self.removed = 0;
+        for hunk in &self.hunks {
+            self.added += (hunk.after.end.saturating_sub(hunk.after.start)) as usize;
+            self.removed += (hunk.before.end.saturating_sub(hunk.before.start)) as usize;
+        }
+
+        // Recompute diff lines and boundaries
+        self.compute_diff_lines();
+
+        // Clear caches since diff_base changed
+        self.word_diff_cache.borrow_mut().clear();
+        self.syntax_highlight_cache.borrow_mut().clear();
+        self.function_context_cache.borrow_mut().clear();
+        self.function_context_highlight_cache.borrow_mut().clear();
+        self.cached_syntax_base = None; // Need to re-parse syntax for new diff_base
+
+        // Reset staged hunks tracking and re-detect
+        self.staged_hunks.clear();
+        self.detect_staged_hunks();
+
+        // Update selection
+        self.selected_hunk = new_selected_hunk.min(self.hunk_boundaries.len().saturating_sub(1));
+
+            self.selected_line = boundary.start;
+        }
+
+        true
+    }
+
     /// Initialize Syntax objects once on first render
     /// Word diffs, highlights, and function context are computed lazily in prepare_visible
     fn initialize_caches(&mut self, loader: &Loader, _theme: &helix_view::Theme) {
@@ -4120,7 +4215,7 @@ impl Component for DiffView {
                             return EventResult::Consumed(None);
                         }
 
-                        // Stage the hunk synchronously and stay in the view
+                        // Stage the hunk synchronously and refresh the diff view
                         match git::stage_hunk(&self.absolute_path, &patch) {
                             Ok(()) => {
                                 // Mark hunk as staged and stay in the view
