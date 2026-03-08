@@ -1490,6 +1490,58 @@ pub struct DiffView {
     blame_loaded: bool,
 }
 
+/// Find the best matching line in an opened document by comparing content.
+///
+/// First tries an exact match within ±50 lines of `target_line_num`, then
+/// falls back to a simple character-similarity heuristic. Returns
+/// `target_line_num` (clamped) if no good match is found.
+fn find_best_matching_line(
+    cx: &mut Context,
+    doc_id: helix_view::DocumentId,
+    target_line_num: usize,
+    target_line_content: &str,
+) -> usize {
+    let Some(doc) = cx.editor.document(doc_id) else {
+        return target_line_num;
+    };
+    let text = doc.text().slice(..);
+    let max_line = text.len_lines().saturating_sub(1);
+    let mut best_line = target_line_num.min(max_line);
+
+    let target_trimmed = target_line_content.trim();
+    if target_trimmed.is_empty() {
+        return best_line;
+    }
+
+    let search_range: usize = 50;
+    let start = target_line_num.saturating_sub(search_range);
+    let end = (target_line_num + search_range).min(max_line);
+
+    let mut best_score = 0usize;
+    for line_idx in start..=end {
+        let line_text: String = text.line(line_idx).into();
+        let line_trimmed = line_text.trim();
+
+        if line_trimmed == target_trimmed {
+            // Exact match — use immediately
+            return line_idx;
+        }
+
+        // Simple similarity: count leading matching characters
+        let score = line_trimmed
+            .chars()
+            .zip(target_trimmed.chars())
+            .filter(|(a, b)| a == b)
+            .count();
+        if score > best_score && score > target_trimmed.len() / 2 {
+            best_score = score;
+            best_line = line_idx;
+        }
+    }
+
+    best_line
+}
+
 /// Re-open the diff view for a file after a successful revert.
 ///
 /// Reads the file from disk, computes a fresh diff against HEAD,
@@ -4132,86 +4184,131 @@ impl Component for DiffView {
                 KeyCode::Enter => {
                     // Jump to the selected line in the document
                     if !self.diff_lines.is_empty() {
-                        // Get the line number from the selected diff line
-                        let line = if let Some(diff_line) = self.diff_lines.get(self.selected_line)
-                        {
-                            match diff_line {
-                                DiffLine::HunkHeader { new_start, .. } => *new_start as usize,
-                                DiffLine::Context {
-                                    doc_line,
-                                    base_line,
-                                    ..
-                                } => {
-                                    // Context-after lines have doc_line set (from new version)
-                                    // Context-before lines have base_line set (from old version) and doc_line: None
-                                    if let Some(n) = doc_line {
-                                        // Context-after: use the doc_line directly
-                                        (n - 1) as usize
-                                    } else if let Some(base) = base_line {
-                                        // Context-before: calculate approximate line in new document
-                                        // base_line is 1-indexed, hunk.before.start/after.start are 0-indexed
-                                        // Formula: hunk.after.start - (hunk.before.start - (base_line - 1))
-                                        //        = hunk.after.start - hunk.before.start + base_line - 1
-                                        self.hunks
-                                            .get(self.selected_hunk)
-                                            .map(|h| {
-                                                (h.after.start as i32 - h.before.start as i32
-                                                    + *base as i32
-                                                    - 1)
-                                                .max(0)
-                                                    as usize
-                                            })
-                                            .unwrap_or(0)
-                                    } else {
-                                        0
+                        // Get the target line number from the selected diff line
+                        let target_line_num =
+                            if let Some(diff_line) = self.diff_lines.get(self.selected_line) {
+                                match diff_line {
+                                    DiffLine::HunkHeader { new_start, .. } => *new_start as usize,
+                                    DiffLine::Context {
+                                        doc_line,
+                                        base_line,
+                                        ..
+                                    } => {
+                                        if let Some(n) = doc_line {
+                                            (n - 1) as usize
+                                        } else if let Some(base) = base_line {
+                                            self.hunks
+                                                .get(self.selected_hunk)
+                                                .map(|h| {
+                                                    (h.after.start as i32 - h.before.start as i32
+                                                        + *base as i32
+                                                        - 1)
+                                                    .max(0)
+                                                        as usize
+                                                })
+                                                .unwrap_or(0)
+                                        } else {
+                                            0
+                                        }
                                     }
-                                }
-                                DiffLine::Addition { doc_line, .. } => (*doc_line - 1) as usize,
-                                DiffLine::Deletion { .. } => {
-                                    // For deletions, jump to where the deletion occurred in the current doc
-                                    // Use the selected hunk's after.start as the best approximation
-                                    self.hunks
+                                    DiffLine::Addition { doc_line, .. } => (*doc_line - 1) as usize,
+                                    DiffLine::Deletion { .. } => self
+                                        .hunks
                                         .get(self.selected_hunk)
                                         .map(|h| h.after.start as usize)
-                                        .unwrap_or(0)
+                                        .unwrap_or(0),
                                 }
-                            }
+                            } else {
+                                self.hunks
+                                    .first()
+                                    .map(|h| h.after.start as usize)
+                                    .unwrap_or(0)
+                            };
+
+                        // Capture the line content from the diff doc for similarity matching
+                        // when the workspace file may differ from the commit version
+                        let target_line_content = if target_line_num < self.doc.len_lines() {
+                            let line_slice = self.doc.line(target_line_num);
+                            String::from(line_slice).trim_end_matches('\n').to_string()
                         } else {
-                            // Fallback to first hunk's start
-                            self.hunks
-                                .first()
-                                .map(|h| h.after.start as usize)
-                                .unwrap_or(0)
+                            String::new()
                         };
 
                         let doc_id = self.doc_id;
+                        let file_path = self.file_path.clone();
+                        let absolute_path = self.absolute_path.clone();
 
-                        // Create a callback that closes the overlay and jumps to the line
                         let jump_fn: Callback =
                             Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
-                                // Pop the overlay
-                                compositor.pop();
+                                // Pop the DiffView and remove all git picker overlay layers
+                                // so the user lands back in the editor, not a stale picker.
+                                compositor.pop(); // DiffView
+                                compositor.remove("commit_file_picker");
+                                compositor.remove("git_log_picker");
+                                compositor.remove("git_stash_picker");
+                                compositor.remove("git_status_picker");
 
-                                // Switch to the document
-                                cx.editor.switch(doc_id, Action::Replace);
+                                // Helper: jump cursor to a line in the focused document
+                                let jump_to_line =
+                                    |cx: &mut Context, doc_id: DocumentId, line: usize| {
+                                        let view_id = cx.editor.tree.focus;
+                                        if let Some(doc) = cx.editor.document_mut(doc_id) {
+                                            let text = doc.text().slice(..);
+                                            let max_line = text.len_lines().saturating_sub(1);
+                                            let clamped = line.min(max_line);
+                                            let pos = text.line_to_char(clamped);
+                                            let selection =
+                                                doc.selection(view_id).clone().transform(|range| {
+                                                    range.put_cursor(text, pos, false)
+                                                });
+                                            doc.set_selection(view_id, selection);
+                                            cx.editor.ensure_cursor_in_view(view_id);
+                                        }
+                                    };
 
-                                // Get the current view id from the tree's focus
-                                let view_id = cx.editor.tree.focus;
+                                // Case 1: Valid doc_id (status picker — file is open in editor)
+                                if doc_id != helix_view::DocumentId::default() {
+                                    if cx.editor.document(doc_id).is_some() {
+                                        cx.editor.switch(doc_id, Action::Replace);
+                                        jump_to_line(cx, doc_id, target_line_num);
+                                        return;
+                                    }
+                                }
 
-                                // Get the document and set the selection
-                                if let Some(doc) = cx.editor.document_mut(doc_id) {
-                                    let text = doc.text().slice(..);
-                                    // Convert line number to character position
-                                    let pos = text.line_to_char(line);
-                                    // Create a selection at that position
-                                    let selection = doc
-                                        .selection(view_id)
-                                        .clone()
-                                        .transform(|range| range.put_cursor(text, pos, false));
-                                    doc.set_selection(view_id, selection);
+                                // Case 2: Historical commit diff — open the file from workspace
+                                let cwd = helix_stdx::env::current_working_dir();
+                                let workspace_path = if absolute_path.is_absolute() {
+                                    absolute_path.clone()
+                                } else {
+                                    cwd.join(&file_path)
+                                };
 
-                                    // Ensure cursor is in view after setting selection
-                                    cx.editor.ensure_cursor_in_view(view_id);
+                                if !workspace_path.exists() {
+                                    cx.editor.set_error(format!(
+                                        "File not found: {}",
+                                        file_path.display()
+                                    ));
+                                    return;
+                                }
+
+                                match cx.editor.open(&workspace_path, Action::Replace) {
+                                    Ok(opened_doc_id) => {
+                                        // Find the best line to jump to via similarity matching
+                                        let best_line = if !target_line_content.is_empty() {
+                                            find_best_matching_line(
+                                                cx,
+                                                opened_doc_id,
+                                                target_line_num,
+                                                &target_line_content,
+                                            )
+                                        } else {
+                                            target_line_num
+                                        };
+                                        jump_to_line(cx, opened_doc_id, best_line);
+                                    }
+                                    Err(e) => {
+                                        cx.editor.set_error(format!("Failed to open file: {}", e));
+                                    }
                                 }
                             });
                         return EventResult::Consumed(Some(jump_fn));
