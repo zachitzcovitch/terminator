@@ -185,6 +185,63 @@ pub fn get_index_content(file: &Path) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Get the unstaged diff for a file (INDEX→workdir).
+/// Runs `git diff -- <file>` which produces the exact patch that `git apply --cached` expects.
+pub fn get_unstaged_diff(file_path: &Path) -> Result<String> {
+    let file = gix::path::realpath(file_path).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let work_dir = repo.workdir().context("bare repository has no worktree")?;
+    let rela_path = file.strip_prefix(work_dir)?;
+
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--")
+        .arg(rela_path)
+        .current_dir(work_dir)
+        .output()
+        .context("failed to execute git diff")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Get the staged diff for a file (HEAD→INDEX).
+/// Runs `git diff --cached -- <file>` which produces the exact patch for staged changes.
+pub fn get_staged_diff(file_path: &Path) -> Result<String> {
+    let file = gix::path::realpath(file_path).context("resolve symlinks")?;
+    let repo_dir = get_repo_dir(&file)?;
+
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let work_dir = repo.workdir().context("bare repository has no worktree")?;
+    let rela_path = file.strip_prefix(work_dir)?;
+
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--")
+        .arg(rela_path)
+        .current_dir(work_dir)
+        .output()
+        .context("failed to execute git diff --cached")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff --cached failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Revert a hunk by applying a reverse patch using `git apply -R`
 pub fn revert_hunk(file_path: &Path, patch: &str) -> Result<()> {
     use std::io::Write;
