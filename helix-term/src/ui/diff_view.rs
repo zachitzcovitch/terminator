@@ -3827,6 +3827,225 @@ impl DiffView {
 
         patch
     }
+
+    /// Generate a patch for staging that uses INDEX-based line numbers and context.
+    ///
+    /// When a file is partially staged, previous staged hunks shift line numbers
+    /// in the INDEX. Our normal `generate_hunk_patch` uses HEAD line numbers and
+    /// HEAD context, but `git apply --cached` applies to the INDEX where line
+    /// numbers may be shifted. This method:
+
+    /// 2. Computes INDEX→workdir diff using imara_diff
+    /// 3. Finds the matching hunk by overlapping `after` ranges (workdir side)
+    /// 4. Generates a patch using INDEX content for context and INDEX line numbers
+    fn generate_stage_patch(&self, hunk: &Hunk) -> Option<String> {
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+        // Fetch current INDEX content
+        let index_bytes = git::get_index_content(&self.absolute_path).ok()?;
+        let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        // Compute INDEX→workdir diff
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+
+                self.0.len_lines() as u32
+            }
+        }
+
+        let input = InternedInput::new(
+            RopeLines(index_rope.slice(..)),
+            RopeLines(self.doc.slice(..)),
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let index_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        // Find matching hunk by overlapping `after` ranges (workdir side is the same)
+        let matching_hunk = index_hunks
+            .iter()
+            .find(|ih| ih.after.start < hunk.after.end && ih.after.end > hunk.after.start)?;
+
+        // Generate patch with INDEX content and INDEX line numbers
+        let patch = generate_patch_for_ropes(
+            &self.file_path,
+            matching_hunk,
+            &index_rope,
+            &self.doc,
+            3, // normal context lines
+        );
+
+        if patch.is_empty() {
+            None
+        } else {
+            Some(patch)
+        }
+    }
+
+
+    ///
+    /// For unstaging, `git apply --cached -R` reverses a patch against the INDEX.
+    /// We need to compute HEAD→INDEX diff and generate a patch with HEAD content
+    /// so that reversing it removes the change from the INDEX.
+    fn generate_unstage_patch(&self, hunk: &Hunk) -> Option<String> {
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+        // Fetch HEAD and INDEX content
+        let head_bytes = git::get_diff_base(&self.absolute_path).ok()?;
+        let head_rope = Rope::from(String::from_utf8_lossy(&head_bytes));
+
+        let index_bytes = git::get_index_content(&self.absolute_path).ok()?;
+        let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        // Compute HEAD→INDEX diff
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+            fn estimate_tokens(&self) -> u32 {
+                self.0.len_lines() as u32
+            }
+        }
+
+        let input = InternedInput::new(
+            RopeLines(head_rope.slice(..)),
+            RopeLines(index_rope.slice(..)),
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let head_index_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        // Find matching hunk by overlapping `before` range (HEAD side)
+        // The HEAD→workdir hunk.before matches the HEAD→INDEX hunk.before
+        let matching_hunk = head_index_hunks
+            .iter()
+            .find(|hih| hih.before.start < hunk.before.end && hih.before.end > hunk.before.start)?;
+
+        // Generate patch with HEAD content and HEAD line numbers
+        let patch = generate_patch_for_ropes(
+
+            matching_hunk,
+            &head_rope,
+            &index_rope,
+            3, // normal context lines
+        );
+
+        if patch.is_empty() {
+            None
+        } else {
+            Some(patch)
+        }
+    }
+}
+
+/// Generate a unified diff patch for a single hunk using explicit old/new ropes.
+///
+/// This is a standalone function (not a method) that generates a patch with
+/// context lines from `old_rope` and line numbers relative to `old_rope`.
+/// Used by `generate_stage_patch` and `generate_unstage_patch` where the
+/// "old" side may be INDEX or HEAD rather than the DiffView's diff_base.
+fn generate_patch_for_ropes(
+    file_path: &std::path::Path,
+    hunk: &Hunk,
+    old_rope: &Rope,
+    new_rope: &Rope,
+    context_lines: usize,
+) -> String {
+    let old_len = old_rope.len_lines();
+    let new_len = new_rope.len_lines();
+
+    let del_count = hunk.before.end.saturating_sub(hunk.before.start);
+
+
+    // Skip empty hunks
+    if del_count == 0 && add_count == 0 {
+        return String::new();
+    }
+
+    // Escape file path for patch header
+    let file_path_str = file_path.to_string_lossy();
+    let escaped_file_path = file_path_str
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+
+    let strip_line_ending = |content: helix_core::RopeSlice| -> String {
+        let s = content.as_str().unwrap_or("");
+        s.trim_end_matches('\n').trim_end_matches('\r').to_string()
+    };
+
+    // Context comes from old_rope (the side git apply will match against)
+    let old_hunk_start = hunk.before.start as usize;
+    let old_hunk_end = hunk.before.end as usize;
+
+    // Calculate context ranges (clamped to file bounds)
+    let ctx_before_start = old_hunk_start.saturating_sub(context_lines).min(old_len);
+    let ctx_before_end = old_hunk_start.min(old_len);
+
+
+    let ctx_after_start = old_hunk_end.min(old_len);
+    let ctx_after_end = (old_hunk_end + context_lines).min(old_len);
+    let ctx_after_count = ctx_after_end - ctx_after_start;
+
+    // Line counts for the hunk header must include context lines
+    let old_total = ctx_before_count + del_count as usize + ctx_after_count;
+    let new_total = ctx_before_count + add_count as usize + ctx_after_count;
+
+    // Start lines (1-indexed, accounting for context before)
+    let old_start = if ctx_before_count > 0 {
+        old_hunk_start.saturating_sub(ctx_before_count) + 1
+    } else {
+        old_hunk_start + 1
+    };
+    let new_start = if ctx_before_count > 0 {
+        (hunk.after.start as usize).saturating_sub(ctx_before_count) + 1
+    } else {
+        hunk.after.start as usize + 1
+    };
+
+    let mut patch = format!(
+        "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+
+    );
+
+    // Context before: lines from old_rope before the changed region
+    for line_num in ctx_before_start..ctx_before_end {
+        let content = old_rope.line(line_num);
+        patch.push_str(&format!(" {}\n", strip_line_ending(content)));
+    }
+
+    // Deletions: lines from old_rope in range hunk.before
+    for line_num in hunk.before.start..hunk.before.end {
+        if line_num as usize >= old_len {
+            break;
+        }
+        let content = old_rope.line(line_num as usize);
+        patch.push_str(&format!("-{}\n", strip_line_ending(content)));
+    }
+
+    // Additions: lines from new_rope in range hunk.after
+    for line_num in hunk.after.start..hunk.after.end {
+        if line_num as usize >= new_len {
+            break;
+        }
+        let content = new_rope.line(line_num as usize);
+        patch.push_str(&format!("+{}\n", strip_line_ending(content)));
+    }
+
+
+    for line_num in ctx_after_start..ctx_after_end {
+        let content = old_rope.line(line_num);
+        patch.push_str(&format!(" {}\n", strip_line_ending(content)));
+    }
+
+    patch
 }
 
 impl Component for DiffView {
@@ -4225,11 +4444,20 @@ impl Component for DiffView {
                         }
 
                         let hunk = self.hunks[selected].clone();
-                        let patch = self.generate_hunk_patch(&hunk, ContextSource::Index);
-                        if patch.is_empty() {
-                            cx.editor.set_status("Cannot unstage empty hunk");
-                            return EventResult::Consumed(None);
-                        }
+
+                        // Use HEAD→INDEX patch generation (handles partially staged files)
+                        // Falls back to simple HEAD-based approach if fetch fails
+                        let patch = match self.generate_unstage_patch(&hunk) {
+                            Some(p) => p,
+                            None => {
+                                let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
+                                if p.is_empty() {
+
+                                    return EventResult::Consumed(None);
+                                }
+                                p
+                            }
+                        };
 
                         match git::unstage_hunk(&self.absolute_path, &patch) {
                             Ok(()) => {
