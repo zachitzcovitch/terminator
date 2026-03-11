@@ -90,6 +90,17 @@ impl AgentOverlay {
         });
     }
 
+    /// Append text to the last assistant message, or create one if needed.
+    pub fn append_to_last(&mut self, text: &str) {
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == "assistant" {
+                last.content.push_str(text);
+                return;
+            }
+        }
+        self.push_message("assistant", text);
+    }
+
     /// Set the loading state (waiting for AI response).
     #[allow(dead_code)]
     pub fn set_loading(&mut self, loading: bool) {
@@ -262,6 +273,15 @@ impl Component for AgentOverlay {
         let text_style = theme.get("ui.text");
         let prompt_style = theme.get("ui.text.focus");
 
+        // -- Auto-scroll during streaming to keep latest content visible ------
+        if self.loading {
+            let total = self.total_output_lines(output_area.width as usize);
+            let visible = output_area.height as usize;
+            if total > visible {
+                self.scroll_offset = total.saturating_sub(visible);
+            }
+        }
+
         // -- Render messages --------------------------------------------------
         self.render_messages(
             output_area,
@@ -334,8 +354,9 @@ impl Component for AgentOverlay {
                     let session_id = self.session_id.clone();
                     let agent_id = self.agent_id.clone();
 
-                    // Use synchronous send_message which waits for the full
-                    // response. The callback updates the overlay when done.
+                    // Spawn async task that streams SSE deltas via
+                    // job::dispatch(), falling back to synchronous send_message
+                    // if the SSE connection fails.
                     cx.jobs.callback(async move {
                         // Create session if we don't have one yet
                         let sid = match session_id {
@@ -344,65 +365,214 @@ impl Component for AgentOverlay {
                                 Ok(session) => session.id,
                                 Err(e) => {
                                     let err_msg = format!("Failed to create session: {}", e);
-                                    let callback: job::Callback = job::Callback::EditorCompositor(
-                                        Box::new(move |_editor, compositor| {
-                                            if let Some(overlay) =
-                                                compositor.find::<Overlay<AgentOverlay>>()
-                                            {
-                                                overlay.content.loading = false;
-                                                overlay.content.push_message("assistant", &err_msg);
-                                            }
-                                        }),
-                                    );
-                                    return Ok(callback);
+                                    job::dispatch(move |_editor, compositor| {
+                                        if let Some(overlay) =
+                                            compositor.find::<Overlay<AgentOverlay>>()
+                                        {
+                                            overlay.content.loading = false;
+                                            overlay.content.push_message("assistant", &err_msg);
+                                        }
+                                    })
+                                    .await;
+                                    return Ok(job::Callback::EditorCompositor(Box::new(
+                                        |_, _| {},
+                                    )));
                                 }
                             },
                         };
+
+                        let session_id_for_events = sid.clone();
 
                         // Build the request, optionally targeting a specific agent
-                        let request = match &agent_id {
-                            Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(
-                                &message, id,
-                            ),
-                            None => helix_opencode::types::SendMessageRequest::text(&message),
-                        };
-
-                        // Send synchronously — blocks until the full response arrives
-                        let response = client.send_message(&sid, &request).await;
-                        let session_id_for_cb = sid;
-
-                        let callback: job::Callback = job::Callback::EditorCompositor(Box::new(
-                            move |_editor, compositor| {
-                                let Some(overlay) =
-                                    compositor.find::<Overlay<AgentOverlay>>()
-                                else {
-                                    return;
-                                };
-                                let agent = &mut overlay.content;
-                                agent.loading = false;
-                                agent.session_id = Some(session_id_for_cb);
-                                match response {
-                                    Ok(msg) => {
-                                        let content = msg.text_content();
-                                        if content.is_empty() {
-                                            agent.push_message("assistant", "(No response)");
-                                        } else {
-                                            agent.push_message("assistant", &content);
-                                        }
+                        let build_request =
+                            |msg: &str,
+                             aid: &Option<String>|
+                             -> helix_opencode::types::SendMessageRequest {
+                                match aid {
+                                    Some(id) => {
+                                        helix_opencode::types::SendMessageRequest::text_with_agent(
+                                            msg, id,
+                                        )
                                     }
-                                    Err(e) => {
-                                        agent.push_message(
-                                            "assistant",
-                                            &format!("Error: {}", e),
-                                        );
+                                    None => {
+                                        helix_opencode::types::SendMessageRequest::text(msg)
                                     }
                                 }
-                                // Auto-scroll to show the response
-                                let total_lines = agent.total_output_lines(80);
-                                agent.scroll_offset = total_lines.saturating_sub(20);
-                            },
-                        ));
-                        Ok(callback)
+                            };
+
+                        // Try SSE streaming approach
+                        match client.start_event_listener().await {
+                            Ok(mut rx) => {
+                                // SSE connected — send message asynchronously
+                                let request = build_request(&message, &agent_id);
+                                if let Err(e) = client.send_message_async(&sid, &request).await {
+                                    let err_msg = format!("Error: {}", e);
+                                    job::dispatch(move |_editor, compositor| {
+                                        if let Some(overlay) =
+                                            compositor.find::<Overlay<AgentOverlay>>()
+                                        {
+                                            overlay.content.loading = false;
+                                            overlay.content.push_message("assistant", &err_msg);
+                                        }
+                                    })
+                                    .await;
+                                    return Ok(job::Callback::EditorCompositor(Box::new(
+                                        |_, _| {},
+                                    )));
+                                }
+
+                                // Process SSE events — each delta dispatches a
+                                // UI update that triggers a re-render.
+                                // Track whether the overlay is still alive so
+                                // we can bail out of the loop early.
+                                let cancelled = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicBool::new(false),
+                                );
+                                let session_id_clone = session_id_for_events.clone();
+
+                                while let Some(event) = rx.recv().await {
+                                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    match event.event_type.as_str() {
+                                        "message.part.delta" => {
+                                            if let Ok(props) = serde_json::from_value::<
+                                                helix_opencode::types::PartDeltaProperties,
+                                            >(
+                                                event.properties
+                                            ) {
+                                                if props.session_id == session_id_clone
+                                                    && props.field == "text"
+                                                {
+                                                    let delta = props.delta;
+                                                    let flag = cancelled.clone();
+                                                    job::dispatch(
+                                                        move |_editor, compositor| {
+                                                            if let Some(overlay) = compositor
+                                                                .find::<Overlay<AgentOverlay>>()
+                                                            {
+                                                                overlay
+                                                                    .content
+                                                                    .append_to_last(&delta);
+                                                            } else {
+                                                                flag.store(
+                                                                    true,
+                                                                    std::sync::atomic::Ordering::Relaxed,
+                                                                );
+                                                            }
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                        "session.status" => {
+                                            // Check if our session went idle (response complete)
+                                            if let Some(props) = event.properties.as_object() {
+                                                let matches_session = props
+                                                    .get("sessionID")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s == session_id_clone)
+                                                    .unwrap_or(false);
+                                                let is_idle = props
+                                                    .get("status")
+                                                    .and_then(|v| v.get("type"))
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s == "idle")
+                                                    .unwrap_or(false);
+                                                if matches_session && is_idle {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // If no assistant message was ever created,
+                                // push a placeholder so the user sees feedback.
+                                if !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let flag = cancelled.clone();
+                                    job::dispatch(move |_editor, compositor| {
+                                        if let Some(overlay) =
+                                            compositor.find::<Overlay<AgentOverlay>>()
+                                        {
+                                            let has_assistant = overlay
+                                                .content
+                                                .messages
+                                                .last()
+                                                .map(|m| m.role == "assistant")
+                                                .unwrap_or(false);
+                                            if !has_assistant {
+                                                overlay
+                                                    .content
+                                                    .push_message("assistant", "(No response)");
+                                            }
+                                        } else {
+                                            flag.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    })
+                                    .await;
+                                }
+
+                                // Done streaming — finalize session_id and loading state
+                                let final_sid = session_id_for_events;
+                                Ok(job::Callback::EditorCompositor(Box::new(
+                                    move |_editor, compositor| {
+                                        if let Some(overlay) =
+                                            compositor.find::<Overlay<AgentOverlay>>()
+                                        {
+                                            overlay.content.session_id = Some(final_sid);
+                                            overlay.content.loading = false;
+                                        }
+                                    },
+                                )))
+                            }
+                            Err(_) => {
+                                // SSE failed — fall back to synchronous send_message
+                                let request = build_request(&message, &agent_id);
+                                let response = client.send_message(&sid, &request).await;
+                                let session_id_for_cb = sid;
+
+                                Ok(job::Callback::EditorCompositor(Box::new(
+                                    move |_editor, compositor| {
+                                        let Some(overlay) =
+                                            compositor.find::<Overlay<AgentOverlay>>()
+                                        else {
+                                            return;
+                                        };
+                                        let agent = &mut overlay.content;
+                                        agent.loading = false;
+                                        agent.session_id = Some(session_id_for_cb);
+                                        match response {
+                                            Ok(msg) => {
+                                                let content = msg.text_content();
+                                                if content.is_empty() {
+                                                    agent.push_message(
+                                                        "assistant",
+                                                        "(No response)",
+                                                    );
+                                                } else {
+                                                    agent.push_message("assistant", &content);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                agent.push_message(
+                                                    "assistant",
+                                                    &format!("Error: {}", e),
+                                                );
+                                            }
+                                        }
+                                        // Auto-scroll to show the response
+                                        let total_lines = agent.total_output_lines(80);
+                                        agent.scroll_offset = total_lines.saturating_sub(20);
+                                    },
+                                )))
+                            }
+                        }
                     });
                 }
                 EventResult::Consumed(None)
