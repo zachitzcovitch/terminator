@@ -428,6 +428,8 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    /// AI integration configuration.
+    pub ai: AiConfig,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1146,6 +1148,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            ai: AiConfig::default(),
         }
     }
 }
@@ -1155,6 +1158,30 @@ impl Default for SearchConfig {
         Self {
             wrap_around: true,
             smart_case: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AiConfig {
+    /// Enable AI integration.
+    pub enabled: bool,
+    /// Port for the OpenCode server.
+    pub port: u16,
+    /// Auto-start the server on first AI command.
+    pub auto_start: bool,
+    /// Path to the opencode binary.
+    pub opencode_path: String,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 4096,
+            auto_start: false,
+            opencode_path: "opencode".to_string(),
         }
     }
 }
@@ -1247,6 +1274,7 @@ pub struct Editor {
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
+    pub opencode_server: Option<helix_opencode::server::OpenCodeServer>,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1368,6 +1396,7 @@ impl Editor {
             handlers,
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
+            opencode_server: None,
         }
     }
 

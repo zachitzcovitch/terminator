@@ -1,3 +1,4 @@
+pub(crate) mod agent_overlay;
 pub(crate) mod blame;
 mod completion;
 pub(crate) mod diff_view;

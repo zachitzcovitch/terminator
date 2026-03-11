@@ -2782,6 +2782,104 @@ fn echo(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     Ok(())
 }
 
+fn ai_start(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.opencode_server.is_some() {
+        cx.editor.set_status("OpenCode server is already running");
+        return Ok(());
+    }
+
+    let config = cx.editor.config();
+    let port = config.ai.port;
+    let opencode_path = config.ai.opencode_path.clone();
+
+    cx.editor.set_status("Starting OpenCode server...");
+
+    let callback = async move {
+        let result =
+            helix_opencode::server::OpenCodeServer::start(port, &opencode_path).await;
+
+        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, _compositor: &mut Compositor| match result {
+                Ok(server) => {
+                    let managed = server.info().managed;
+                    editor.opencode_server = Some(server);
+                    if managed {
+                        editor.set_status(format!(
+                            "OpenCode server started on port {}",
+                            port
+                        ));
+                    } else {
+                        editor.set_status(format!(
+                            "Connected to existing OpenCode server on port {}",
+                            port
+                        ));
+                    }
+                }
+                Err(e) => {
+                    editor.set_error(format!("Failed to start OpenCode: {}", e));
+                }
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn ai_stop(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if let Some(mut server) = cx.editor.opencode_server.take() {
+        let callback = async move {
+            server.shutdown().await;
+            let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                |editor: &mut Editor, _compositor: &mut Compositor| {
+                    editor.set_status("OpenCode server stopped");
+                },
+            ));
+            Ok(call)
+        };
+        cx.jobs.callback(callback);
+    } else {
+        cx.editor.set_status("OpenCode server is not running");
+    }
+
+    Ok(())
+}
+
+fn ai_status(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.opencode_server.is_some() {
+        cx.editor.set_status("OpenCode: connected");
+    } else {
+        cx.editor.set_status("OpenCode: not running (use :ai-start)");
+    }
+
+    Ok(())
+}
+
 fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyhow::Result<()> {
     Ok(())
 }
@@ -4028,6 +4126,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ai-start",
+        aliases: &[],
+        doc: "Start or connect to the OpenCode AI server",
+        fun: ai_start,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ai-stop",
+        aliases: &[],
+        doc: "Stop the OpenCode AI server",
+        fun: ai_stop,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ai-status",
+        aliases: &[],
+        doc: "Show OpenCode AI server status",
+        fun: ai_status,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

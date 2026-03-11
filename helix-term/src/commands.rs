@@ -417,6 +417,7 @@ impl MappableCommand {
         git_log_picker, "Open git log picker",
         git_stash_picker, "Open git stash picker",
         git_blame_view, "Open git blame view",
+        open_agent_overlay, "Open AI agent overlay",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
@@ -5204,6 +5205,11 @@ fn git_blame_view(cx: &mut Context) {
 
     let blame_view = ui::BlameView::new(blame_lines, file_name, cursor_line);
     cx.push_layer(Box::new(overlaid(blame_view)));
+}
+
+fn open_agent_overlay(cx: &mut Context) {
+    let overlay = ui::agent_overlay::AgentOverlay::new();
+    cx.push_layer(Box::new(overlaid(overlay)));
 }
 
 // Helper function to extract hunk data to avoid borrow issues with cx.editor

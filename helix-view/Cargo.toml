@@ -23,6 +23,7 @@ helix-loader = { path = "../helix-loader" }
 helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
 helix-vcs = { path = "../helix-vcs" }
+helix-opencode = { path = "../helix-opencode" }
 
 bitflags.workspace = true
 anyhow = "1"
