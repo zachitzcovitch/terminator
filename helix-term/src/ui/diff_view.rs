@@ -996,7 +996,7 @@ fn build_context_lines(
 enum ContextSource {
     /// Use working copy (doc) for context lines - for revert operations
     WorkingCopy,
-    /// Use index/HEAD (diff_base) for context lines - for stage operations
+    /// Use diff_base (typically HEAD content) for context lines. Used when generating patches for git apply --cached.
     Index,
 }
 use helix_vcs::Hunk;
@@ -1922,25 +1922,6 @@ impl DiffView {
             self.added = 0;
             self.removed = self.diff_base.len_lines();
         }
-    }
-
-    /// Refresh the diff view after staging/unstaging a hunk.
-    ///
-    /// The diff view always shows HEAD→workdir (all changes). Staging/unstaging
-    /// only changes which hunks are marked as staged (rendered with muted colors).
-    /// We keep diff_base and hunks unchanged and just re-detect staged hunks.
-    #[allow(dead_code)]
-    fn refresh_after_staging(&mut self) {
-        // Don't change diff_base or hunks — keep showing HEAD→workdir
-        // Just re-detect which hunks are staged
-        self.staged_hunks.clear();
-        self.detect_staged_hunks();
-
-        // Clear rendering caches so muted styling updates
-        self.word_diff_cache.borrow_mut().clear();
-        self.syntax_highlight_cache.borrow_mut().clear();
-        self.function_context_cache.borrow_mut().clear();
-        self.function_context_highlight_cache.borrow_mut().clear();
     }
 
     /// Initialize Syntax objects once on first render
@@ -3884,143 +3865,210 @@ impl DiffView {
         patch
     }
 
-    /// Generate a patch for staging using git's own diff output.
+    /// Generate a patch for staging by computing INDEX→workdir diff with imara_diff.
     ///
-    /// Runs `git diff -- <file>` to get the INDEX→workdir diff, then extracts
-    /// the hunk that overlaps with the selected HEAD→workdir hunk. Since git
-    /// generates the patch itself, line numbers and context are always correct,
-    /// even for partially staged files where INDEX differs from HEAD.
+    /// Instead of parsing `git diff` output (which has hunk boundary mismatches),
+    /// we fetch the INDEX content directly, diff it against the working copy, and
+    /// find the hunk that overlaps with the selected HEAD→workdir hunk. Context
+    /// lines come from INDEX, which is what `git apply --cached` checks against.
     fn generate_stage_patch(&self, hunk: &Hunk) -> Option<String> {
-        let diff_output = git::get_unstaged_diff(&self.absolute_path).ok()?;
-        if diff_output.is_empty() {
-            return None;
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+        let index_bytes = git::get_index_content(&self.absolute_path).ok()?;
+        let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+            fn estimate_tokens(&self) -> u32 {
+                self.0.len_lines() as u32
+            }
         }
 
-        let hunks = extract_hunks_from_diff(&diff_output);
+        // Compute INDEX→workdir diff to get exact hunk boundaries
+        let input = InternedInput::new(
+            RopeLines(index_rope.slice(..)),
+            RopeLines(self.doc.slice(..)),
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let index_hunks: Vec<Hunk> = diff.hunks().collect();
 
-        // Match by workdir line numbers: the `+` side (new_start) of the INDEX→workdir
-        // diff corresponds to workdir lines, which align with hunk.after (0-indexed).
-        // Git uses 1-indexed line numbers, so compare new_start-1 with hunk.after.start.
-        let matching = hunks.into_iter().find(|(_, _, new_start, new_count, _)| {
-            let git_start = (*new_start).saturating_sub(1) as u32;
-            let git_end = git_start + *new_count as u32;
-            git_start < hunk.after.end && git_end > hunk.after.start
-        })?;
+        // Find matching INDEX→workdir hunk by overlapping `after` ranges (workdir side)
+        // Both the HEAD→workdir hunk and INDEX→workdir hunk share the same workdir
+        let matching_hunk = index_hunks
+            .iter()
+            .find(|ih| ranges_overlap(&ih.after, &hunk.after))?;
 
-        Some(matching.4)
+        self.build_patch_from_hunk(matching_hunk, &index_rope, &self.doc)
     }
 
-    /// Generate a patch for unstaging using git's own diff output.
+    /// Generate a patch for unstaging by computing INDEX→HEAD diff with imara_diff.
     ///
-    /// Runs `git diff --cached -- <file>` to get the HEAD→INDEX diff, then
-    /// extracts the hunk that overlaps with the selected hunk. The resulting
-    /// patch is applied with `git apply --cached -R` to reverse the staged change.
+    /// Computes the diff from INDEX to HEAD (reversing the staged change), finds
+    /// the hunk overlapping the selected HEAD→workdir hunk's `before` range, and
+    /// generates a forward-apply patch with INDEX context. Applied with
+    /// `git apply --cached` (no -R) to move INDEX back toward HEAD.
     fn generate_unstage_patch(&self, hunk: &Hunk) -> Option<String> {
-        let diff_output = git::get_staged_diff(&self.absolute_path).ok()?;
-        if diff_output.is_empty() {
+        use imara_diff::{Algorithm, Diff, InternedInput};
+
+        let head_bytes = git::get_diff_base(&self.absolute_path).ok()?;
+        let head_rope = Rope::from(String::from_utf8_lossy(&head_bytes));
+
+        let index_bytes = git::get_index_content(&self.absolute_path).ok()?;
+        let index_rope = Rope::from(String::from_utf8_lossy(&index_bytes));
+
+        struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+        impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+            type Token = helix_core::RopeSlice<'a>;
+            type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+            fn tokenize(&self) -> Self::Tokenizer {
+                self.0.lines()
+            }
+            fn estimate_tokens(&self) -> u32 {
+                self.0.len_lines() as u32
+            }
+        }
+
+        // Compute INDEX→HEAD diff (reverse of staged changes)
+        // In this diff: old=INDEX, new=HEAD
+        let input = InternedInput::new(
+            RopeLines(index_rope.slice(..)),
+            RopeLines(head_rope.slice(..)),
+        );
+        let diff = Diff::compute(Algorithm::Histogram, &input);
+        let index_head_hunks: Vec<Hunk> = diff.hunks().collect();
+
+        // Find matching hunk: the HEAD→workdir hunk's `before` range is in HEAD-space.
+        // In the INDEX→HEAD diff, HEAD is the `after` side.
+        let matching_hunk = index_head_hunks
+            .iter()
+            .find(|ih| ranges_overlap(&ih.after, &hunk.before))?;
+
+        self.build_patch_from_hunk(matching_hunk, &index_rope, &head_rope)
+    }
+
+    /// Build a unified diff patch from a single hunk with explicit old/new ropes.
+    ///
+    /// `old_rope` provides context and deletion lines (the `-` side).
+    /// `new_rope` provides addition lines (the `+` side).
+    /// The hunk's `before` range indexes into `old_rope`, `after` into `new_rope`.
+    fn build_patch_from_hunk(
+        &self,
+        hunk: &Hunk,
+        old_rope: &Rope,
+        new_rope: &Rope,
+    ) -> Option<String> {
+        let old_len = old_rope.len_lines();
+        let new_len = new_rope.len_lines();
+
+        let del_count = hunk.before.end.saturating_sub(hunk.before.start) as usize;
+        let add_count = hunk.after.end.saturating_sub(hunk.after.start) as usize;
+
+        if del_count == 0 && add_count == 0 {
             return None;
         }
 
-        let hunks = extract_hunks_from_diff(&diff_output);
+        let file_path_str = self.file_path.to_string_lossy();
 
-        // Match by HEAD line numbers: the `-` side (old_start) of the HEAD→INDEX
-        // diff corresponds to HEAD lines, which align with hunk.before (0-indexed).
-        // Git uses 1-indexed line numbers, so compare old_start-1 with hunk.before.start.
-        let matching = hunks.into_iter().find(|(old_start, old_count, _, _, _)| {
-            let git_start = (*old_start).saturating_sub(1) as u32;
-            let git_end = git_start + *old_count as u32;
-            git_start < hunk.before.end && git_end > hunk.before.start
-        })?;
+        let strip_line_ending = |content: helix_core::RopeSlice| -> String {
+            let mut s = String::from(content);
+            while s.ends_with('\n') || s.ends_with('\r') {
+                s.pop();
+            }
+            s
+        };
 
-        Some(matching.4)
+        let old_hunk_start = hunk.before.start as usize;
+        let old_hunk_end = hunk.before.end as usize;
+
+        // Context lines before the hunk (up to 3 lines, clamped to file bounds)
+        let ctx_before_start = old_hunk_start.saturating_sub(3).min(old_len);
+        let ctx_before_end = old_hunk_start.min(old_len);
+        let ctx_before_count = ctx_before_end - ctx_before_start;
+
+        // Context lines after the hunk (up to 3 lines, clamped to file bounds)
+        let ctx_after_start = old_hunk_end.min(old_len);
+        let ctx_after_end = (old_hunk_end + 3).min(old_len);
+        let ctx_after_count = ctx_after_end - ctx_after_start;
+
+        let old_total = ctx_before_count + del_count + ctx_after_count;
+        let new_total = ctx_before_count + add_count + ctx_after_count;
+
+        // 1-indexed start lines for the patch header
+        let old_start = if ctx_before_count > 0 {
+            old_hunk_start - ctx_before_count + 1
+        } else {
+            old_hunk_start + 1
+        };
+        let new_start = if ctx_before_count > 0 {
+            (hunk.after.start as usize).saturating_sub(ctx_before_count) + 1
+        } else {
+            hunk.after.start as usize + 1
+        };
+
+        let mut patch = format!(
+            "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+            file_path_str, file_path_str, old_start, old_total, new_start, new_total
+        );
+
+        // Context before from old_rope
+        for line_num in ctx_before_start..ctx_before_end {
+            let content = old_rope.line(line_num);
+            patch.push_str(&format!(" {}\n", strip_line_ending(content)));
+        }
+
+        // Deletions from old_rope
+        for line_num in hunk.before.start..hunk.before.end {
+            if line_num as usize >= old_len {
+                break;
+            }
+            let content = old_rope.line(line_num as usize);
+            patch.push_str(&format!("-{}\n", strip_line_ending(content)));
+        }
+
+        // Additions from new_rope
+        for line_num in hunk.after.start..hunk.after.end {
+            if line_num as usize >= new_len {
+                break;
+            }
+            let content = new_rope.line(line_num as usize);
+            patch.push_str(&format!("+{}\n", strip_line_ending(content)));
+        }
+
+        // Context after from old_rope
+        for line_num in ctx_after_start..ctx_after_end {
+            let content = old_rope.line(line_num);
+            patch.push_str(&format!(" {}\n", strip_line_ending(content)));
+        }
+
+        Some(patch)
     }
 }
 
-/// Extract individual hunks from a unified diff output string.
+/// Check whether two `u32` ranges overlap, handling zero-width (insertion point) ranges.
 ///
-/// Parses `git diff` output and splits it into individual hunks, each including
-/// the `--- a/` and `+++ b/` headers. Returns a vector of tuples:
-/// `(old_start, old_count, new_start, new_count, full_hunk_patch)`.
-///
-/// The `full_hunk_patch` for each hunk is a complete, self-contained patch that
-/// can be fed directly to `git apply`.
-fn extract_hunks_from_diff(diff_output: &str) -> Vec<(u32, u32, u32, u32, String)> {
-    let mut hunks = Vec::new();
-    let mut header_lines = String::new();
-    let mut current_hunk = String::new();
-    let mut current_old_start = 0u32;
-    let mut current_old_count = 0u32;
-    let mut current_new_start = 0u32;
-    let mut current_new_count = 0u32;
-
-    for line in diff_output.lines() {
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            header_lines.push_str(line);
-            header_lines.push('\n');
-        } else if line.starts_with("@@ ") {
-            // Save previous hunk if any
-            if !current_hunk.is_empty() {
-                hunks.push((
-                    current_old_start,
-                    current_old_count,
-                    current_new_start,
-                    current_new_count,
-                    format!("{}{}", header_lines, current_hunk),
-                ));
-            }
-            current_hunk = String::new();
-            current_hunk.push_str(line);
-            current_hunk.push('\n');
-
-            // Parse @@ -X,Y +A,B @@ (or @@ -X +A,B @@ for single-line hunks)
-            if let Some(header) = line.strip_prefix("@@ ") {
-                if let Some(at_end) = header.find(" @@") {
-                    let ranges = &header[..at_end];
-                    let parts: Vec<&str> = ranges.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        // Parse old range: -X,Y or -X
-                        if let Some(old_range) = parts[0].strip_prefix('-') {
-                            let old_parts: Vec<&str> = old_range.split(',').collect();
-                            current_old_start = old_parts[0].parse().unwrap_or(0);
-                            current_old_count = if old_parts.len() > 1 {
-                                old_parts[1].parse().unwrap_or(1)
-                            } else {
-                                1
-                            };
-                        }
-                        // Parse new range: +A,B or +A
-                        if let Some(new_range) = parts[1].strip_prefix('+') {
-                            let new_parts: Vec<&str> = new_range.split(',').collect();
-                            current_new_start = new_parts[0].parse().unwrap_or(0);
-                            current_new_count = if new_parts.len() > 1 {
-                                new_parts[1].parse().unwrap_or(1)
-                            } else {
-                                1
-                            };
-                        }
-                    }
-                }
-            }
-        } else if in_hunks {
-            // Hunk content: context ( ), deletions (-), additions (+), no-newline (\)
-            // This correctly handles deleted lines starting with "--- " as content.
-            current_hunk.push_str(line);
-            current_hunk.push('\n');
-        }
+/// Zero-width ranges represent pure insertions/deletions where start == end.
+/// For these, we check containment within the other range rather than strict overlap.
+fn ranges_overlap(a: &std::ops::Range<u32>, b: &std::ops::Range<u32>) -> bool {
+    let a_empty = a.start == a.end;
+    let b_empty = b.start == b.end;
+    if a_empty && b_empty {
+        // Both are insertion points — match if at same position
+        a.start == b.start
+    } else if a_empty {
+        // a is an insertion point — match if within b's range
+        a.start >= b.start && a.start <= b.end
+    } else if b_empty {
+        // b is an insertion point — match if within a's range
+        b.start >= a.start && b.start <= a.end
+    } else {
+        // Normal overlap check
+        a.start < b.end && a.end > b.start
     }
-
-    // Don't forget the last hunk
-    if !current_hunk.is_empty() {
-        hunks.push((
-            current_old_start,
-            current_old_count,
-            current_new_start,
-            current_new_count,
-            format!("{}{}", header_lines, current_hunk),
-        ));
-    }
-
-    hunks
 }
 
 impl Component for DiffView {
@@ -4474,21 +4522,27 @@ impl Component for DiffView {
 
                         let hunk = self.hunks[selected].clone();
 
-                        // Use git-generated HEAD→INDEX patch, reverse-applied with -R.
-                        // Falls back to HEAD-based approach if git diff --cached fails.
-                        let patch = match self.generate_unstage_patch(&hunk) {
-                            Some(p) => p,
+                        // Generate INDEX→HEAD patch (forward-apply to move INDEX back toward HEAD).
+                        // Falls back to HEAD-based reverse-apply if INDEX/HEAD fetch fails.
+                        let (patch, use_forward_apply) = match self.generate_unstage_patch(&hunk) {
+                            Some(p) => (p, true),
                             None => {
                                 let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
                                 if p.is_empty() {
                                     cx.editor.set_status("Cannot unstage empty hunk");
                                     return EventResult::Consumed(None);
                                 }
-                                p
+                                (p, false)
                             }
                         };
 
-                        let result = git::unstage_hunk(&self.absolute_path, &patch);
+                        let result = if use_forward_apply {
+                            // INDEX→HEAD patch: apply forward to move INDEX toward HEAD
+                            git::stage_hunk(&self.absolute_path, &patch)
+                        } else {
+                            // Fallback HEAD→INDEX patch: reverse-apply with -R
+                            git::unstage_hunk(&self.absolute_path, &patch)
+                        };
 
                         match result {
                             Ok(()) => {
