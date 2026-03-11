@@ -6,7 +6,6 @@ use helix_view::graphics::{CursorKind, Rect};
 use helix_view::keyboard::{KeyCode, KeyModifiers};
 use helix_view::Editor;
 
-use std::sync::{Arc, Mutex};
 use tui::buffer::Buffer as Surface;
 use tui::text::Span;
 use tui::widgets::{Block, Widget};
@@ -56,11 +55,6 @@ pub struct AgentOverlay {
     loading: bool,
     /// Session ID assigned by the opencode server (None until first message).
     session_id: Option<String>,
-    /// Shared buffer for streaming text deltas from the background SSE task.
-    /// The background task pushes chunks here; `render()` drains them.
-    stream_buffer: Arc<Mutex<Vec<String>>>,
-    /// Set to `true` by the background task when the message is complete.
-    stream_done: Arc<Mutex<bool>>,
     /// Optional agent ID to target when sending messages.
     agent_id: Option<String>,
     /// Display name for the agent shown in the overlay title.
@@ -76,8 +70,6 @@ impl AgentOverlay {
             scroll_offset: 0,
             loading: false,
             session_id: None,
-            stream_buffer: Arc::new(Mutex::new(Vec::new())),
-            stream_done: Arc::new(Mutex::new(false)),
             agent_id: None,
             agent_name: "AI Agent".to_string(),
         }
@@ -99,22 +91,9 @@ impl AgentOverlay {
     }
 
     /// Set the loading state (waiting for AI response).
+    #[allow(dead_code)]
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
-    }
-
-    /// Append text to the last assistant message (for streaming responses).
-    ///
-    /// If the last message is not from the assistant, a new assistant message
-    /// is created automatically.
-    pub fn append_to_last(&mut self, text: &str) {
-        if let Some(last) = self.messages.last_mut() {
-            if last.role == "assistant" {
-                last.content.push_str(text);
-                return;
-            }
-        }
-        self.push_message("assistant", text);
     }
 
     // -------------------------------------------------------------------------
@@ -239,30 +218,6 @@ impl Component for AgentOverlay {
             return;
         }
 
-        // Drain any streaming deltas that arrived since the last frame.
-        // We collect into a local vec first to avoid holding the lock
-        // while calling &mut self methods.
-        let pending_deltas: Vec<String> = {
-            let mut buffer = self.stream_buffer.lock().unwrap();
-            buffer.drain(..).collect()
-        };
-        if !pending_deltas.is_empty() {
-            for delta in pending_deltas {
-                self.append_to_last(&delta);
-            }
-            // Auto-scroll to follow new content
-            let total = self.total_output_lines(area.width as usize);
-            let visible = area.height.saturating_sub(INPUT_AREA_HEIGHT + 2) as usize;
-            self.scroll_offset = total.saturating_sub(visible);
-        }
-        {
-            let mut done = self.stream_done.lock().unwrap();
-            if *done && self.loading {
-                self.loading = false;
-                *done = false;
-            }
-        }
-
         let theme = &cx.editor.theme;
 
         // -- Background -------------------------------------------------------
@@ -378,18 +333,9 @@ impl Component for AgentOverlay {
                     let client = server.client().clone();
                     let session_id = self.session_id.clone();
                     let agent_id = self.agent_id.clone();
-                    let stream_buffer = self.stream_buffer.clone();
-                    let stream_done = self.stream_done.clone();
 
-                    // Reset stream state for the new request
-                    *stream_done.lock().unwrap() = false;
-
-                    // Spawn a long-running job that:
-                    // 1. Creates a session (if needed)
-                    // 2. Connects to the SSE event stream
-                    // 3. Sends the message via prompt_async
-                    // 4. Reads SSE deltas into the shared buffer
-                    // 5. Returns a final callback when the message is complete
+                    // Use synchronous send_message which waits for the full
+                    // response. The callback updates the overlay when done.
                     cx.jobs.callback(async move {
                         // Create session if we don't have one yet
                         let sid = match session_id {
@@ -413,125 +359,49 @@ impl Component for AgentOverlay {
                             },
                         };
 
-                        // Connect to the SSE event stream before sending the message
-                        // so we don't miss any early deltas.
-                        let mut event_rx = match client.start_event_listener().await {
-                            Ok(rx) => rx,
-                            Err(e) => {
-                                // Fall back to synchronous send_message
-                                log::warn!("SSE connect failed, falling back to sync: {}", e);
-                                let request = match &agent_id {
-                                    Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(&message, id),
-                                    None => helix_opencode::types::SendMessageRequest::text(&message),
-                                };
-                                let response = client.send_message(&sid, &request).await;
-                                let session_id_for_cb = sid.clone();
-                                let callback: job::Callback = job::Callback::EditorCompositor(
-                                    Box::new(move |_editor, compositor| {
-                                        let Some(overlay) =
-                                            compositor.find::<Overlay<AgentOverlay>>()
-                                        else {
-                                            return;
-                                        };
-                                        let agent = &mut overlay.content;
-                                        agent.loading = false;
-                                        agent.session_id = Some(session_id_for_cb);
-                                        match response {
-                                            Ok(msg) => {
-                                                let content = msg.text_content();
-                                                if content.is_empty() {
-                                                    agent.push_message(
-                                                        "assistant",
-                                                        "(No response)",
-                                                    );
-                                                } else {
-                                                    agent.push_message("assistant", &content);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                agent.push_message(
-                                                    "assistant",
-                                                    &format!("Error: {}", e),
-                                                );
-                                            }
-                                        }
-                                        let total_lines = agent.total_output_lines(80);
-                                        agent.scroll_offset = total_lines.saturating_sub(20);
-                                    }),
-                                );
-                                return Ok(callback);
-                            }
-                        };
-
-                        // Fire the async prompt — returns immediately (204).
+                        // Build the request, optionally targeting a specific agent
                         let request = match &agent_id {
-                            Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(&message, id),
+                            Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(
+                                &message, id,
+                            ),
                             None => helix_opencode::types::SendMessageRequest::text(&message),
                         };
-                        if let Err(e) = client.send_message_async(&sid, &request).await {
-                            let err_msg = format!("Failed to send message: {}", e);
-                            let callback: job::Callback = job::Callback::EditorCompositor(
-                                Box::new(move |_editor, compositor| {
-                                    if let Some(overlay) =
-                                        compositor.find::<Overlay<AgentOverlay>>()
-                                    {
-                                        overlay.content.loading = false;
-                                        overlay.content.push_message("assistant", &err_msg);
-                                    }
-                                }),
-                            );
-                            return Ok(callback);
-                        }
 
-                        // Read SSE events until the message is complete.
-                        let target_session = sid.clone();
-                        while let Some(event) = event_rx.recv().await {
-                            match event.event_type.as_str() {
-                                "message.part.delta" => {
-                                    if let Ok(props) = serde_json::from_value::<
-                                        helix_opencode::types::PartDeltaProperties,
-                                    >(
-                                        event.properties.clone()
-                                    ) {
-                                        if props.session_id == target_session
-                                            && props.field == "text"
-                                        {
-                                            stream_buffer
-                                                .lock()
-                                                .unwrap()
-                                                .push(props.delta);
+                        // Send synchronously — blocks until the full response arrives
+                        let response = client.send_message(&sid, &request).await;
+                        let session_id_for_cb = sid;
+
+                        let callback: job::Callback = job::Callback::EditorCompositor(Box::new(
+                            move |_editor, compositor| {
+                                let Some(overlay) =
+                                    compositor.find::<Overlay<AgentOverlay>>()
+                                else {
+                                    return;
+                                };
+                                let agent = &mut overlay.content;
+                                agent.loading = false;
+                                agent.session_id = Some(session_id_for_cb);
+                                match response {
+                                    Ok(msg) => {
+                                        let content = msg.text_content();
+                                        if content.is_empty() {
+                                            agent.push_message("assistant", "(No response)");
+                                        } else {
+                                            agent.push_message("assistant", &content);
                                         }
                                     }
-                                }
-                                "message.updated" => {
-                                    // Check if this completion event is for our session.
-                                    let is_ours = event
-                                        .properties
-                                        .get("sessionID")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s == target_session)
-                                        .unwrap_or(false);
-                                    if is_ours {
-                                        *stream_done.lock().unwrap() = true;
-                                        break;
+                                    Err(e) => {
+                                        agent.push_message(
+                                            "assistant",
+                                            &format!("Error: {}", e),
+                                        );
                                     }
                                 }
-                                _ => {}
-                            }
-                        }
-
-                        // Return a final callback to persist the session ID.
-                        let session_id_final = sid;
-                        let callback: job::Callback =
-                            job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                                if let Some(overlay) =
-                                    compositor.find::<Overlay<AgentOverlay>>()
-                                {
-                                    overlay.content.session_id = Some(session_id_final);
-                                    // Mark done in case render hasn't picked it up yet
-                                    overlay.content.loading = false;
-                                }
-                            }));
+                                // Auto-scroll to show the response
+                                let total_lines = agent.total_output_lines(80);
+                                agent.scroll_offset = total_lines.saturating_sub(20);
+                            },
+                        ));
                         Ok(callback)
                     });
                 }

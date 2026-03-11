@@ -5393,7 +5393,7 @@ fn open_agent_picker(cx: &mut Context) {
                     PickerColumn::new(
                         "agent",
                         |agent: &helix_opencode::types::Agent, _data: &()| {
-                            agent.id.clone().into()
+                            agent.name.clone().into()
                         },
                     ),
                     PickerColumn::new(
@@ -5410,16 +5410,12 @@ fn open_agent_picker(cx: &mut Context) {
 
                 let picker = Picker::new(
                     columns,
-                    0, // search by agent id
+                    0, // search by agent name
                     [],
                     (),
                     move |cx, agent: &helix_opencode::types::Agent, action| {
                         if matches!(action, Action::Replace) {
-                            let agent_id = agent.id.clone();
-                            let agent_name = agent
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| agent.id.clone());
+                            let agent_name = agent.name.clone();
                             // Use jobs callback to push the overlay layer since
                             // the picker callback context doesn't have push_layer
                             cx.jobs.callback(async move {
@@ -5427,7 +5423,7 @@ fn open_agent_picker(cx: &mut Context) {
                                     move |_editor, compositor| {
                                         let overlay =
                                             ui::agent_overlay::AgentOverlay::new()
-                                                .with_agent(agent_id, agent_name);
+                                                .with_agent(agent_name.clone(), agent_name);
                                         compositor.push(Box::new(overlaid(overlay)));
                                     },
                                 )))
@@ -5478,7 +5474,7 @@ pub(crate) fn make_agent_picker_callback(
                     PickerColumn::new(
                         "agent",
                         |agent: &helix_opencode::types::Agent, _data: &()| {
-                            agent.id.clone().into()
+                            agent.name.clone().into()
                         },
                     ),
                     PickerColumn::new(
@@ -5500,17 +5496,13 @@ pub(crate) fn make_agent_picker_callback(
                     (),
                     move |cx, agent: &helix_opencode::types::Agent, action| {
                         if matches!(action, Action::Replace) {
-                            let agent_id = agent.id.clone();
-                            let agent_name = agent
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| agent.id.clone());
+                            let agent_name = agent.name.clone();
                             cx.jobs.callback(async move {
                                 Ok(job::Callback::EditorCompositor(Box::new(
                                     move |_editor, compositor| {
                                         let overlay =
                                             ui::agent_overlay::AgentOverlay::new()
-                                                .with_agent(agent_id, agent_name);
+                                                .with_agent(agent_name.clone(), agent_name);
                                         compositor.push(Box::new(overlaid(overlay)));
                                     },
                                 )))

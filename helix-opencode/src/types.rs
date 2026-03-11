@@ -25,11 +25,11 @@ pub struct Session {
 /// An available agent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
+    pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// A message part (text content).
