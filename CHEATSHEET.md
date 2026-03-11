@@ -4,6 +4,16 @@
 
 Open the git status picker to see all changed files with diff preview.
 
+### File Status Labels
+| Status | Meaning |
+|--------|---------|
+| staged | Fully staged for commit |
+| unstaged | Not staged |
+| partial | File has both staged and unstaged changes |
+| untracked | New file not yet tracked by git |
+
+Partially staged files appear once (yellow "partial" label). Untracked directories show individual files.
+
 ### Navigation
 | Key | Action |
 |-----|--------|
@@ -38,24 +48,31 @@ View the diff for the current file or selected file.
 | `j/k` | Navigate lines |
 | `J/K` | Navigate hunks |
 | `n/p` | Next/previous file (when opened from picker) |
+| `Enter` | Jump to selected line in workspace file (uses similarity matching for historical diffs) |
 | `q/Esc` | Return to file picker |
 
 ### Hunk Actions
 | Key | Action |
 |-----|--------|
-| `s` | Stage selected hunk (stays in view, shows ✓ staged) |
-| `u` | Unstage selected hunk (stays in view, removes ✓) |
+| `s` | Stage selected hunk (stays in view, shows dimmed with checkmark) |
+| `u` | Unstage selected hunk (stays in view, removes checkmark) |
 | `r` | Revert selected hunk (confirms first) |
 | `R` | Reload file from disk |
+
+Hunk staging uses git-generated patches internally for robustness, including correct behavior with partially staged files.
 
 ### Visual Features
 - **Syntax highlighting** - Full syntax highlighting for all line types
 - **Word-level diff** - Changed words highlighted with underline
-- **Function context** - Hunk headers show containing function/class
+- **Function context** - Hunk headers show nested parent scopes (e.g. `impl Foo { fn bar(`)
 - **Line numbers** - Both old and new line numbers displayed
 - **3-line box decoration** - Delta-style hunk headers
-- **Staged hunk indicators** - Staged hunks shown dimmed with ✓ badge
+- **Staged hunk indicators** - Staged hunks shown dimmed with checkmark badge
 - **Inline blame** - Bottom bar shows who last changed the selected line
+
+### Partially Staged Files
+
+Files with "partial" status show a unified diff (HEAD to workdir). Hunks that are already staged appear in muted/dimmed colors so you can distinguish staged from unstaged changes at a glance.
 
 ---
 
@@ -92,16 +109,6 @@ View the diff for the current file or selected file.
 
 ---
 
-## Diff Preview for Partially Staged Files
-
-When a file has both staged and unstaged changes (MM status):
-- **Staged entry** shows: HEAD → INDEX (what will be committed)
-- **Unstaged Entry** shows: INDEX → WORKDIR (uncommitted changes)
-
-Each entry displays the correct diff independently.
-
----
-
 ## Global Commands
 
 | Command | Action |
@@ -126,7 +133,9 @@ Browse commit history with diff preview.
 | `y` | Yank commit hash |
 | `q/Esc` | Close |
 
-Preview pane shows commit stat summary.
+Preview pane shows formatted commit info (hash, author, date, subject) above a color-coded file list: modified (yellow), added (green), deleted (red), renamed (cyan).
+
+From the commit file picker, `Enter` opens the diff view for that file. From the diff view, `Enter` jumps to the corresponding line in the workspace file (uses similarity matching to find the best line in the current version).
 
 ---
 
@@ -163,7 +172,7 @@ Manage git stashes with preview.
 | `:stash-push [message]` | Stash current changes |
 | `:stash-pop [index]` | Pop stash (default: stash@{0}) |
 
-Preview pane shows stash diff.
+Preview pane shows a color-coded file list: modified (yellow), added (green), deleted (red), renamed (cyan). `Enter` on a stash opens a file picker for that stash's contents.
 
 ---
 
@@ -173,7 +182,8 @@ Preview pane shows stash diff.
 2. **Review before commit**: Use the picker to review all staged changes
 3. **Check whitespace**: Trailing whitespace is highlighted in red
 4. **Navigate efficiently**: Use `J/K` to jump between hunks, `n/p` for files
-5. **Partial staging**: Files with both staged and unstaged changes appear twice
-6. **Browse history**: Use `Space+g+l` to explore commit log with stat preview
-7. **Blame a line**: Inline blame shows automatically in diff view
-8. **Stash work**: Use `Space+g+t` to manage stashes, `:stash-push` to create
+5. **Partial staging**: Partially staged files show as "partial" with staged hunks dimmed in the diff
+6. **Jump to source**: Press `Enter` in any diff view to jump to that line in the workspace file
+7. **Browse history**: Use `Space+g+l` to explore commit log with formatted preview
+8. **Blame a line**: Inline blame shows automatically in diff view
+9. **Stash work**: Use `Space+g+t` to manage stashes, `:stash-push` to create

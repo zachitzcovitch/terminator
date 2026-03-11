@@ -4001,10 +4001,9 @@ fn extract_hunks_from_diff(diff_output: &str) -> Vec<(u32, u32, u32, u32, String
                     }
                 }
             }
-        } else if line.starts_with("diff ") || line.starts_with("index ") {
-            // Skip diff metadata lines
-        } else {
-            // Content lines: context ( ), deletions (-), additions (+), no-newline (\)
+        } else if in_hunks {
+            // Hunk content: context ( ), deletions (-), additions (+), no-newline (\)
+            // This correctly handles deleted lines starting with "--- " as content.
             current_hunk.push_str(line);
             current_hunk.push('\n');
         }
