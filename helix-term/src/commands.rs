@@ -4337,6 +4337,11 @@ impl Component for GitStatusPicker {
                 }
                 KeyCode::Char('C') if key_event.modifiers == KeyModifiers::SHIFT => {
                     // AI-generated commit message from staged changes
+                    if !cx.editor.config().ai.enabled {
+                        cx.editor.set_error("AI integration is disabled (set ai.enabled = true in config)");
+                        return EventResult::Consumed(None);
+                    }
+
                     let server = match &cx.editor.opencode_server {
                         Some(s) => s,
                         None => {
@@ -4351,49 +4356,56 @@ impl Component for GitStatusPicker {
                         return EventResult::Consumed(None);
                     }
 
-                    // Collect the staged diff for context
                     let cwd = self.cwd.clone();
-                    let staged_stat = std::process::Command::new("git")
-                        .args(["diff", "--cached", "--stat"])
-                        .current_dir(&cwd)
-                        .output()
-                        .ok()
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .unwrap_or_default();
-
-                    let staged_diff = std::process::Command::new("git")
-                        .args(["diff", "--cached"])
-                        .current_dir(&cwd)
-                        .output()
-                        .ok()
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .unwrap_or_default();
-
-                    // Truncate large diffs to avoid overwhelming the LLM
-                    let max_diff_chars = 4000;
-                    let diff_context = if staged_diff.len() > max_diff_chars {
-                        format!(
-                            "{}\n\n(diff truncated, {} total chars)\n\n{}",
-                            staged_stat,
-                            staged_diff.len(),
-                            &staged_diff[..max_diff_chars]
-                        )
-                    } else {
-                        format!("{}\n\n{}", staged_stat, staged_diff)
-                    };
-
-                    let prompt_text = format!(
-                        "Write a concise git commit message for these staged changes. \
-                         Use conventional commit format (e.g., 'feat:', 'fix:', 'refactor:'). \
-                         Be specific about what changed. Return ONLY the commit message, nothing else.\n\n{}",
-                        diff_context
-                    );
-
                     let client = server.client().clone();
                     cx.editor.set_status("Generating commit message...");
 
                     let cwd_for_commit = cwd.clone();
                     cx.jobs.callback(async move {
+                        // Collect the staged diff asynchronously (off the UI thread)
+                        let staged_stat = tokio::process::Command::new("git")
+                            .args(["diff", "--cached", "--stat"])
+                            .current_dir(&cwd)
+                            .output()
+                            .await
+                            .ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .unwrap_or_default();
+
+                        let staged_diff = tokio::process::Command::new("git")
+                            .args(["diff", "--cached"])
+                            .current_dir(&cwd)
+                            .output()
+                            .await
+                            .ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .unwrap_or_default();
+
+                        // Truncate large diffs with char-boundary-aware slicing
+                        let max_diff_chars = 4000;
+                        let diff_context = if staged_diff.len() > max_diff_chars {
+                            // Find the nearest char boundary at or before max_diff_chars
+                            let mut end = max_diff_chars;
+                            while end > 0 && !staged_diff.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!(
+                                "{}\n\n(diff truncated, {} total chars)\n\n{}",
+                                staged_stat,
+                                staged_diff.len(),
+                                &staged_diff[..end]
+                            )
+                        } else {
+                            format!("{}\n\n{}", staged_stat, staged_diff)
+                        };
+
+                        let prompt_text = format!(
+                            "Write a concise git commit message for these staged changes. \
+                             Use conventional commit format (e.g., 'feat:', 'fix:', 'refactor:'). \
+                             Be specific about what changed. Return ONLY the commit message, nothing else.\n\n{}",
+                            diff_context
+                        );
+
                         let session = match client.create_session().await {
                             Ok(s) => s,
                             Err(e) => {

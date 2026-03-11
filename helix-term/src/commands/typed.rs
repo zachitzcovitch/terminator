@@ -2791,6 +2791,11 @@ fn ai_start(
         return Ok(());
     }
 
+    if !cx.editor.config().ai.enabled {
+        cx.editor.set_error("AI integration is disabled (set ai.enabled = true in config)");
+        return Ok(());
+    }
+
     if cx.editor.opencode_server.is_some() {
         cx.editor.set_status("OpenCode server is already running");
         return Ok(());

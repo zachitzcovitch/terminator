@@ -88,11 +88,22 @@ impl SendMessageRequest {
 
 /// SSE event from the /event stream.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ServerEvent {
+pub struct BusEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     #[serde(default)]
     pub properties: serde_json::Value,
+}
+
+/// Properties for `message.part.delta` events (streaming text chunks).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartDeltaProperties {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    pub field: String,
+    pub delta: String,
 }
 
 /// Internal bookkeeping for a running OpenCode server.

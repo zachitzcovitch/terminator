@@ -4873,6 +4873,11 @@ impl Component for DiffView {
                 }
                 KeyCode::Char('?') => {
                     // Ask AI to explain the current hunk
+                    if !cx.editor.config().ai.enabled {
+                        cx.editor.set_error("AI integration is disabled (set ai.enabled = true in config)");
+                        return EventResult::Consumed(None);
+                    }
+
                     let server = match &cx.editor.opencode_server {
                         Some(s) => s,
                         None => {
