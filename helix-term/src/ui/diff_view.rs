@@ -1797,21 +1797,19 @@ impl DiffView {
 
         // Get HEAD content to compare against INDEX
         // Fetch HEAD content to compare against INDEX for staged hunk detection
-        let head_bytes = match git::get_diff_base(&self.absolute_path) {
+        let head_rope = match git::get_diff_base(&self.absolute_path) {
             Ok(bytes) => {
                 log::info!(
                     "detect_staged_hunks: got HEAD content, {} bytes",
                     bytes.len()
                 );
-                bytes
+                Rope::from(String::from_utf8_lossy(&bytes))
             }
             Err(_) => {
-                log::info!("detect_staged_hunks: failed to get HEAD content");
-                return; // Can't detect staged hunks without HEAD content
+                log::info!("detect_staged_hunks: HEAD content not found (new file), using empty");
+                Rope::new() // New file — HEAD is empty
             }
         };
-
-        let head_rope = Rope::from(String::from_utf8_lossy(&head_bytes));
 
         // Get index (staged) content for this file
         let index_bytes = match git::get_index_content(&self.absolute_path) {
