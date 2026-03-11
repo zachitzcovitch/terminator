@@ -77,6 +77,11 @@ impl AgentOverlay {
         });
     }
 
+    /// Set the loading state (waiting for AI response).
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
+    }
+
     /// Append text to the last assistant message (for streaming responses).
     ///
     /// If the last message is not from the assistant, a new assistant message

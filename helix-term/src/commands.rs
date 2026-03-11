@@ -4335,6 +4335,134 @@ impl Component for GitStatusPicker {
 
                     return EventResult::Consumed(Some(callback));
                 }
+                KeyCode::Char('C') if key_event.modifiers == KeyModifiers::SHIFT => {
+                    // AI-generated commit message from staged changes
+                    let server = match &cx.editor.opencode_server {
+                        Some(s) => s,
+                        None => {
+                            cx.editor.set_error("OpenCode not connected. Run :ai-start first.");
+                            return EventResult::Consumed(None);
+                        }
+                    };
+
+                    let has_staged = self.files.iter().any(|f| f.staged || f.partially_staged);
+                    if !has_staged {
+                        cx.editor.set_error("No staged changes to commit");
+                        return EventResult::Consumed(None);
+                    }
+
+                    // Collect the staged diff for context
+                    let cwd = self.cwd.clone();
+                    let staged_stat = std::process::Command::new("git")
+                        .args(["diff", "--cached", "--stat"])
+                        .current_dir(&cwd)
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .unwrap_or_default();
+
+                    let staged_diff = std::process::Command::new("git")
+                        .args(["diff", "--cached"])
+                        .current_dir(&cwd)
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .unwrap_or_default();
+
+                    // Truncate large diffs to avoid overwhelming the LLM
+                    let max_diff_chars = 4000;
+                    let diff_context = if staged_diff.len() > max_diff_chars {
+                        format!(
+                            "{}\n\n(diff truncated, {} total chars)\n\n{}",
+                            staged_stat,
+                            staged_diff.len(),
+                            &staged_diff[..max_diff_chars]
+                        )
+                    } else {
+                        format!("{}\n\n{}", staged_stat, staged_diff)
+                    };
+
+                    let prompt_text = format!(
+                        "Write a concise git commit message for these staged changes. \
+                         Use conventional commit format (e.g., 'feat:', 'fix:', 'refactor:'). \
+                         Be specific about what changed. Return ONLY the commit message, nothing else.\n\n{}",
+                        diff_context
+                    );
+
+                    let client = server.client().clone();
+                    cx.editor.set_status("Generating commit message...");
+
+                    let cwd_for_commit = cwd.clone();
+                    cx.jobs.callback(async move {
+                        let session = match client.create_session().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let callback: job::Callback = job::Callback::EditorCompositor(
+                                    Box::new(move |editor, _compositor| {
+                                        editor.set_error(format!("Failed to create AI session: {}", e));
+                                    }),
+                                );
+                                return Ok(callback);
+                            }
+                        };
+
+                        let request = helix_opencode::types::SendMessageRequest::text(&prompt_text);
+                        let response = client.send_message(&session.id, &request).await;
+
+                        let callback: job::Callback = job::Callback::EditorCompositor(
+                            Box::new(move |editor, compositor| {
+                                match response {
+                                    Ok(msg) => {
+                                        let commit_msg = msg.text_content().trim().to_string();
+                                        if commit_msg.is_empty() {
+                                            editor.set_error("AI returned empty commit message");
+                                            return;
+                                        }
+
+                                        // Open commit prompt pre-filled with the AI-generated message
+                                        let cwd = cwd_for_commit;
+                                        let prompt = Prompt::new(
+                                            "commit (AI): ".into(),
+                                            None,
+                                            |_editor: &Editor, _input: &str| Vec::new(),
+                                            move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
+                                                if event != PromptEvent::Validate {
+                                                    return;
+                                                }
+                                                if input.trim().is_empty() {
+                                                    cx.editor.set_error("Commit message cannot be empty");
+                                                    return;
+                                                }
+                                                let message = input.to_string();
+                                                match git::commit(&cwd, &message) {
+                                                    Ok(()) => {
+                                                        cx.editor.set_status("Committed successfully");
+                                                        job::dispatch_blocking(|_editor, compositor| {
+                                                            compositor.pop();
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        cx.editor.set_error(format!("Failed to commit: {}", e));
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .with_line(commit_msg, editor);
+
+                                        compositor.push(Box::new(prompt));
+                                        editor.set_status("AI commit message generated — edit and press Enter to commit");
+                                    }
+                                    Err(e) => {
+                                        editor.set_error(format!("Failed to generate commit message: {}", e));
+                                    }
+                                }
+                            }),
+                        );
+                        Ok(callback)
+                    });
+
+                    return EventResult::Consumed(None);
+                }
                 _ => {}
             }
         }

@@ -4871,6 +4871,131 @@ impl Component for DiffView {
                         return EventResult::Consumed(Some(callback));
                     }
                 }
+                KeyCode::Char('?') => {
+                    // Ask AI to explain the current hunk
+                    let server = match &cx.editor.opencode_server {
+                        Some(s) => s,
+                        None => {
+                            cx.editor
+                                .set_error("OpenCode not connected. Run :ai-start first.");
+                            return EventResult::Consumed(None);
+                        }
+                    };
+
+                    if self.hunk_boundaries.is_empty() {
+                        return EventResult::Consumed(None);
+                    }
+
+                    let selected =
+                        self.selected_hunk.min(self.hunk_boundaries.len().saturating_sub(1));
+                    let boundary = &self.hunk_boundaries[selected];
+
+                    // Collect hunk content from diff_lines using hunk boundaries
+                    let mut hunk_text = String::new();
+                    for i in boundary.start..boundary.end {
+                        if let Some(line) = self.diff_lines.get(i) {
+                            match line {
+                                DiffLine::HunkHeader { text, .. } => {
+                                    hunk_text.push_str(text);
+                                    hunk_text.push('\n');
+                                }
+                                DiffLine::Deletion { content, .. } => {
+                                    hunk_text.push('-');
+                                    hunk_text.push_str(content);
+                                    hunk_text.push('\n');
+                                }
+                                DiffLine::Addition { content, .. } => {
+                                    hunk_text.push('+');
+                                    hunk_text.push_str(content);
+                                    hunk_text.push('\n');
+                                }
+                                DiffLine::Context { content, .. } => {
+                                    hunk_text.push(' ');
+                                    hunk_text.push_str(content);
+                                    hunk_text.push('\n');
+                                }
+                            }
+                        }
+                    }
+
+                    let file_name = self.file_name.clone();
+                    let prompt = format!(
+                        "Explain this code change in {}. \
+                         What does it do and why might it have been made?\n\n\
+                         ```diff\n{}\n```",
+                        file_name, hunk_text
+                    );
+
+                    let client = server.client().clone();
+                    cx.editor.set_status("Asking AI about this hunk...");
+
+                    let prompt_for_async = prompt.clone();
+
+                    // Push an AgentOverlay with the question, then send asynchronously
+                    let callback: Callback =
+                        Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                            let mut overlay = crate::ui::agent_overlay::AgentOverlay::new();
+                            overlay.push_message("user", &prompt);
+                            overlay.set_loading(true);
+                            compositor.push(Box::new(overlaid(overlay)));
+
+                            // Send the message asynchronously via a job callback
+                            cx.jobs.callback(async move {
+                                let session = match client.create_session().await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let cb: job::Callback = job::Callback::EditorCompositor(
+                                            Box::new(move |editor, _compositor| {
+                                                editor.set_error(format!("AI error: {}", e));
+                                            }),
+                                        );
+                                        return Ok(cb);
+                                    }
+                                };
+
+                                let request = helix_opencode::types::SendMessageRequest::text(
+                                    &prompt_for_async,
+                                );
+                                let response =
+                                    client.send_message(&session.id, &request).await;
+
+                                let cb: job::Callback = job::Callback::EditorCompositor(
+                                    Box::new(move |_editor, compositor| {
+                                        if let Some(overlay) = compositor.find::<
+                                            crate::ui::overlay::Overlay<
+                                                crate::ui::agent_overlay::AgentOverlay,
+                                            >,
+                                        >() {
+                                            let agent = &mut overlay.content;
+                                            agent.set_loading(false);
+                                            match response {
+                                                Ok(msg) => {
+                                                    let content = msg.text_content();
+                                                    if !content.is_empty() {
+                                                        agent.push_message("assistant", &content);
+                                                    } else {
+                                                        agent.push_message(
+                                                            "assistant",
+                                                            "(No response)",
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    agent.push_message(
+                                                        "assistant",
+                                                        &format!("Error: {}", e),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }),
+                                );
+                                Ok(cb)
+                            });
+                        });
+
+                    return EventResult::Consumed(Some(callback));
+                }
                 _ => {}
             }
         }

@@ -1,0 +1,27 @@
+in prog: When we select a file we already have open, it requires a reload to see the changes, and what do we do if the user has unsaved changes?
+
+
+When pressing enter on a file in the git status view to go to the diff view, the first load (same time as file load) is always empty
+It would be nice to have the 'q' to go back to the git status view when in the diff view
+have better header contexts, for example when looking at something in a 'drop' in rust, delta shows `impl Drop for Thing {`
+When pressing enter on a file in the git status view to go to the diff view, the first load (same time as file load) is always empty
+It would be nice to have the 'q' to go back to the git status view when in the diff view
+while ours just shows 'fn drop(&mut self) {'. What would be really really cool is if we could show all the parent scopes.
+
+     Press Space then g to open the new git status picker with:
+     - Staged/unstaged file sections
+     - Diff stats (+X -Y)
+     - Stage/unstage actions (s, u, a)
+     - Commit workflow (c)
+     - Diff view integration (Enter, then n/p to navigate files)
+
+
+Option 2: Start New Features
+
+     Potential new features:
+     - Side-by-side diff view (deferred - requires significant UI work)
+     - Git blame integration in diff view
+     - Merge conflict resolution UI
+     - Git log/history browser
+     - Stash management
+     - Branch picker/switcher
