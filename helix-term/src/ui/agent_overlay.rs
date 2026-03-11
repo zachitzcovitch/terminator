@@ -61,6 +61,10 @@ pub struct AgentOverlay {
     stream_buffer: Arc<Mutex<Vec<String>>>,
     /// Set to `true` by the background task when the message is complete.
     stream_done: Arc<Mutex<bool>>,
+    /// Optional agent ID to target when sending messages.
+    agent_id: Option<String>,
+    /// Display name for the agent shown in the overlay title.
+    agent_name: String,
 }
 
 impl AgentOverlay {
@@ -74,7 +78,16 @@ impl AgentOverlay {
             session_id: None,
             stream_buffer: Arc::new(Mutex::new(Vec::new())),
             stream_done: Arc::new(Mutex::new(false)),
+            agent_id: None,
+            agent_name: "AI Agent".to_string(),
         }
+    }
+
+    /// Configure the overlay to target a specific agent.
+    pub fn with_agent(mut self, id: String, name: String) -> Self {
+        self.agent_id = Some(id);
+        self.agent_name = name;
+        self
     }
 
     /// Append a complete message to the conversation.
@@ -259,9 +272,9 @@ impl Component for AgentOverlay {
         // -- Outer border -----------------------------------------------------
         let border_style = theme.get("ui.popup.info");
         let title = if self.loading {
-            " AI Agent (loading…) "
+            format!(" {} (loading…) ", self.agent_name)
         } else {
-            " AI Agent "
+            format!(" {} ", self.agent_name)
         };
         let block = Block::bordered()
             .title(Span::styled(title, border_style))
@@ -364,6 +377,7 @@ impl Component for AgentOverlay {
 
                     let client = server.client().clone();
                     let session_id = self.session_id.clone();
+                    let agent_id = self.agent_id.clone();
                     let stream_buffer = self.stream_buffer.clone();
                     let stream_done = self.stream_done.clone();
 
@@ -406,8 +420,10 @@ impl Component for AgentOverlay {
                             Err(e) => {
                                 // Fall back to synchronous send_message
                                 log::warn!("SSE connect failed, falling back to sync: {}", e);
-                                let request =
-                                    helix_opencode::types::SendMessageRequest::text(&message);
+                                let request = match &agent_id {
+                                    Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(&message, id),
+                                    None => helix_opencode::types::SendMessageRequest::text(&message),
+                                };
                                 let response = client.send_message(&sid, &request).await;
                                 let session_id_for_cb = sid.clone();
                                 let callback: job::Callback = job::Callback::EditorCompositor(
@@ -448,8 +464,10 @@ impl Component for AgentOverlay {
                         };
 
                         // Fire the async prompt — returns immediately (204).
-                        let request =
-                            helix_opencode::types::SendMessageRequest::text(&message);
+                        let request = match &agent_id {
+                            Some(id) => helix_opencode::types::SendMessageRequest::text_with_agent(&message, id),
+                            None => helix_opencode::types::SendMessageRequest::text(&message),
+                        };
                         if let Err(e) = client.send_message_async(&sid, &request).await {
                             let err_msg = format!("Failed to send message: {}", e);
                             let callback: job::Callback = job::Callback::EditorCompositor(

@@ -418,6 +418,7 @@ impl MappableCommand {
         git_stash_picker, "Open git stash picker",
         git_blame_view, "Open git blame view",
         open_agent_overlay, "Open AI agent overlay",
+        open_agent_picker, "Open AI agent picker",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
@@ -5350,6 +5351,185 @@ fn git_blame_view(cx: &mut Context) {
 fn open_agent_overlay(cx: &mut Context) {
     let overlay = ui::agent_overlay::AgentOverlay::new();
     cx.push_layer(Box::new(overlaid(overlay)));
+}
+
+fn open_agent_picker(cx: &mut Context) {
+    let server = match &cx.editor.opencode_server {
+        Some(s) => s,
+        None => {
+            cx.editor
+                .set_error("OpenCode not connected. Run :ai-start first.");
+            return;
+        }
+    };
+
+    let client = server.client().clone();
+
+    cx.jobs.callback(async move {
+        let agents = match client.list_agents().await {
+            Ok(a) => a,
+            Err(e) => {
+                let callback: job::Callback = job::Callback::EditorCompositor(Box::new(
+                    move |editor, _| {
+                        editor.set_error(format!("Failed to list agents: {}", e));
+                    },
+                ));
+                return Ok(callback);
+            }
+        };
+
+        if agents.is_empty() {
+            let callback: job::Callback = job::Callback::EditorCompositor(Box::new(
+                |editor, _| {
+                    editor.set_status("No agents available");
+                },
+            ));
+            return Ok(callback);
+        }
+
+        let callback: job::Callback =
+            job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                let columns = vec![
+                    PickerColumn::new(
+                        "agent",
+                        |agent: &helix_opencode::types::Agent, _data: &()| {
+                            agent.id.clone().into()
+                        },
+                    ),
+                    PickerColumn::new(
+                        "description",
+                        |agent: &helix_opencode::types::Agent, _data: &()| {
+                            agent
+                                .description
+                                .clone()
+                                .unwrap_or_default()
+                                .into()
+                        },
+                    ),
+                ];
+
+                let picker = Picker::new(
+                    columns,
+                    0, // search by agent id
+                    [],
+                    (),
+                    move |cx, agent: &helix_opencode::types::Agent, action| {
+                        if matches!(action, Action::Replace) {
+                            let agent_id = agent.id.clone();
+                            let agent_name = agent
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| agent.id.clone());
+                            // Use jobs callback to push the overlay layer since
+                            // the picker callback context doesn't have push_layer
+                            cx.jobs.callback(async move {
+                                Ok(job::Callback::EditorCompositor(Box::new(
+                                    move |_editor, compositor| {
+                                        let overlay =
+                                            ui::agent_overlay::AgentOverlay::new()
+                                                .with_agent(agent_id, agent_name);
+                                        compositor.push(Box::new(overlaid(overlay)));
+                                    },
+                                )))
+                            });
+                        }
+                    },
+                );
+
+                let injector = picker.injector();
+                for agent in agents {
+                    if injector.push(agent).is_err() {
+                        break;
+                    }
+                }
+
+                compositor.push(Box::new(overlaid(picker)));
+            }));
+        Ok(callback)
+    });
+}
+
+/// Creates a callback for the agent picker that can be used from typable commands.
+pub(crate) fn make_agent_picker_callback(
+    client: helix_opencode::client::OpenCodeClient,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<job::Callback, anyhow::Error>> + Send>>
+{
+    Box::pin(async move {
+        let agents = match client.list_agents().await {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(job::Callback::EditorCompositor(Box::new(
+                    move |editor, _| {
+                        editor.set_error(format!("Failed to list agents: {}", e));
+                    },
+                )));
+            }
+        };
+
+        if agents.is_empty() {
+            return Ok(job::Callback::EditorCompositor(Box::new(|editor, _| {
+                editor.set_status("No agents available");
+            })));
+        }
+
+        Ok(job::Callback::EditorCompositor(Box::new(
+            move |_editor, compositor| {
+                let columns = vec![
+                    PickerColumn::new(
+                        "agent",
+                        |agent: &helix_opencode::types::Agent, _data: &()| {
+                            agent.id.clone().into()
+                        },
+                    ),
+                    PickerColumn::new(
+                        "description",
+                        |agent: &helix_opencode::types::Agent, _data: &()| {
+                            agent
+                                .description
+                                .clone()
+                                .unwrap_or_default()
+                                .into()
+                        },
+                    ),
+                ];
+
+                let picker = Picker::new(
+                    columns,
+                    0,
+                    [],
+                    (),
+                    move |cx, agent: &helix_opencode::types::Agent, action| {
+                        if matches!(action, Action::Replace) {
+                            let agent_id = agent.id.clone();
+                            let agent_name = agent
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| agent.id.clone());
+                            cx.jobs.callback(async move {
+                                Ok(job::Callback::EditorCompositor(Box::new(
+                                    move |_editor, compositor| {
+                                        let overlay =
+                                            ui::agent_overlay::AgentOverlay::new()
+                                                .with_agent(agent_id, agent_name);
+                                        compositor.push(Box::new(overlaid(overlay)));
+                                    },
+                                )))
+                            });
+                        }
+                    },
+                );
+
+                let injector = picker.injector();
+                for agent in agents {
+                    if injector.push(agent).is_err() {
+                        break;
+                    }
+                }
+
+                compositor.push(Box::new(overlaid(picker)));
+            },
+        )))
+    })
 }
 
 // Helper function to extract hunk data to avoid borrow issues with cx.editor

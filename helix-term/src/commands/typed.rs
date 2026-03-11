@@ -2885,6 +2885,31 @@ fn ai_status(
     Ok(())
 }
 
+fn ai_agents(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let server = match &cx.editor.opencode_server {
+        Some(s) => s,
+        None => {
+            cx.editor
+                .set_error("OpenCode not connected. Run :ai-start first.");
+            return Ok(());
+        }
+    };
+
+    let client = server.client().clone();
+    let callback = super::make_agent_picker_callback(client);
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyhow::Result<()> {
     Ok(())
 }
@@ -4161,6 +4186,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Show OpenCode AI server status",
         fun: ai_status,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ai-agents",
+        aliases: &[],
+        doc: "Open AI agent picker",
+        fun: ai_agents,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

@@ -73,6 +73,8 @@ impl Message {
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMessageRequest {
     pub parts: Vec<MessagePart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl SendMessageRequest {
@@ -82,6 +84,17 @@ impl SendMessageRequest {
             parts: vec![MessagePart::Text {
                 text: content.to_string(),
             }],
+            agent: None,
+        }
+    }
+
+    /// Create a text message targeted at a specific agent.
+    pub fn text_with_agent(content: &str, agent_id: &str) -> Self {
+        Self {
+            parts: vec![MessagePart::Text {
+                text: content.to_string(),
+            }],
+            agent: Some(agent_id.to_string()),
         }
     }
 }
