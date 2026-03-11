@@ -101,22 +101,41 @@ pub fn stage_file(file: &Path) -> Result<()> {
 }
 
 /// Unstage a file from the git index (equivalent to `git reset HEAD <path>`).
+///
+/// For new/untracked files that have been staged but don't exist in HEAD,
+/// `git reset HEAD` fails. In that case we fall back to `git rm --cached`
+/// which removes the file from the index without deleting it from disk.
 pub fn unstage_file(file: &Path) -> Result<()> {
     let file = gix::path::realpath(file).context("resolve symlinks")?;
     let repo_dir = get_repo_dir(&file)?;
 
-    // Use git reset to unstage the file
+    // Try git reset HEAD first (works for tracked files)
     let output = Command::new("git")
         .arg("reset")
         .arg("HEAD")
+        .arg("--")
         .arg(file.as_path())
         .current_dir(repo_dir)
         .output()
         .context("failed to execute git reset")?;
 
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // Fallback: git rm --cached for new files that don't exist in HEAD
+    let output = Command::new("git")
+        .arg("rm")
+        .arg("--cached")
+        .arg("--")
+        .arg(file.as_path())
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to execute git rm --cached")?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git reset failed: {}", stderr);
+        bail!("git rm --cached failed: {}", stderr);
     }
 
     Ok(())

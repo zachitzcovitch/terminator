@@ -4151,10 +4151,26 @@ impl GitStatusPicker {
                             (diff_base, doc_text, hunks)
                         }
                         None => {
-                            // Untracked file - show as new file
+                            // Untracked file - show entire file as a single addition hunk
                             let diff_base = Rope::new();
                             let doc_text = doc.text().clone();
-                            let hunks = Vec::new(); // No hunks for untracked files
+                            let line_count = doc_text.len_lines() as u32;
+                            // Skip the trailing empty line that Rope adds for files ending with newline
+                            let actual_lines = if line_count > 0
+                                && doc_text.line(line_count as usize - 1).len_chars() == 0
+                            {
+                                line_count - 1
+                            } else {
+                                line_count
+                            };
+                            let hunks = if actual_lines > 0 {
+                                vec![Hunk {
+                                    before: 0..0,
+                                    after: 0..actual_lines,
+                                }]
+                            } else {
+                                Vec::new()
+                            };
                             (diff_base, doc_text, hunks)
                         }
                     };

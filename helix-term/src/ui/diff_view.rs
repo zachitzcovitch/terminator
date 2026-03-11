@@ -1480,7 +1480,6 @@ pub struct DiffView {
     /// Detected indentation style (for tab/space mixing warnings)
     indent_style: IndentStyle,
     /// Whether this diff view was opened for a staged entry (HEAD→INDEX).
-    /// When true, staged hunk detection is skipped since all hunks are staged by definition.
     is_staged_entry: bool,
     /// Set of hunk indices that have been staged in this session
     staged_hunks: HashSet<usize>,
@@ -1688,7 +1687,7 @@ impl DiffView {
         file_index: usize,                    // Current file index in the files list
         is_modified: bool,                    // Whether the document has unsaved changes
         is_stale: bool,                       // Whether the file on disk is newer than the buffer
-        is_staged_entry: bool, // Whether this is a staged entry (skip staged hunk detection)
+        is_staged_entry: bool,                // Whether this is a staged entry (HEAD→INDEX)
     ) -> Self {
         // Calculate stats
         let mut added: usize = 0;
@@ -1791,13 +1790,6 @@ impl DiffView {
             return;
         }
 
-        // Skip staged hunk detection for staged entries — all hunks are staged by
-        // definition, and running HEAD→INDEX detection would mark every hunk as
-        // staged, causing the entire diff to render with muted colors.
-        if self.is_staged_entry {
-            return;
-        }
-
         // Skip staged hunk detection if path is not absolute (e.g., in tests)
         if !self.absolute_path.is_absolute() {
             return;
@@ -1867,15 +1859,17 @@ impl DiffView {
             staged_hunks.len()
         );
 
-        // A hunk is staged if a staged hunk has the exact same `before` range
+        // A hunk is staged if a staged hunk overlaps with its `before` range.
+        // Using overlap instead of exact match handles cases where the staged
+        // hunk covers a slightly different range (e.g., whole-file staging or
+        // line offset differences from other changes).
         for (i, hunk) in self.hunks.iter().enumerate() {
             for staged_hunk in &staged_hunks {
-                if staged_hunk.before.start == hunk.before.start
-                    && staged_hunk.before.end == hunk.before.end
-                {
+                if ranges_overlap(&staged_hunk.before, &hunk.before) {
                     log::info!(
-                        "detect_staged_hunks: hunk {} matched staged hunk (before {:?})",
+                        "detect_staged_hunks: hunk {} matched staged hunk (before {:?} overlaps {:?})",
                         i,
+                        staged_hunk.before,
                         hunk.before
                     );
                     self.staged_hunks.insert(i);
@@ -4479,21 +4473,29 @@ impl Component for DiffView {
 
                         let hunk = self.hunks[selected].clone();
 
-                        // Use INDEX-based patch generation (handles partially staged files)
-                        // Falls back to simple HEAD-based approach if INDEX fetch fails
-                        let patch = match self.generate_stage_patch(&hunk) {
-                            Some(p) => p,
-                            None => {
-                                let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
-                                if p.is_empty() {
-                                    cx.editor.set_status("Cannot stage empty hunk");
-                                    return EventResult::Consumed(None);
+                        // For new/untracked files (empty diff_base), use git add
+                        // instead of git apply --cached which fails with
+                        // "does not exist in index" on some git versions
+                        let result = if self.diff_base.len_chars() == 0 {
+                            git::stage_file(&self.absolute_path)
+                        } else {
+                            // Use INDEX-based patch generation (handles partially staged files)
+                            // Falls back to simple HEAD-based approach if INDEX fetch fails
+                            let patch = match self.generate_stage_patch(&hunk) {
+                                Some(p) => p,
+                                None => {
+                                    let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
+                                    if p.is_empty() {
+                                        cx.editor.set_status("Cannot stage empty hunk");
+                                        return EventResult::Consumed(None);
+                                    }
+                                    p
                                 }
-                                p
-                            }
+                            };
+                            git::stage_hunk(&self.absolute_path, &patch)
                         };
 
-                        match git::stage_hunk(&self.absolute_path, &patch) {
+                        match result {
                             Ok(()) => {
                                 self.staged_hunks.insert(selected);
                                 let unstaged_count = self.hunks.len() - self.staged_hunks.len();
@@ -4522,26 +4524,34 @@ impl Component for DiffView {
 
                         let hunk = self.hunks[selected].clone();
 
-                        // Generate INDEX→HEAD patch (forward-apply to move INDEX back toward HEAD).
-                        // Falls back to HEAD-based reverse-apply if INDEX/HEAD fetch fails.
-                        let (patch, use_forward_apply) = match self.generate_unstage_patch(&hunk) {
-                            Some(p) => (p, true),
-                            None => {
-                                let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
-                                if p.is_empty() {
-                                    cx.editor.set_status("Cannot unstage empty hunk");
-                                    return EventResult::Consumed(None);
-                                }
-                                (p, false)
-                            }
-                        };
-
-                        let result = if use_forward_apply {
-                            // INDEX→HEAD patch: apply forward to move INDEX toward HEAD
-                            git::stage_hunk(&self.absolute_path, &patch)
+                        // For new/untracked files (empty diff_base), use git rm --cached
+                        // instead of git apply --cached -R which fails for files not in HEAD
+                        let result = if self.diff_base.len_chars() == 0 {
+                            git::unstage_file(&self.absolute_path)
                         } else {
-                            // Fallback HEAD→INDEX patch: reverse-apply with -R
-                            git::unstage_hunk(&self.absolute_path, &patch)
+                            // Generate INDEX→HEAD patch (forward-apply to move INDEX back toward HEAD).
+                            // Falls back to HEAD-based reverse-apply if INDEX/HEAD fetch fails.
+                            let (patch, use_forward_apply) = match self
+                                .generate_unstage_patch(&hunk)
+                            {
+                                Some(p) => (p, true),
+                                None => {
+                                    let p = self.generate_hunk_patch(&hunk, ContextSource::Index);
+                                    if p.is_empty() {
+                                        cx.editor.set_status("Cannot unstage empty hunk");
+                                        return EventResult::Consumed(None);
+                                    }
+                                    (p, false)
+                                }
+                            };
+
+                            if use_forward_apply {
+                                // INDEX→HEAD patch: apply forward to move INDEX toward HEAD
+                                git::stage_hunk(&self.absolute_path, &patch)
+                            } else {
+                                // Fallback HEAD→INDEX patch: reverse-apply with -R
+                                git::unstage_hunk(&self.absolute_path, &patch)
+                            }
                         };
 
                         match result {
