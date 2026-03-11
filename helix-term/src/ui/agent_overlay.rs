@@ -1,9 +1,11 @@
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
 use crate::job;
 use crate::ui::overlay::Overlay;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
-use helix_view::graphics::{CursorKind, Rect};
+use helix_view::graphics::{Color, CursorKind, Modifier, Rect, Style};
 use helix_view::keyboard::{KeyCode, KeyModifiers};
+use helix_view::Theme;
 use helix_view::Editor;
 
 use tui::buffer::Buffer as Surface;
@@ -21,6 +23,200 @@ pub struct ChatMessage {
     pub role: String,
     /// Message content (may span multiple lines).
     pub content: String,
+}
+
+// =============================================================================
+// Display Line Cache
+// =============================================================================
+
+/// A pre-computed line for rendering in the overlay.
+#[derive(Debug, Clone)]
+enum DisplayLine {
+    /// Role header (e.g., "You:", "Assistant:")
+    RoleHeader { text: String, style: Style },
+    /// Content line with styled segments
+    Content {
+        segments: Vec<(String, Style)>,
+        #[allow(dead_code)]
+        is_code_block: bool,
+    },
+    /// Horizontal separator between messages
+    Separator,
+    /// Blank line for spacing
+    BlankLine,
+}
+
+/// Word-wrap a single line of text at `max_width` display columns.
+///
+/// Splits on whitespace boundaries and measures each word using
+/// `UnicodeWidthStr` so that CJK and other wide characters are
+/// handled correctly.
+fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width: usize = 0;
+
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+
+        // If adding this word (plus a space separator) would exceed the
+        // limit, flush the current line first.
+        let separator_cost = if current_line.is_empty() { 0 } else { 1 };
+        if current_width + separator_cost + word_width > max_width {
+            if !current_line.is_empty() {
+                lines.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            }
+            // If a single word is wider than max_width, push it as-is
+            // (set_stringn will truncate on render).
+            if word_width > max_width {
+                lines.push(word.to_string());
+                continue;
+            }
+        }
+
+        if !current_line.is_empty() {
+            current_line.push(' ');
+            current_width += 1;
+        }
+        current_line.push_str(word);
+        current_width += word_width;
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    // An empty input should still produce one blank line.
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+/// Parse a line of text for markdown-like inline formatting.
+///
+/// Recognises fenced code blocks (``` delimiters), ATX headers (`#`),
+/// unordered list items (`-` / `*`), inline code (`` ` ``), and bold
+/// (`**…**`).  Unclosed formatting markers are emitted as plain text.
+fn parse_markdown_segments(
+    line: &str,
+    in_code_block: &mut bool,
+    base_style: Style,
+    code_style: Style,
+    bold_style: Style,
+    inline_code_style: Style,
+) -> Vec<(String, Style)> {
+    // Inside a fenced code block — everything is rendered with code_style.
+    if *in_code_block {
+        if line.trim_start().starts_with("```") {
+            *in_code_block = false;
+        }
+        return vec![(line.to_string(), code_style)];
+    }
+
+    // Opening a fenced code block.
+    if line.trim_start().starts_with("```") {
+        *in_code_block = true;
+        return vec![(line.to_string(), code_style)];
+    }
+
+    // ATX header — strip leading `#` markers and render bold.
+    if line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ") {
+        let text = line.trim_start_matches('#').trim_start();
+        return vec![(text.to_string(), bold_style)];
+    }
+
+    // Unordered list items — replace marker with a bullet character.
+    let (prefix, rest) = if line.starts_with("- ") || line.starts_with("* ") {
+        ("  • ".to_string(), &line[2..])
+    } else if line.starts_with("  - ") || line.starts_with("  * ") {
+        ("    ◦ ".to_string(), &line[4..])
+    } else {
+        (String::new(), line)
+    };
+
+    // Parse inline formatting: **bold** and `code`.
+    let mut segments: Vec<(String, Style)> = Vec::new();
+    if !prefix.is_empty() {
+        segments.push((prefix, base_style));
+    }
+
+    let mut chars = rest.chars().peekable();
+    let mut current = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                // Flush accumulated plain text.
+                if !current.is_empty() {
+                    segments.push((current.clone(), base_style));
+                    current.clear();
+                }
+                let mut code_text = String::new();
+                let mut closed = false;
+                while let Some(&next) = chars.peek() {
+                    if next == '`' {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
+                    code_text.push(chars.next().unwrap());
+                }
+                if closed && !code_text.is_empty() {
+                    segments.push((code_text, inline_code_style));
+                } else {
+                    // Unclosed backtick — emit as plain text.
+                    current.push('`');
+                    current.push_str(&code_text);
+                }
+            }
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume second `*`
+                // Flush accumulated plain text.
+                if !current.is_empty() {
+                    segments.push((current.clone(), base_style));
+                    current.clear();
+                }
+                let mut bold_text = String::new();
+                let mut closed = false;
+                while let Some(next) = chars.next() {
+                    if next == '*' && chars.peek() == Some(&'*') {
+                        chars.next(); // consume closing `*`
+                        closed = true;
+                        break;
+                    }
+                    bold_text.push(next);
+                }
+                if closed && !bold_text.is_empty() {
+                    segments.push((bold_text, bold_style));
+                } else {
+                    // Unclosed bold — emit markers and text as plain.
+                    current.push_str("**");
+                    current.push_str(&bold_text);
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push((current, base_style));
+    }
+
+    if segments.is_empty() {
+        segments.push((String::new(), base_style));
+    }
+
+    segments
 }
 
 // =============================================================================
@@ -59,6 +255,16 @@ pub struct AgentOverlay {
     agent_id: Option<String>,
     /// Display name for the agent shown in the overlay title.
     agent_name: String,
+
+    // -- Display line cache ---------------------------------------------------
+    /// Pre-computed display lines for rendering.
+    display_lines: Vec<DisplayLine>,
+    /// Width used for the last display line computation.
+    cached_width: u16,
+    /// Flag to indicate display lines need recomputation.
+    display_dirty: bool,
+    /// Whether the view is pinned to the bottom (auto-scrolls on new content).
+    pinned_to_bottom: bool,
 }
 
 impl AgentOverlay {
@@ -72,6 +278,10 @@ impl AgentOverlay {
             session_id: None,
             agent_id: None,
             agent_name: "AI Agent".to_string(),
+            display_lines: Vec::new(),
+            cached_width: 0,
+            display_dirty: true,
+            pinned_to_bottom: true,
         }
     }
 
@@ -88,6 +298,7 @@ impl AgentOverlay {
             role: role.to_string(),
             content: content.to_string(),
         });
+        self.display_dirty = true;
     }
 
     /// Append text to the last assistant message, or create one if needed.
@@ -95,6 +306,7 @@ impl AgentOverlay {
         if let Some(last) = self.messages.last_mut() {
             if last.role == "assistant" {
                 last.content.push_str(text);
+                self.display_dirty = true;
                 return;
             }
         }
@@ -111,100 +323,196 @@ impl AgentOverlay {
     // Rendering helpers
     // -------------------------------------------------------------------------
 
-    /// Count the total logical lines produced by all messages when rendered.
-    fn total_output_lines(&self, _width: usize) -> usize {
-        let mut count = 0usize;
-        for msg in &self.messages {
-            // Role header line
-            count += 1;
-            // Content lines (one per line, no wrapping — set_stringn truncates)
-            if msg.content.is_empty() {
-                count += 1;
-            } else {
-                count += msg.content.lines().count();
-            }
-            // Blank separator between messages
-            count += 1;
-        }
-        count
+    /// Count the total display lines (after word wrapping).
+    fn total_output_lines(&self) -> usize {
+        self.display_lines.len()
     }
 
-    /// Render the message history into the output area.
+    /// Recompute the display line cache from the current messages.
     ///
-    /// Styles are passed in to avoid borrow-checker conflicts with `Context`
-    /// in the caller.
-    fn render_messages(
-        &self,
-        area: Rect,
-        surface: &mut Surface,
-        user_style: helix_view::graphics::Style,
-        assistant_style: helix_view::graphics::Style,
-        role_label_style: helix_view::graphics::Style,
+    /// Called lazily at the start of `render()` when the cache is dirty
+    /// or the available width has changed.  Assistant messages are parsed
+    /// for markdown-like formatting (headers, bold, inline code, fenced
+    /// code blocks, list items).  User messages are rendered plain.
+    fn recompute_display_lines(
+        &mut self,
+        width: u16,
+        user_style: Style,
+        assistant_style: Style,
+        role_label_style: Style,
+        code_style: Style,
+        bold_style: Style,
+        inline_code_style: Style,
     ) {
-        let max_y = area.y + area.height;
-        let content_width = area.width.saturating_sub(2) as usize;
-        let mut y = area.y;
-        let mut line_idx: usize = 0;
+        self.display_lines.clear();
+
+        let content_width = width.saturating_sub(2) as usize;
 
         for msg in &self.messages {
             // -- Role header --------------------------------------------------
-            if line_idx >= self.scroll_offset && y < max_y {
-                let label = if msg.role == "user" {
-                    "You:"
-                } else {
-                    "Assistant:"
-                };
-                let label_style = if msg.role == "user" {
-                    user_style
-                } else {
-                    role_label_style
-                };
-                surface.set_stringn(area.x, y, label, area.width as usize, label_style);
-                y += 1;
-            }
-            line_idx += 1;
+            let (label, label_style) = if msg.role == "user" {
+                ("You:".to_string(), user_style)
+            } else {
+                ("Assistant:".to_string(), role_label_style)
+            };
+            self.display_lines.push(DisplayLine::RoleHeader {
+                text: label,
+                style: label_style,
+            });
 
-            // -- Content lines ------------------------------------------------
-            let style = if msg.role == "user" {
+            // -- Content lines (word-wrapped) ---------------------------------
+            let is_user = msg.role == "user";
+            let content_style = if is_user {
                 user_style
             } else {
                 assistant_style
             };
 
             if msg.content.is_empty() {
-                // Empty content still occupies one logical line
-                if line_idx >= self.scroll_offset && y < max_y {
-                    y += 1;
-                }
-                line_idx += 1;
+                self.display_lines.push(DisplayLine::BlankLine);
             } else {
-                for line in msg.content.lines() {
-                    // Render each line and let set_stringn handle display-width
-                    // truncation safely (avoids UTF-8 boundary panics from
-                    // manual byte-offset slicing).
-                    if line_idx >= self.scroll_offset && y < max_y {
-                        surface.set_stringn(
-                            area.x + 2,
-                            y,
-                            line,
-                            content_width,
-                            style,
+                // Track fenced code block state across lines within a message.
+                let mut in_code_block = false;
+
+                for raw_line in msg.content.lines() {
+                    if is_user {
+                        // User messages: plain text with word wrapping, no markdown.
+                        for wrapped_line in word_wrap(raw_line, content_width) {
+                            self.display_lines.push(DisplayLine::Content {
+                                segments: vec![(wrapped_line, content_style)],
+                                is_code_block: false,
+                            });
+                        }
+                    } else if in_code_block {
+                        // Don't word-wrap code blocks — preserve indentation
+                        // and formatting. Truncation happens at render time
+                        // via set_stringn.
+                        let segments = parse_markdown_segments(
+                            raw_line,
+                            &mut in_code_block,
+                            content_style,
+                            code_style,
+                            bold_style,
+                            inline_code_style,
                         );
-                        y += 1;
+                        self.display_lines.push(DisplayLine::Content {
+                            segments,
+                            is_code_block: true,
+                        });
+                    } else {
+                        // Normal assistant text: word-wrap then parse markdown.
+                        for wrapped_line in word_wrap(raw_line, content_width) {
+                            let was_in_code_block = in_code_block;
+                            let segments = parse_markdown_segments(
+                                &wrapped_line,
+                                &mut in_code_block,
+                                content_style,
+                                code_style,
+                                bold_style,
+                                inline_code_style,
+                            );
+                            self.display_lines.push(DisplayLine::Content {
+                                segments,
+                                is_code_block: was_in_code_block || in_code_block,
+                            });
+                        }
                     }
-                    line_idx += 1;
                 }
             }
 
-            // -- Blank separator ----------------------------------------------
-            if line_idx >= self.scroll_offset && y < max_y {
-                y += 1;
-            }
-            line_idx += 1;
+            // -- Blank separator between messages -----------------------------
+            self.display_lines.push(DisplayLine::Separator);
         }
 
-        // Loading indicator
+        self.cached_width = width;
+        self.display_dirty = false;
+    }
+
+    /// Render the message history into the output area using the
+    /// pre-computed display line cache.
+    fn render_messages(
+        &self,
+        area: Rect,
+        surface: &mut Surface,
+        theme: &Theme,
+        role_label_style: Style,
+    ) {
+        let max_y = area.y + area.height;
+        let visible_height = area.height as usize;
+        let mut y = area.y;
+
+        for (line_idx, line) in self.display_lines.iter().enumerate() {
+            // Skip lines before the scroll offset.
+            if line_idx < self.scroll_offset {
+                continue;
+            }
+            // Stop once we've filled the visible area.
+            if line_idx >= self.scroll_offset + visible_height {
+                break;
+            }
+
+            let line_y = y;
+            if line_y >= max_y {
+                break;
+            }
+
+            match line {
+                DisplayLine::RoleHeader { text, style } => {
+                    surface.set_stringn(area.x, line_y, text, area.width as usize, *style);
+                }
+                DisplayLine::Content {
+                    segments,
+                    is_code_block,
+                } => {
+                    if *is_code_block {
+                        // Fill the full line width with a dark background.
+                        let code_bg = theme.get("ui.statusline");
+                        for x in area.x..(area.x + area.width) {
+                            if let Some(cell) = surface.get_mut(x, line_y) {
+                                cell.set_style(code_bg);
+                            }
+                        }
+                        // Draw a gutter bar on the left edge.
+                        if let Some(cell) = surface.get_mut(area.x, line_y) {
+                            cell.set_char('▎');
+                            cell.set_style(Style::default().fg(Color::Cyan));
+                        }
+                    }
+
+                    let indent: u16 = 2;
+                    let mut x = area.x + indent;
+                    for (text, style) in segments {
+                        let max_chars =
+                            (area.x + area.width).saturating_sub(x) as usize;
+                        if max_chars == 0 {
+                            break;
+                        }
+                        surface.set_stringn(x, line_y, text, max_chars, *style);
+                        x += UnicodeWidthStr::width(text.as_str()) as u16;
+                    }
+                }
+                DisplayLine::Separator => {
+                    let sep = "─".repeat(area.width as usize);
+                    let dim_style = theme.get("ui.virtual.whitespace");
+                    surface.set_stringn(
+                        area.x,
+                        line_y,
+                        &sep,
+                        area.width as usize,
+                        dim_style,
+                    );
+                }
+                DisplayLine::BlankLine => {
+                    // Empty line — nothing to draw.
+                }
+            }
+
+            y += 1;
+        }
+
+        // Loading indicator after all display lines.
         if self.loading && y < max_y {
+            let content_width = area.width.saturating_sub(2) as usize;
             surface.set_stringn(
                 area.x + 2,
                 y,
@@ -273,12 +581,42 @@ impl Component for AgentOverlay {
         let text_style = theme.get("ui.text");
         let prompt_style = theme.get("ui.text.focus");
 
-        // -- Auto-scroll during streaming to keep latest content visible ------
-        if self.loading {
-            let total = self.total_output_lines(output_area.width as usize);
+        // Markdown formatting styles for assistant messages.
+        let code_style = assistant_style.patch(theme.get("ui.statusline"));
+        let bold_style = assistant_style.add_modifier(Modifier::BOLD);
+        let inline_code_style = assistant_style.patch(theme.get("ui.virtual.inlay-hint"));
+
+        // -- Recompute display line cache if needed ---------------------------
+        if self.display_dirty || self.cached_width != output_area.width {
+            self.recompute_display_lines(
+                output_area.width,
+                user_style,
+                assistant_style,
+                role_label_style,
+                code_style,
+                bold_style,
+                inline_code_style,
+            );
+        }
+
+        // -- Auto-scroll when pinned to bottom to keep latest content visible --
+        if self.pinned_to_bottom {
+            let total = self.total_output_lines();
             let visible = output_area.height as usize;
             if total > visible {
                 self.scroll_offset = total.saturating_sub(visible);
+            } else {
+                self.scroll_offset = 0;
+            }
+        }
+
+        // -- Clamp scroll_offset to valid range -------------------------------
+        {
+            let total = self.display_lines.len();
+            let visible = output_area.height as usize;
+            let max_offset = total.saturating_sub(visible);
+            if self.scroll_offset > max_offset {
+                self.scroll_offset = max_offset;
             }
         }
 
@@ -286,10 +624,45 @@ impl Component for AgentOverlay {
         self.render_messages(
             output_area,
             surface,
-            user_style,
-            assistant_style,
+            theme,
             role_label_style,
         );
+
+        // -- Scroll indicators ------------------------------------------------
+        {
+            let total = self.display_lines.len();
+            let visible = output_area.height as usize;
+            let dim_style = theme.get("ui.virtual.whitespace");
+
+            // Top indicator: "▲ N more" when scrolled down
+            if self.scroll_offset > 0 {
+                let indicator = format!("▲ {} more", self.scroll_offset);
+                let max_chars = output_area.width as usize;
+                surface.set_stringn(
+                    output_area.x,
+                    output_area.y,
+                    &indicator,
+                    max_chars,
+                    dim_style,
+                );
+            }
+
+            // Bottom indicator: "▼ N more" when content extends below
+            let visible_end = self.scroll_offset + visible;
+            if visible_end < total {
+                let remaining = total - visible_end;
+                let indicator = format!("▼ {} more", remaining);
+                let max_chars = output_area.width as usize;
+                let bottom_y = output_area.y + output_area.height.saturating_sub(1);
+                surface.set_stringn(
+                    output_area.x,
+                    bottom_y,
+                    &indicator,
+                    max_chars,
+                    dim_style,
+                );
+            }
+        }
 
         // -- Input separator line ---------------------------------------------
         let sep_y = input_area.y;
@@ -332,10 +705,7 @@ impl Component for AgentOverlay {
                     self.input_cursor = 0;
                     self.push_message("user", &message);
                     self.loading = true;
-
-                    // Auto-scroll to show the user message
-                    let total = self.total_output_lines(80);
-                    self.scroll_offset = total.saturating_sub(10);
+                    self.pinned_to_bottom = true;
 
                     // Check if server is connected
                     let server = match &cx.editor.opencode_server {
@@ -567,14 +937,40 @@ impl Component for AgentOverlay {
                                             }
                                         }
                                         // Auto-scroll to show the response
-                                        let total_lines = agent.total_output_lines(80);
-                                        agent.scroll_offset = total_lines.saturating_sub(20);
+                                        agent.pinned_to_bottom = true;
                                     },
                                 )))
                             }
                         }
                     });
                 }
+                EventResult::Consumed(None)
+            }
+
+            // -- Scroll output (Ctrl+k / Ctrl+j) ---------------------------------
+            KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.pinned_to_bottom = false;
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                // If we've scrolled to the bottom, re-pin
+                // (exact clamping happens in render, so use a heuristic:
+                //  the total lines are at least as many as display_lines)
+                let total = self.display_lines.len();
+                // We don't know visible height here, so just mark pinned
+                // if offset is clearly past the end; render() will clamp.
+                if self.scroll_offset + 1 >= total {
+                    self.pinned_to_bottom = true;
+                }
+                EventResult::Consumed(None)
+            }
+
+            // -- Jump to bottom (G) -------------------------------------------
+            KeyCode::Char('G') if key.modifiers == KeyModifiers::SHIFT => {
+                self.pinned_to_bottom = true;
+                // scroll_offset will be adjusted in render()
                 EventResult::Consumed(None)
             }
 
@@ -627,6 +1023,11 @@ impl Component for AgentOverlay {
                 self.input_cursor = 0;
                 EventResult::Consumed(None)
             }
+            KeyCode::End if key.modifiers == KeyModifiers::CONTROL => {
+                // Ctrl+End: jump to bottom of output
+                self.pinned_to_bottom = true;
+                EventResult::Consumed(None)
+            }
             KeyCode::End => {
                 self.input_cursor = self.input.len();
                 EventResult::Consumed(None)
@@ -635,10 +1036,16 @@ impl Component for AgentOverlay {
             // -- Scroll output (PageUp / PageDown) ----------------------------
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                self.pinned_to_bottom = false;
                 EventResult::Consumed(None)
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(20);
+                // If scrolled past the end, pin to bottom (render will clamp)
+                let total = self.display_lines.len();
+                if self.scroll_offset + 1 >= total {
+                    self.pinned_to_bottom = true;
+                }
                 EventResult::Consumed(None)
             }
 
@@ -654,9 +1061,7 @@ impl Component for AgentOverlay {
         let inner_x = area.x + 1; // border
         let prompt_len = 2u16; // "> "
 
-        // Compute display column from byte cursor (ASCII-safe; for full
-        // unicode we would need UnicodeWidthStr but this is fine for now).
-        let display_col = self.input[..self.input_cursor].len() as u16;
+        let display_col = UnicodeWidthStr::width(&self.input[..self.input_cursor]) as u16;
 
         let cursor_x = inner_x + prompt_len + display_col;
         let cursor_y = inner_y;
