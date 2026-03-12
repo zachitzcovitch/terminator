@@ -2,10 +2,22 @@
 //
 // Provides unified diff parsing and before/after content reconstruction so that
 // agent-proposed changes can be displayed using the same DiffView infrastructure.
+//
+// Also contains `PermissionDiffView`, a full-screen Component that renders a
+// colored unified diff with approve/reject/feedback actions.
 
-use helix_core::Rope;
+use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
+use crate::job;
+use helix_core::unicode::width::UnicodeWidthStr;
+use helix_core::{Position, Rope};
 use helix_vcs::Hunk;
+use helix_view::graphics::{CursorKind, Modifier, Rect};
+use helix_view::keyboard::{KeyCode, KeyModifiers};
+use helix_view::Editor;
 use imara_diff::{Algorithm, Diff, InternedInput};
+use tui::buffer::Buffer as Surface;
+use tui::text::Span;
+use tui::widgets::{Block, Widget};
 
 /// Parsed info from a unified diff hunk header.
 #[derive(Debug, Clone)]
@@ -259,6 +271,522 @@ pub fn parse_and_compute_hunks(diff: &str) -> (Rope, Rope, Vec<Hunk>) {
     let after_rope = Rope::from(after_text);
     let hunks = compute_hunks(&before_rope, &after_rope);
     (before_rope, after_rope, hunks)
+}
+
+// =============================================================================
+// PermissionDiffView — full-screen diff review for agent edits
+// =============================================================================
+
+/// A single line in the rendered diff.
+enum PermDiffLine {
+    /// Hunk header (e.g. `@@ -10,5 +20,7 @@ fn main`)
+    Header(String),
+    /// Unchanged context line
+    Context(String),
+    /// Added line
+    Addition(String),
+    /// Removed line
+    Deletion(String),
+}
+
+/// Full-screen component that displays a colored unified diff for an agent's
+/// proposed edit, with keyboard shortcuts to approve, reject, or provide
+/// feedback before rejecting.
+pub struct PermissionDiffView {
+    /// Permission request ID used when replying to the server.
+    permission_id: String,
+    /// File being edited (displayed in the header).
+    file_path: String,
+    /// Queue position (1-indexed) when multiple permissions are pending.
+    queue_position: usize,
+    /// Total number of pending permissions.
+    queue_total: usize,
+    /// Pre-parsed diff lines for rendering.
+    diff_lines: Vec<PermDiffLine>,
+    /// Vertical scroll offset into `diff_lines`.
+    scroll_offset: usize,
+    /// Number of added lines in the diff.
+    additions: usize,
+    /// Number of removed lines in the diff.
+    deletions: usize,
+    /// When `true`, the footer shows a text input for rejection feedback.
+    feedback_mode: bool,
+    /// Text the user is typing as rejection feedback.
+    feedback_input: String,
+    /// Byte-offset cursor position within `feedback_input`.
+    feedback_cursor: usize,
+    /// OpenCode HTTP client for sending the reply.
+    client: helix_opencode::client::OpenCodeClient,
+    /// Original permission request, kept so Esc can re-queue it.
+    request: helix_opencode::types::PermissionRequest,
+}
+
+impl PermissionDiffView {
+    pub fn new(
+        request: &helix_opencode::types::PermissionRequest,
+        client: helix_opencode::client::OpenCodeClient,
+        queue_position: usize,
+        queue_total: usize,
+    ) -> Self {
+        let file_path = request.display_name();
+        let diff_text = request.diff().unwrap_or_default();
+
+        let (diff_lines, additions, deletions) = Self::parse_diff_lines(&diff_text);
+
+        Self {
+            permission_id: request.id.clone(),
+            file_path,
+            queue_position,
+            queue_total,
+            diff_lines,
+            scroll_offset: 0,
+            additions,
+            deletions,
+            feedback_mode: false,
+            feedback_input: String::new(),
+            feedback_cursor: 0,
+            client,
+            request: request.clone(),
+        }
+    }
+
+    /// Parse a unified diff string into colored display lines, returning
+    /// `(lines, addition_count, deletion_count)`.
+    fn parse_diff_lines(diff_text: &str) -> (Vec<PermDiffLine>, usize, usize) {
+        let mut lines = Vec::new();
+        let mut additions = 0usize;
+        let mut deletions = 0usize;
+
+        for line in diff_text.lines() {
+            if line.starts_with("@@") {
+                lines.push(PermDiffLine::Header(line.to_string()));
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                additions += 1;
+                // Strip the leading '+' for display; we render our own gutter.
+                lines.push(PermDiffLine::Addition(line[1..].to_string()));
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                deletions += 1;
+                lines.push(PermDiffLine::Deletion(line[1..].to_string()));
+            } else if line.starts_with(' ') {
+                lines.push(PermDiffLine::Context(line[1..].to_string()));
+            } else if line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("---")
+                || line.starts_with("+++")
+            {
+                // Skip metadata headers
+            } else {
+                // Treat anything else (e.g. missing-newline marker) as context
+                lines.push(PermDiffLine::Context(line.to_string()));
+            }
+        }
+
+        (lines, additions, deletions)
+    }
+
+    /// Maximum number of diff lines that can scroll past the bottom.
+    fn max_scroll(&self, visible_height: usize) -> usize {
+        self.diff_lines.len().saturating_sub(visible_height)
+    }
+
+    /// Send an async reply to the OpenCode server and pop this view.
+    fn reply_and_close(
+        &self,
+        reply: &'static str,
+        message: Option<String>,
+        status_msg: String,
+    ) -> EventResult {
+        let permission_id = self.permission_id.clone();
+        let client = self.client.clone();
+
+        let callback: Callback = Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+            compositor.pop();
+            cx.editor.set_status(status_msg);
+
+            cx.jobs.callback(async move {
+                let msg_ref = message.as_deref();
+                if let Err(e) = client
+                    .reply_permission(&permission_id, reply, msg_ref)
+                    .await
+                {
+                    log::error!("Failed to send permission reply: {}", e);
+                    crate::job::dispatch(move |editor, _| {
+                        editor.set_error(format!("Permission reply failed: {}", e));
+                    })
+                    .await;
+                }
+                Ok(job::Callback::EditorCompositor(Box::new(|_, _| {})))
+            });
+        });
+        EventResult::Consumed(Some(callback))
+    }
+}
+
+impl Component for PermissionDiffView {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        let theme = &cx.editor.theme;
+
+        // -- Background -------------------------------------------------------
+        let bg_style = theme.get("ui.background");
+        surface.clear_with(area, bg_style);
+
+        // -- Outer border -----------------------------------------------------
+        let border_style = theme.get("ui.popup.info");
+        let title = format!(" Agent Edit: {} ", self.file_path);
+        let block = Block::bordered()
+            .title(Span::styled(title, border_style))
+            .border_style(border_style);
+        let inner = block.inner(area);
+        block.render(area, surface);
+
+        if inner.width < 4 || inner.height < 6 {
+            return;
+        }
+
+        // -- Layout -----------------------------------------------------------
+        // header_height: stats line + separator = 2
+        // footer_height: separator + hints (or feedback) = 2 or 3
+        let header_height = 2u16;
+        let footer_height: u16 = if self.feedback_mode { 3 } else { 2 };
+
+        let header_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: header_height,
+        };
+        let diff_area = Rect {
+            x: inner.x,
+            y: inner.y + header_height,
+            width: inner.width,
+            height: inner.height.saturating_sub(header_height + footer_height),
+        };
+        let footer_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(footer_height),
+            width: inner.width,
+            height: footer_height,
+        };
+
+        // -- Styles -----------------------------------------------------------
+        let title_style = theme
+            .get("ui.text.focus")
+            .add_modifier(Modifier::BOLD);
+        let dim_style = theme.get("ui.virtual.whitespace");
+        let plus_style = theme.get("diff.plus");
+        let minus_style = theme.get("diff.minus");
+        let delta_style = theme.get("diff.delta");
+        let text_style = theme.get("ui.text");
+
+        // -- Header: stats line -----------------------------------------------
+        let queue_info = if self.queue_total > 1 {
+            format!(" ({}/{})", self.queue_position, self.queue_total)
+        } else {
+            String::new()
+        };
+        let stats = format!(
+            "+{} -{}{queue_info}",
+            self.additions, self.deletions
+        );
+        surface.set_stringn(
+            header_area.x,
+            header_area.y,
+            &stats,
+            header_area.width as usize,
+            title_style,
+        );
+
+        // Separator
+        let sep: String = "─".repeat(header_area.width as usize);
+        surface.set_stringn(
+            header_area.x,
+            header_area.y + 1,
+            &sep,
+            header_area.width as usize,
+            dim_style,
+        );
+
+        // -- Diff lines -------------------------------------------------------
+        let visible_height = diff_area.height as usize;
+        for (i, line) in self
+            .diff_lines
+            .iter()
+            .enumerate()
+            .skip(self.scroll_offset)
+            .take(visible_height)
+        {
+            let y = diff_area.y + (i - self.scroll_offset) as u16;
+            let w = diff_area.width as usize;
+            match line {
+                PermDiffLine::Header(text) => {
+                    surface.set_stringn(diff_area.x, y, text, w, delta_style);
+                }
+                PermDiffLine::Addition(text) => {
+                    surface.set_stringn(diff_area.x, y, "+", 1, plus_style);
+                    surface.set_stringn(
+                        diff_area.x + 1,
+                        y,
+                        text,
+                        w.saturating_sub(1),
+                        plus_style,
+                    );
+                }
+                PermDiffLine::Deletion(text) => {
+                    surface.set_stringn(diff_area.x, y, "-", 1, minus_style);
+                    surface.set_stringn(
+                        diff_area.x + 1,
+                        y,
+                        text,
+                        w.saturating_sub(1),
+                        minus_style,
+                    );
+                }
+                PermDiffLine::Context(text) => {
+                    surface.set_stringn(
+                        diff_area.x + 1,
+                        y,
+                        text,
+                        w.saturating_sub(1),
+                        text_style,
+                    );
+                }
+            }
+        }
+
+        // -- Scroll indicator (right edge) ------------------------------------
+        if self.diff_lines.len() > visible_height {
+            let max = self.max_scroll(visible_height);
+            let pct = if max > 0 {
+                (self.scroll_offset as f64 / max as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let indicator_y =
+                diff_area.y + (pct * (diff_area.height.saturating_sub(1)) as f64) as u16;
+            surface.set_stringn(
+                diff_area.x + diff_area.width.saturating_sub(1),
+                indicator_y,
+                "█",
+                1,
+                dim_style,
+            );
+        }
+
+        // -- Footer -----------------------------------------------------------
+        surface.set_stringn(
+            footer_area.x,
+            footer_area.y,
+            &sep,
+            footer_area.width as usize,
+            dim_style,
+        );
+
+        if self.feedback_mode {
+            let prompt_style = theme.get("ui.text.focus");
+            surface.set_stringn(
+                footer_area.x,
+                footer_area.y + 1,
+                "Feedback: ",
+                10,
+                prompt_style,
+            );
+            surface.set_stringn(
+                footer_area.x + 10,
+                footer_area.y + 1,
+                &self.feedback_input,
+                (footer_area.width.saturating_sub(10)) as usize,
+                text_style,
+            );
+            surface.set_stringn(
+                footer_area.x,
+                footer_area.y + 2,
+                "[Enter] send  [Esc] cancel",
+                footer_area.width as usize,
+                dim_style,
+            );
+        } else {
+            let hint = "[a]pprove  [x]reject  [X]reject+feedback  [A]always  [Esc]back";
+            surface.set_stringn(
+                footer_area.x,
+                footer_area.y + 1,
+                hint,
+                footer_area.width as usize,
+                dim_style,
+            );
+        }
+    }
+
+    fn handle_event(&mut self, event: &Event, _cx: &mut Context) -> EventResult {
+        let Event::Key(key) = event else {
+            return EventResult::Ignored(None);
+        };
+
+        // -- Feedback input mode ----------------------------------------------
+        if self.feedback_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.feedback_mode = false;
+                    self.feedback_input.clear();
+                    self.feedback_cursor = 0;
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Enter => {
+                    let feedback = self.feedback_input.clone();
+                    let file_path = self.file_path.clone();
+                    let status = format!("✗ Rejected edit to {} (with feedback)", file_path);
+                    return self.reply_and_close("reject", Some(feedback), status);
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.feedback_input.insert(self.feedback_cursor, c);
+                    self.feedback_cursor += c.len_utf8();
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Backspace => {
+                    if self.feedback_cursor > 0 {
+                        // Find the previous character boundary
+                        let prev = self.feedback_input[..self.feedback_cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.feedback_input.remove(prev);
+                        self.feedback_cursor = prev;
+                    }
+                    return EventResult::Consumed(None);
+                }
+                _ => return EventResult::Consumed(None),
+            }
+        }
+
+        // -- Normal mode ------------------------------------------------------
+        match key.code {
+            KeyCode::Esc => {
+                // Defer — go back without answering; push permission back to
+                // the front of the queue so it can be reviewed later.
+                let request = self.request.clone();
+                let callback: Callback =
+                    Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                        compositor.pop();
+                        cx.editor.permission_queue.push_front(request);
+                        let pending = cx.editor.permission_queue.len();
+                        cx.editor.set_status(format!(
+                            "Deferred — {} permission(s) pending",
+                            pending
+                        ));
+                    });
+                EventResult::Consumed(Some(callback))
+            }
+
+            // Approve (once)
+            KeyCode::Char('a') if key.modifiers.is_empty() => {
+                let status = format!("✓ Approved edit to {}", self.file_path);
+                self.reply_and_close("once", None, status)
+            }
+
+            // Always approve (sets editor mode)
+            KeyCode::Char('A') => {
+                let permission_id = self.permission_id.clone();
+                let client = self.client.clone();
+                let file_path = self.file_path.clone();
+
+                let callback: Callback =
+                    Box::new(move |compositor: &mut Compositor, cx: &mut Context| {
+                        compositor.pop();
+                        cx.editor.permission_mode =
+                            helix_view::editor::PermissionMode::AutoApprove;
+                        cx.editor.set_status(format!(
+                            "✓ Always approve — edit applied to {}",
+                            file_path
+                        ));
+
+                        cx.jobs.callback(async move {
+                            if let Err(e) = client
+                                .reply_permission(&permission_id, "always", None)
+                                .await
+                            {
+                                log::error!("Failed to send permission reply: {}", e);
+                                crate::job::dispatch(move |editor, _| {
+                                    editor.set_error(format!("Permission reply failed: {}", e));
+                                })
+                                .await;
+                            }
+                            Ok(job::Callback::EditorCompositor(Box::new(|_, _| {})))
+                        });
+                    });
+                EventResult::Consumed(Some(callback))
+            }
+
+            // Reject (no feedback)
+            KeyCode::Char('x') if key.modifiers.is_empty() => {
+                let status = format!("✗ Rejected edit to {}", self.file_path);
+                self.reply_and_close("reject", None, status)
+            }
+
+            // Reject with feedback
+            KeyCode::Char('X') => {
+                self.feedback_mode = true;
+                EventResult::Consumed(None)
+            }
+
+            // -- Scrolling ----------------------------------------------------
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                // Clamp will happen naturally in render; but let's be precise
+                let max = self.diff_lines.len().saturating_sub(1);
+                self.scroll_offset = self.scroll_offset.min(max);
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll_offset = self.scroll_offset.saturating_add(20);
+                let max = self.diff_lines.len().saturating_sub(1);
+                self.scroll_offset = self.scroll_offset.min(max);
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('G') => {
+                self.scroll_offset = self.diff_lines.len().saturating_sub(1);
+                EventResult::Consumed(None)
+            }
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                self.scroll_offset = 0;
+                EventResult::Consumed(None)
+            }
+
+            // Consume everything else so keys don't leak to the editor
+            _ => EventResult::Consumed(None),
+        }
+    }
+
+    fn cursor(&self, area: Rect, _editor: &Editor) -> (Option<Position>, CursorKind) {
+        if self.feedback_mode {
+            // Cursor sits in the feedback input line inside the border.
+            // footer_area.y + 1 is the feedback line; x offset = border(1) + "Feedback: "(10)
+            let footer_y = area.y + area.height.saturating_sub(3);
+            let display_col =
+                UnicodeWidthStr::width(&self.feedback_input[..self.feedback_cursor]) as u16;
+            let cursor_x = area.x + 1 + 10 + display_col; // border + prompt
+            (
+                Some(Position::new(footer_y as usize, cursor_x as usize)),
+                CursorKind::Block,
+            )
+        } else {
+            (None, CursorKind::Hidden)
+        }
+    }
+
+    fn required_size(&mut self, _viewport: (u16, u16)) -> Option<(u16, u16)> {
+        // Full-screen — let the compositor decide the size.
+        None
+    }
 }
 
 #[cfg(test)]

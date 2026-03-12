@@ -348,12 +348,17 @@ impl AgentOverlay {
 
         let content_width = width.saturating_sub(2) as usize;
 
+        // System message style: italic with info color
+        let system_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::ITALIC);
+
         for msg in &self.messages {
             // -- Role header --------------------------------------------------
-            let (label, label_style) = if msg.role == "user" {
-                ("You:".to_string(), user_style)
-            } else {
-                ("Assistant:".to_string(), role_label_style)
+            let (label, label_style) = match msg.role.as_str() {
+                "user" => ("You:".to_string(), user_style),
+                "system" => ("System:".to_string(), system_style),
+                _ => ("Assistant:".to_string(), role_label_style),
             };
             self.display_lines.push(DisplayLine::RoleHeader {
                 text: label,
@@ -362,8 +367,11 @@ impl AgentOverlay {
 
             // -- Content lines (word-wrapped) ---------------------------------
             let is_user = msg.role == "user";
+            let is_system = msg.role == "system";
             let content_style = if is_user {
                 user_style
+            } else if is_system {
+                system_style
             } else {
                 assistant_style
             };
@@ -375,8 +383,8 @@ impl AgentOverlay {
                 let mut in_code_block = false;
 
                 for raw_line in msg.content.lines() {
-                    if is_user {
-                        // User messages: plain text with word wrapping, no markdown.
+                    if is_user || is_system {
+                        // User/system messages: plain text with word wrapping, no markdown.
                         for wrapped_line in word_wrap(raw_line, content_width) {
                             self.display_lines.push(DisplayLine::Content {
                                 segments: vec![(wrapped_line, content_style)],
@@ -699,6 +707,32 @@ impl Component for AgentOverlay {
 
             // -- Submit message -----------------------------------------------
             KeyCode::Enter => {
+                // If input is empty and there are pending permissions, open review
+                if self.input.is_empty() {
+                    let has_pending = !cx.editor.permission_queue.is_empty();
+                    if has_pending {
+                        let server = match &cx.editor.opencode_server {
+                            Some(s) => s,
+                            None => return EventResult::Consumed(None),
+                        };
+                        let client = server.client().clone();
+                        let request = cx.editor.permission_queue.pop_front().unwrap();
+                        let queue_total = cx.editor.permission_queue.len() + 1;
+
+                        let view = crate::ui::permission_view::PermissionDiffView::new(
+                            &request,
+                            client,
+                            1,
+                            queue_total,
+                        );
+
+                        let callback: Callback = Box::new(move |compositor, _cx| {
+                            compositor.push(Box::new(crate::ui::overlay::overlaid(view)));
+                        });
+                        return EventResult::Consumed(Some(callback));
+                    }
+                }
+
                 if !self.input.is_empty() && !self.loading {
                     let message = self.input.clone();
                     self.input.clear();
@@ -799,6 +833,7 @@ impl Component for AgentOverlay {
                                     std::sync::atomic::AtomicBool::new(false),
                                 );
                                 let session_id_clone = session_id_for_events.clone();
+                                let client_for_perms = client.clone();
 
                                 while let Some(event) = rx.recv().await {
                                     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -852,6 +887,120 @@ impl Component for AgentOverlay {
                                                     .unwrap_or(false);
                                                 if matches_session && is_idle {
                                                     break;
+                                                }
+                                            }
+                                        }
+                                        "permission.asked" => {
+                                            if let Ok(perm_request) = serde_json::from_value::<
+                                                helix_opencode::types::PermissionRequest,
+                                            >(
+                                                event.properties
+                                            ) {
+                                                if perm_request.session_id == session_id_clone {
+                                                    let display_name =
+                                                        perm_request.display_name();
+                                                    let perm_id = perm_request.id.clone();
+                                                    let perm_client =
+                                                        client_for_perms.clone();
+                                                    let flag = cancelled.clone();
+
+                                                    job::dispatch(
+                                                        move |editor, compositor| {
+                                                            match editor.permission_mode {
+                                                                helix_view::editor::PermissionMode::AutoApprove => {
+                                                                    editor.set_status(format!(
+                                                                        "Auto-approved: {}",
+                                                                        display_name
+                                                                    ));
+                                                                    let pid = perm_id.clone();
+                                                                    tokio::spawn(async move {
+                                                                        if let Err(e) = perm_client
+                                                                            .reply_permission(
+                                                                                &pid, "once", None,
+                                                                            )
+                                                                            .await
+                                                                        {
+                                                                            log::error!("Auto-approve failed: {}", e);
+                                                                        }
+                                                                    });
+                                                                    if let Some(overlay) = compositor
+                                                                        .find::<Overlay<AgentOverlay>>()
+                                                                    {
+                                                                        overlay.content.push_message(
+                                                                            "system",
+                                                                            &format!(
+                                                                                "Auto-approved: {}",
+                                                                                display_name
+                                                                            ),
+                                                                        );
+                                                                    } else {
+                                                                        flag.store(
+                                                                            true,
+                                                                            std::sync::atomic::Ordering::Relaxed,
+                                                                        );
+                                                                    }
+                                                                }
+                                                                helix_view::editor::PermissionMode::AutoReject => {
+                                                                    editor.set_status(format!(
+                                                                        "Auto-rejected: {}",
+                                                                        display_name
+                                                                    ));
+                                                                    let pid = perm_id.clone();
+                                                                    tokio::spawn(async move {
+                                                                        if let Err(e) = perm_client
+                                                                            .reply_permission(
+                                                                                &pid, "reject", None,
+                                                                            )
+                                                                            .await
+                                                                        {
+                                                                            log::error!("Auto-reject failed: {}", e);
+                                                                        }
+                                                                    });
+                                                                    if let Some(overlay) = compositor
+                                                                        .find::<Overlay<AgentOverlay>>()
+                                                                    {
+                                                                        overlay.content.push_message(
+                                                                            "system",
+                                                                            &format!(
+                                                                                "Auto-rejected: {}",
+                                                                                display_name
+                                                                            ),
+                                                                        );
+                                                                    } else {
+                                                                        flag.store(
+                                                                            true,
+                                                                            std::sync::atomic::Ordering::Relaxed,
+                                                                        );
+                                                                    }
+                                                                }
+                                                                helix_view::editor::PermissionMode::Ask => {
+                                                                    let pending_display = display_name.clone();
+                                                                    editor
+                                                                        .permission_queue
+                                                                        .push_back(perm_request);
+                                                                    let pending =
+                                                                        editor.permission_queue.len();
+                                                                    if let Some(overlay) = compositor
+                                                                        .find::<Overlay<AgentOverlay>>()
+                                                                    {
+                                                                        overlay.content.push_message(
+                                                                            "system",
+                                                                            &format!(
+                                                                                "Agent wants to edit {} — press Esc then :ai-perm to review ({} pending)",
+                                                                                pending_display, pending
+                                                                            ),
+                                                                        );
+                                                                    } else {
+                                                                        flag.store(
+                                                                            true,
+                                                                            std::sync::atomic::Ordering::Relaxed,
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
