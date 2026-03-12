@@ -15,11 +15,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Manages the OpenCode server child process lifecycle.
 ///
-/// If we spawned the process ourselves (`managed = true`), we own it and
-/// will kill it on shutdown or drop. If we connected to a pre-existing
-/// server, we leave it alone.
+/// The server is always spawned by this module and will be killed
+/// on shutdown or drop.
 pub struct OpenCodeServer {
-    /// Child process handle. `None` when reusing an external server.
+    /// Child process handle.
     child: Option<Child>,
     /// HTTP client for communicating with the server.
     client: OpenCodeClient,
@@ -28,30 +27,14 @@ pub struct OpenCodeServer {
 }
 
 impl OpenCodeServer {
-    /// Start or connect to an OpenCode server.
+    /// Start an OpenCode server.
     ///
-    /// First checks whether a server is already listening on `port`.
-    /// If so, reuses it without spawning. Otherwise, runs
-    /// `<opencode_path> serve --port <port>` and waits for it to
+    /// Runs `<opencode_path> serve --port <port>` and waits for it to
     /// become healthy (up to 30 seconds).
     pub async fn start(port: u16, opencode_path: &str) -> Result<Self> {
         let client = OpenCodeClient::new(port);
 
-        // Reuse an already-running server if one responds on this port.
-        if client.health().await.unwrap_or(false) {
-            log::info!("OpenCode server already running on port {}", port);
-            return Ok(Self {
-                child: None,
-                client,
-                info: ServerInfo {
-                    port,
-                    url: format!("http://127.0.0.1:{}", port),
-                    managed: false,
-                },
-            });
-        }
-
-        // Spawn a new server process.
+        // Always spawn a new server process.
         log::info!("Spawning OpenCode server on port {}...", port);
         let child = Command::new(opencode_path)
             .arg("serve")
@@ -113,8 +96,7 @@ impl OpenCodeServer {
 
     /// Shut down the server gracefully.
     ///
-    /// Only kills the process if we spawned it (`managed = true`).
-    /// Reused external servers are left untouched.
+    /// Kills the spawned server process.
     pub async fn shutdown(&mut self) {
         if let Some(ref mut child) = self.child {
             log::info!("Shutting down managed OpenCode server...");

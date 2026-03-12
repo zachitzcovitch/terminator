@@ -237,7 +237,7 @@ impl OpenCodeClient {
                                     }
                                 }
                                 Err(e) => {
-                                    log::debug!("SSE parse skip: {}", e);
+                                    log::warn!("SSE parse skip: {}", e);
                                 }
                             }
                         }

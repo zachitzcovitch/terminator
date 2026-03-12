@@ -2814,19 +2814,8 @@ fn ai_start(
         let call: job::Callback = job::Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, _compositor: &mut Compositor| match result {
                 Ok(server) => {
-                    let managed = server.info().managed;
                     editor.opencode_server = Some(server);
-                    if managed {
-                        editor.set_status(format!(
-                            "OpenCode server started on port {}",
-                            port
-                        ));
-                    } else {
-                        editor.set_status(format!(
-                            "Connected to existing OpenCode server on port {}",
-                            port
-                        ));
-                    }
+                    editor.set_status(format!("OpenCode server started on port {}", port));
                 }
                 Err(e) => {
                     editor.set_error(format!("Failed to start OpenCode: {}", e));

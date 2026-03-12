@@ -928,35 +928,52 @@ impl Component for AgentOverlay {
                                     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                                         break;
                                     }
+                                    log::info!("SSE event: {}", event.event_type);
                                     match event.event_type.as_str() {
                                         "message.part.delta" => {
-                                            if let Ok(props) = serde_json::from_value::<
+                                            match serde_json::from_value::<
                                                 helix_opencode::types::PartDeltaProperties,
                                             >(
                                                 event.properties
                                             ) {
-                                                if props.session_id == session_id_clone
-                                                    && props.field == "text"
-                                                {
-                                                    let delta = props.delta;
-                                                    let flag = cancelled.clone();
-                                                    job::dispatch(
-                                                        move |_editor, compositor| {
-                                                            if let Some(overlay) = compositor
-                                                                .find::<Overlay<AgentOverlay>>()
-                                                            {
-                                                                overlay
-                                                                    .content
-                                                                    .append_to_last(&delta);
-                                                            } else {
-                                                                flag.store(
-                                                                    true,
-                                                                    std::sync::atomic::Ordering::Relaxed,
-                                                                );
-                                                            }
-                                                        },
-                                                    )
-                                                    .await;
+                                                Ok(props) => {
+                                                    log::debug!("field: {}", props.field);
+                                                    if props.session_id != session_id_clone {
+                                                        log::warn!(
+                                                            "session_id mismatch: props={}, expected={}",
+                                                            props.session_id,
+                                                            session_id_clone
+                                                        );
+                                                    }
+                                                    if props.session_id == session_id_clone
+                                                        && props.field == "text"
+                                                    {
+                                                        let delta = props.delta;
+                                                        let flag = cancelled.clone();
+                                                        job::dispatch(
+                                                            move |_editor, compositor| {
+                                                                if let Some(overlay) = compositor
+                                                                    .find::<Overlay<AgentOverlay>>()
+                                                                {
+                                                                    overlay
+                                                                        .content
+                                                                        .append_to_last(&delta);
+                                                                } else {
+                                                                    flag.store(
+                                                                        true,
+                                                                        std::sync::atomic::Ordering::Relaxed,
+                                                                    );
+                                                                }
+                                                            },
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "Failed to parse PartDeltaProperties: {}",
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }
@@ -980,12 +997,13 @@ impl Component for AgentOverlay {
                                             }
                                         }
                                         "permission.asked" => {
-                                            if let Ok(perm_request) = serde_json::from_value::<
+                                            match serde_json::from_value::<
                                                 helix_opencode::types::PermissionRequest,
                                             >(
                                                 event.properties
                                             ) {
-                                                if perm_request.session_id == session_id_clone {
+                                                Ok(perm_request) => {
+                                                    if perm_request.session_id == session_id_clone {
                                                     let display_name =
                                                         perm_request.display_name();
                                                     let perm_id = perm_request.id.clone();
@@ -1090,6 +1108,13 @@ impl Component for AgentOverlay {
                                                         },
                                                     )
                                                     .await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "Failed to parse PermissionRequest: {}",
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }
