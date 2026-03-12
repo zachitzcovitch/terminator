@@ -57,6 +57,7 @@ impl OpenCodeServer {
             .arg("serve")
             .arg("--port")
             .arg(port.to_string())
+            .env("OPENCODE_PERMISSION", r#"{"edit":"ask"}"#)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
