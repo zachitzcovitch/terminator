@@ -185,7 +185,10 @@ impl OpenCodeClient {
 
         // Build a separate client without the default timeout — SSE
         // connections are long-lived and must not time out.
+        // Also disable automatic decompression for SSE streams, which may
+        // not handle gzip/brotli encoding correctly with incremental processing.
         let sse_client = Client::builder()
+            .no_gzip() // Disable automatic decompression for SSE streams
             .build()
             .map_err(|e| OpenCodeError::ConnectionFailed(e.to_string()))?;
 
