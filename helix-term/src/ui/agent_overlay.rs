@@ -3,7 +3,7 @@ use crate::job;
 use crate::ui::overlay::Overlay;
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
-use helix_view::graphics::{Color, CursorKind, Modifier, Rect, Style};
+use helix_view::graphics::{CursorKind, Modifier, Rect, Style};
 use helix_view::keyboard::{KeyCode, KeyModifiers};
 use helix_view::Theme;
 use helix_view::Editor;
@@ -39,9 +39,8 @@ enum DisplayLine {
         segments: Vec<(String, Style)>,
         #[allow(dead_code)]
         is_code_block: bool,
+        is_user: bool,
     },
-    /// Horizontal separator between messages
-    Separator,
     /// Blank line for spacing
     BlankLine,
 }
@@ -265,6 +264,10 @@ pub struct AgentOverlay {
     display_dirty: bool,
     /// Whether the view is pinned to the bottom (auto-scrolls on new content).
     pinned_to_bottom: bool,
+    /// Optional code context from visual selection (one-shot, cleared after first message).
+    context_code: Option<String>,
+    /// Description of the context (e.g., "src/main.rs:42-58").
+    context_info: Option<String>,
 }
 
 impl AgentOverlay {
@@ -282,6 +285,8 @@ impl AgentOverlay {
             cached_width: 0,
             display_dirty: true,
             pinned_to_bottom: true,
+            context_code: None,
+            context_info: None,
         }
     }
 
@@ -289,6 +294,13 @@ impl AgentOverlay {
     pub fn with_agent(mut self, id: String, name: String) -> Self {
         self.agent_id = Some(id);
         self.agent_name = name;
+        self
+    }
+
+    /// Attach code selection context to prepend to the first message.
+    pub fn with_context(mut self, code: String, info: String) -> Self {
+        self.context_code = Some(code);
+        self.context_info = Some(info);
         self
     }
 
@@ -339,26 +351,29 @@ impl AgentOverlay {
         width: u16,
         user_style: Style,
         assistant_style: Style,
-        role_label_style: Style,
+        _role_label_style: Style,
         code_style: Style,
         bold_style: Style,
         inline_code_style: Style,
+        system_style: Style,
+        user_header_style: Style,
+        assistant_header_style: Style,
+        system_header_style: Style,
+        error_style: Style,
+        error_header_style: Style,
     ) {
         self.display_lines.clear();
 
         let content_width = width.saturating_sub(2) as usize;
-
-        // System message style: italic with info color
-        let system_style = Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::ITALIC);
+        let user_content_width = width.saturating_sub(3) as usize; // Extra indent for accent bar
 
         for msg in &self.messages {
             // -- Role header --------------------------------------------------
             let (label, label_style) = match msg.role.as_str() {
-                "user" => ("You:".to_string(), user_style),
-                "system" => ("System:".to_string(), system_style),
-                _ => ("Assistant:".to_string(), role_label_style),
+                "user" => ("┃ You".to_string(), user_header_style),
+                "system" => ("⚙ System".to_string(), system_header_style),
+                "error" => ("✗ Error".to_string(), error_header_style),
+                _ => ("● Assistant".to_string(), assistant_header_style),
             };
             self.display_lines.push(DisplayLine::RoleHeader {
                 text: label,
@@ -368,10 +383,13 @@ impl AgentOverlay {
             // -- Content lines (word-wrapped) ---------------------------------
             let is_user = msg.role == "user";
             let is_system = msg.role == "system";
+            let is_error = msg.role == "error";
             let content_style = if is_user {
                 user_style
             } else if is_system {
                 system_style
+            } else if is_error {
+                error_style
             } else {
                 assistant_style
             };
@@ -383,12 +401,14 @@ impl AgentOverlay {
                 let mut in_code_block = false;
 
                 for raw_line in msg.content.lines() {
-                    if is_user || is_system {
-                        // User/system messages: plain text with word wrapping, no markdown.
-                        for wrapped_line in word_wrap(raw_line, content_width) {
+                    if is_user || is_system || is_error {
+                        // User/system/error messages: plain text with word wrapping, no markdown.
+                        let wrap_width = if is_user { user_content_width } else { content_width };
+                        for wrapped_line in word_wrap(raw_line, wrap_width) {
                             self.display_lines.push(DisplayLine::Content {
                                 segments: vec![(wrapped_line, content_style)],
                                 is_code_block: false,
+                                is_user,
                             });
                         }
                     } else if in_code_block {
@@ -406,6 +426,7 @@ impl AgentOverlay {
                         self.display_lines.push(DisplayLine::Content {
                             segments,
                             is_code_block: true,
+                            is_user: false,
                         });
                     } else {
                         // Normal assistant text: word-wrap then parse markdown.
@@ -422,6 +443,7 @@ impl AgentOverlay {
                             self.display_lines.push(DisplayLine::Content {
                                 segments,
                                 is_code_block: was_in_code_block || in_code_block,
+                                is_user: false,
                             });
                         }
                     }
@@ -429,7 +451,7 @@ impl AgentOverlay {
             }
 
             // -- Blank separator between messages -----------------------------
-            self.display_lines.push(DisplayLine::Separator);
+            self.display_lines.push(DisplayLine::BlankLine);
         }
 
         self.cached_width = width;
@@ -443,7 +465,7 @@ impl AgentOverlay {
         area: Rect,
         surface: &mut Surface,
         theme: &Theme,
-        role_label_style: Style,
+        _role_label_style: Style,
     ) {
         let max_y = area.y + area.height;
         let visible_height = area.height as usize;
@@ -471,6 +493,7 @@ impl AgentOverlay {
                 DisplayLine::Content {
                     segments,
                     is_code_block,
+                    is_user,
                 } => {
                     if *is_code_block {
                         // Fill the full line width with a dark background.
@@ -483,11 +506,20 @@ impl AgentOverlay {
                         // Draw a gutter bar on the left edge.
                         if let Some(cell) = surface.get_mut(area.x, line_y) {
                             cell.set_char('▎');
-                            cell.set_style(Style::default().fg(Color::Cyan));
+                            cell.set_style(theme.get("string"));
                         }
                     }
 
-                    let indent: u16 = 2;
+                    // Draw left accent bar for user messages.
+                    if *is_user && !*is_code_block {
+                        let accent_style = theme.get("diff.plus");
+                        if let Some(cell) = surface.get_mut(area.x + 1, line_y) {
+                            cell.set_char('┃');
+                            cell.set_style(accent_style);
+                        }
+                    }
+
+                    let indent: u16 = if *is_user { 3 } else { 2 };
                     let mut x = area.x + indent;
                     for (text, style) in segments {
                         let max_chars =
@@ -498,17 +530,14 @@ impl AgentOverlay {
                         surface.set_stringn(x, line_y, text, max_chars, *style);
                         x += UnicodeWidthStr::width(text.as_str()) as u16;
                     }
-                }
-                DisplayLine::Separator => {
-                    let sep = "─".repeat(area.width as usize);
-                    let dim_style = theme.get("ui.virtual.whitespace");
-                    surface.set_stringn(
-                        area.x,
-                        line_y,
-                        &sep,
-                        area.width as usize,
-                        dim_style,
-                    );
+                    // Streaming cursor: show ▍ at end of last content line while loading.
+                    if self.loading && line_idx == self.display_lines.len().saturating_sub(2) {
+                        let cursor_x = x;
+                        if cursor_x < area.x + area.width {
+                            let cursor_style = theme.get("ui.cursor.primary");
+                            surface.set_stringn(cursor_x, line_y, "▍", 1, cursor_style);
+                        }
+                    }
                 }
                 DisplayLine::BlankLine => {
                     // Empty line — nothing to draw.
@@ -521,12 +550,13 @@ impl AgentOverlay {
         // Loading indicator after all display lines.
         if self.loading && y < max_y {
             let content_width = area.width.saturating_sub(2) as usize;
+            let thinking_style = theme.get("diff.plus");
             surface.set_stringn(
                 area.x + 2,
                 y,
-                "Thinking...",
+                "◌ ◌ ◌  Thinking…",
                 content_width,
-                role_label_style,
+                thinking_style,
             );
         }
     }
@@ -545,6 +575,14 @@ impl Component for AgentOverlay {
             return;
         }
 
+        // Show context info as a system message on first render.
+        if let Some(info) = &self.context_info {
+            if self.messages.is_empty() {
+                let msg = format!("Selected code from {}", info);
+                self.push_message("system", &msg);
+            }
+        }
+
         let theme = &cx.editor.theme;
 
         // -- Background -------------------------------------------------------
@@ -553,8 +591,13 @@ impl Component for AgentOverlay {
 
         // -- Outer border -----------------------------------------------------
         let border_style = theme.get("ui.popup.info");
-        let title = if self.loading {
+        let pending_count = cx.editor.permission_queue.len();
+        let title = if self.loading && pending_count > 0 {
+            format!(" {} (loading…) ({} pending) ", self.agent_name, pending_count)
+        } else if self.loading {
             format!(" {} (loading…) ", self.agent_name)
+        } else if pending_count > 0 {
+            format!(" {} ({} pending) ", self.agent_name, pending_count)
         } else {
             format!(" {} ", self.agent_name)
         };
@@ -594,6 +637,14 @@ impl Component for AgentOverlay {
         let bold_style = assistant_style.add_modifier(Modifier::BOLD);
         let inline_code_style = assistant_style.patch(theme.get("ui.virtual.inlay-hint"));
 
+        // Role header and message type styles.
+        let system_style = theme.get("diagnostic.warning").add_modifier(Modifier::ITALIC);
+        let user_header_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let assistant_header_style = theme.get("markup.heading").add_modifier(Modifier::BOLD);
+        let system_header_style = theme.get("diagnostic.warning").add_modifier(Modifier::BOLD | Modifier::ITALIC);
+        let error_style = theme.get("diagnostic.error");
+        let error_header_style = error_style.add_modifier(Modifier::BOLD);
+
         // -- Recompute display line cache if needed ---------------------------
         if self.display_dirty || self.cached_width != output_area.width {
             self.recompute_display_lines(
@@ -604,6 +655,12 @@ impl Component for AgentOverlay {
                 code_style,
                 bold_style,
                 inline_code_style,
+                system_style,
+                user_header_style,
+                assistant_header_style,
+                system_header_style,
+                error_style,
+                error_header_style,
             );
         }
 
@@ -681,14 +738,35 @@ impl Component for AgentOverlay {
         // -- Input prompt -----------------------------------------------------
         let prompt_y = sep_y + 1;
 
-        surface.set_stringn(input_area.x, prompt_y, "> ", 2, prompt_style);
-        surface.set_stringn(
-            input_area.x + 2,
-            prompt_y,
-            &self.input,
-            input_area.width.saturating_sub(2) as usize,
-            text_style,
-        );
+        surface.set_stringn(input_area.x, prompt_y, "❯ ", 2, prompt_style);
+        if self.input.is_empty() && pending_count > 0 {
+            let hint = "Enter to review pending edit │ type to chat";
+            let hint_style = theme.get("ui.virtual.whitespace");
+            surface.set_stringn(
+                input_area.x + 2,
+                prompt_y,
+                &hint,
+                input_area.width.saturating_sub(2) as usize,
+                hint_style,
+            );
+        } else if self.input.is_empty() && !self.loading {
+            let hint_style = theme.get("ui.virtual.whitespace");
+            surface.set_stringn(
+                input_area.x + 2,
+                prompt_y,
+                "Type a message…",
+                input_area.width.saturating_sub(2) as usize,
+                hint_style,
+            );
+        } else {
+            surface.set_stringn(
+                input_area.x + 2,
+                prompt_y,
+                &self.input,
+                input_area.width.saturating_sub(2) as usize,
+                text_style,
+            );
+        }
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -724,7 +802,8 @@ impl Component for AgentOverlay {
                             client,
                             1,
                             queue_total,
-                        );
+                        )
+                        .with_from_overlay();
 
                         let callback: Callback = Box::new(move |compositor, _cx| {
                             compositor.push(Box::new(crate::ui::overlay::overlaid(view)));
@@ -734,9 +813,19 @@ impl Component for AgentOverlay {
                 }
 
                 if !self.input.is_empty() && !self.loading {
-                    let message = self.input.clone();
+                    let mut message = self.input.clone();
                     self.input.clear();
                     self.input_cursor = 0;
+
+                    // Prepend code context to the first message (one-shot).
+                    if let Some(code) = self.context_code.take() {
+                        let info = self.context_info.take().unwrap_or_default();
+                        message = format!(
+                            "Context from {}:\n```\n{}\n```\n\n{}",
+                            info, code, message
+                        );
+                    }
+
                     self.push_message("user", &message);
                     self.loading = true;
                     self.pinned_to_bottom = true;

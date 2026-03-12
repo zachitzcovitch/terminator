@@ -419,6 +419,10 @@ impl MappableCommand {
         git_blame_view, "Open git blame view",
         open_agent_overlay, "Open AI agent overlay",
         open_agent_picker, "Open AI agent picker",
+        open_coder_agent, "Open AI coder agent",
+        open_reviewer_agent, "Open AI reviewer agent",
+        open_explorer_agent, "Open AI explorer agent",
+        review_pending_permission, "Review pending AI permission",
         hunk_picker, "Open hunk picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
@@ -5348,9 +5352,97 @@ fn git_blame_view(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(blame_view)));
 }
 
+/// Extract the primary selection text and file info for AI context.
+/// Returns `None` if the selection is just a cursor (single char or less).
+fn extract_selection_context(cx: &mut Context) -> Option<(String, String)> {
+    let (view, doc) = current!(cx.editor);
+    let selection = doc.selection(view.id);
+    let primary = selection.primary();
+
+    // Only capture if the selection spans more than a single character
+    if primary.len() <= 1 {
+        return None;
+    }
+
+    let text = doc.text().slice(..);
+    let selected_text = primary.slice(text).to_string();
+
+    // Build info string: "filename:start_line-end_line"
+    let file_name = doc
+        .path()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "[scratch]".to_string());
+    let start_line = text.char_to_line(primary.from()) + 1;
+    let end_line = text.char_to_line(primary.to()) + 1;
+    let info = if start_line == end_line {
+        format!("{}:{}", file_name, start_line)
+    } else {
+        format!("{}:{}-{}", file_name, start_line, end_line)
+    };
+
+    Some((selected_text, info))
+}
+
 fn open_agent_overlay(cx: &mut Context) {
-    let overlay = ui::agent_overlay::AgentOverlay::new();
+    let mut overlay = ui::agent_overlay::AgentOverlay::new();
+    if let Some((code, info)) = extract_selection_context(cx) {
+        overlay = overlay.with_context(code, info);
+    }
     cx.push_layer(Box::new(overlaid(overlay)));
+}
+
+fn open_coder_agent(cx: &mut Context) {
+    let mut overlay =
+        ui::agent_overlay::AgentOverlay::new().with_agent("coder".to_string(), "Coder".to_string());
+    if let Some((code, info)) = extract_selection_context(cx) {
+        overlay = overlay.with_context(code, info);
+    }
+    cx.push_layer(Box::new(overlaid(overlay)));
+}
+
+fn open_reviewer_agent(cx: &mut Context) {
+    let mut overlay = ui::agent_overlay::AgentOverlay::new()
+        .with_agent("reviewer".to_string(), "Reviewer".to_string());
+    if let Some((code, info)) = extract_selection_context(cx) {
+        overlay = overlay.with_context(code, info);
+    }
+    cx.push_layer(Box::new(overlaid(overlay)));
+}
+
+fn open_explorer_agent(cx: &mut Context) {
+    let mut overlay = ui::agent_overlay::AgentOverlay::new()
+        .with_agent("explorer".to_string(), "Explorer".to_string());
+    if let Some((code, info)) = extract_selection_context(cx) {
+        overlay = overlay.with_context(code, info);
+    }
+    cx.push_layer(Box::new(overlaid(overlay)));
+}
+
+fn review_pending_permission(cx: &mut Context) {
+    if cx.editor.permission_queue.is_empty() {
+        cx.editor.set_status("No pending permissions");
+        return;
+    }
+
+    let server = match &cx.editor.opencode_server {
+        Some(s) => s,
+        None => {
+            cx.editor
+                .set_error("OpenCode not connected. Run :ai-start first.");
+            return;
+        }
+    };
+
+    let client = server.client().clone();
+    let request = cx.editor.permission_queue.pop_front().unwrap();
+    let queue_total = cx.editor.permission_queue.len() + 1;
+
+    let view = crate::ui::permission_view::PermissionDiffView::new(
+        &request, client, 1, queue_total,
+    );
+
+    cx.push_layer(Box::new(overlaid(view)));
 }
 
 fn open_agent_picker(cx: &mut Context) {

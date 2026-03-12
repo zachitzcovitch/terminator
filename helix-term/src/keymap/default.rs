@@ -243,7 +243,14 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             },
             "\\" => hunk_picker,
             "a" => code_action,
-            "A" => open_agent_overlay,
+            "A" => { "AI"
+                "a" => open_agent_overlay,
+                "c" => open_coder_agent,
+                "r" => open_reviewer_agent,
+                "e" => open_explorer_agent,
+                "p" => open_agent_picker,
+                "d" => review_pending_permission,
+            },
             "'" => last_picker,
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,

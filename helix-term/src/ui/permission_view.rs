@@ -8,6 +8,10 @@
 
 use crate::compositor::{Callback, Component, Compositor, Context, Event, EventResult};
 use crate::job;
+use crate::ui::diff_view::{
+    compute_diff_lines_from_hunks, compute_word_diff, render_diff_line_simple, should_pair_lines,
+    DiffLine,
+};
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::{Position, Rope};
 use helix_vcs::Hunk;
@@ -301,8 +305,8 @@ pub struct PermissionDiffView {
     queue_position: usize,
     /// Total number of pending permissions.
     queue_total: usize,
-    /// Pre-parsed diff lines for rendering.
-    diff_lines: Vec<PermDiffLine>,
+    /// Pre-parsed diff lines for rendering (using DiffView's DiffLine for rich rendering).
+    diff_lines: Vec<DiffLine>,
     /// Vertical scroll offset into `diff_lines`.
     scroll_offset: usize,
     /// Number of added lines in the diff.
@@ -319,6 +323,8 @@ pub struct PermissionDiffView {
     client: helix_opencode::client::OpenCodeClient,
     /// Original permission request, kept so Esc can re-queue it.
     request: helix_opencode::types::PermissionRequest,
+    /// Whether this view was opened from the agent overlay (affects Esc hint).
+    from_overlay: bool,
 }
 
 impl PermissionDiffView {
@@ -331,7 +337,20 @@ impl PermissionDiffView {
         let file_path = request.display_name();
         let diff_text = request.diff().unwrap_or_default();
 
-        let (diff_lines, additions, deletions) = Self::parse_diff_lines(&diff_text);
+        // Parse the unified diff into before/after ropes and compute DiffLines
+        let (before_rope, after_rope, hunks) = parse_and_compute_hunks(&diff_text);
+        let (diff_lines, _boundaries) = compute_diff_lines_from_hunks(&before_rope, &after_rope, &hunks);
+
+        // Count additions and deletions
+        let mut additions = 0usize;
+        let mut deletions = 0usize;
+        for line in &diff_lines {
+            match line {
+                DiffLine::Addition { .. } => additions += 1,
+                DiffLine::Deletion { .. } => deletions += 1,
+                _ => {}
+            }
+        }
 
         Self {
             permission_id: request.id.clone(),
@@ -347,7 +366,14 @@ impl PermissionDiffView {
             feedback_cursor: 0,
             client,
             request: request.clone(),
+            from_overlay: false,
         }
+    }
+
+    /// Mark this view as opened from the agent overlay chat.
+    pub fn with_from_overlay(mut self) -> Self {
+        self.from_overlay = true;
+        self
     }
 
     /// Parse a unified diff string into colored display lines, returning
@@ -473,9 +499,6 @@ impl Component for PermissionDiffView {
             .get("ui.text.focus")
             .add_modifier(Modifier::BOLD);
         let dim_style = theme.get("ui.virtual.whitespace");
-        let plus_style = theme.get("diff.plus");
-        let minus_style = theme.get("diff.minus");
-        let delta_style = theme.get("diff.delta");
         let text_style = theme.get("ui.text");
 
         // -- Header: stats line -----------------------------------------------
@@ -506,8 +529,28 @@ impl Component for PermissionDiffView {
             dim_style,
         );
 
-        // -- Diff lines -------------------------------------------------------
+        // -- Diff lines (using DiffView's rich rendering) ---------------------
         let visible_height = diff_area.height as usize;
+        let line_number_width = 10u16;
+        let style_minus_emph = theme.get("diff.minus").add_modifier(Modifier::BOLD).underline_style(helix_view::graphics::UnderlineStyle::Line);
+        let style_plus_emph = theme.get("diff.plus").add_modifier(Modifier::BOLD).underline_style(helix_view::graphics::UnderlineStyle::Line);
+
+        // Pre-compute word-diff pairs: for each Deletion[i] followed by Addition[i+1],
+        // check if they should be paired for word-level highlighting.
+        let mut word_diff_pairs: std::collections::HashMap<usize, Vec<crate::ui::diff_view::WordSegment>> =
+            std::collections::HashMap::new();
+        for i in 0..self.diff_lines.len().saturating_sub(1) {
+            if let (DiffLine::Deletion { content: old, .. }, DiffLine::Addition { content: new, .. }) =
+                (&self.diff_lines[i], &self.diff_lines[i + 1])
+            {
+                if should_pair_lines(old, new) {
+                    let (old_segs, new_segs) = compute_word_diff(old, new);
+                    word_diff_pairs.insert(i, old_segs);
+                    word_diff_pairs.insert(i + 1, new_segs);
+                }
+            }
+        }
+
         for (i, line) in self
             .diff_lines
             .iter()
@@ -516,40 +559,33 @@ impl Component for PermissionDiffView {
             .take(visible_height)
         {
             let y = diff_area.y + (i - self.scroll_offset) as u16;
-            let w = diff_area.width as usize;
-            match line {
-                PermDiffLine::Header(text) => {
-                    surface.set_stringn(diff_area.x, y, text, w, delta_style);
+
+            // Check if this line has word-level diff segments
+            if let Some(segments) = word_diff_pairs.get(&i) {
+                // Render the base line first (background + gutter)
+                render_diff_line_simple(line, y, diff_area, surface, theme, line_number_width);
+
+                // Then overlay word-level emphasis on the content area
+                let gutter_total = line_number_width as u16 + 4;
+                let mut x = diff_area.x + gutter_total;
+                let max_x = diff_area.x + diff_area.width;
+                let is_deletion = matches!(line, DiffLine::Deletion { .. });
+                let emph_style = if is_deletion { style_minus_emph } else { style_plus_emph };
+
+                for seg in segments {
+                    if x >= max_x {
+                        break;
+                    }
+                    let seg_width = UnicodeWidthStr::width(seg.text.as_str()) as u16;
+                    if seg.is_emph {
+                        // Overwrite with emphasis style
+                        let chars_available = (max_x - x) as usize;
+                        surface.set_stringn(x, y, &seg.text, chars_available, emph_style);
+                    }
+                    x += seg_width;
                 }
-                PermDiffLine::Addition(text) => {
-                    surface.set_stringn(diff_area.x, y, "+", 1, plus_style);
-                    surface.set_stringn(
-                        diff_area.x + 1,
-                        y,
-                        text,
-                        w.saturating_sub(1),
-                        plus_style,
-                    );
-                }
-                PermDiffLine::Deletion(text) => {
-                    surface.set_stringn(diff_area.x, y, "-", 1, minus_style);
-                    surface.set_stringn(
-                        diff_area.x + 1,
-                        y,
-                        text,
-                        w.saturating_sub(1),
-                        minus_style,
-                    );
-                }
-                PermDiffLine::Context(text) => {
-                    surface.set_stringn(
-                        diff_area.x + 1,
-                        y,
-                        text,
-                        w.saturating_sub(1),
-                        text_style,
-                    );
-                }
+            } else {
+                render_diff_line_simple(line, y, diff_area, surface, theme, line_number_width);
             }
         }
 
@@ -605,7 +641,11 @@ impl Component for PermissionDiffView {
                 dim_style,
             );
         } else {
-            let hint = "[a]pprove  [x]reject  [X]reject+feedback  [A]always  [Esc]back";
+            let hint = if self.from_overlay {
+                "[a]pprove  [x]reject  [X]reject+feedback  [A]always  [Esc] back to chat"
+            } else {
+                "[a]pprove  [x]reject  [X]reject+feedback  [A]always  [Esc] defer"
+            };
             surface.set_stringn(
                 footer_area.x,
                 footer_area.y + 1,

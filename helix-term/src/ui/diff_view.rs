@@ -5018,6 +5018,122 @@ impl Component for DiffView {
     }
 }
 
+/// Render a single `DiffLine` to a surface without requiring DiffView state.
+///
+/// This is a simplified renderer for use in contexts like PermissionDiffView
+/// where full syntax highlighting and word-level diffs are not needed.
+/// It renders colored backgrounds, line numbers, gutter signs (+/-), and content.
+pub fn render_diff_line_simple(
+    diff_line: &DiffLine,
+    y: u16,
+    area: Rect,
+    surface: &mut Surface,
+    theme: &helix_view::Theme,
+    line_number_width: u16,
+) {
+    use helix_view::graphics::{Color, Modifier, Style};
+
+    let style_plus = theme.get("diff.plus");
+    let style_minus = theme.get("diff.minus");
+    let style_context = theme.get("ui.text");
+    let style_header = theme.get("ui.popup.info");
+
+    // Ensure we have a visible background for diff lines
+    let ensure_bg = |style: Style, fallback: Color| -> Style {
+        if style.bg.is_some() {
+            style
+        } else {
+            Style {
+                bg: Some(fallback),
+                ..style
+            }
+        }
+    };
+
+    let width = area.width as usize;
+    let x_start = area.x;
+
+    // Gutter width: line_number_width + sign(1) + separator(" |", 2) + space(1)
+    let gutter_total = line_number_width as usize + 4;
+
+    match diff_line {
+        DiffLine::HunkHeader { text, .. } => {
+            // Render hunk header as a styled line
+            let header_style = style_header.add_modifier(Modifier::BOLD);
+            // Fill background
+            for x in x_start..(x_start + area.width) {
+                if let Some(cell) = surface.get_mut(x, y) {
+                    cell.set_style(header_style);
+                }
+            }
+            surface.set_stringn(x_start, y, text, width, header_style);
+        }
+        DiffLine::Context {
+            base_line,
+            doc_line,
+            content,
+        } => {
+            // Line numbers
+            let half_width = line_number_width as usize / 2;
+            let base_str = base_line
+                .map(|n| format!("{:>w$}", n, w = half_width))
+                .unwrap_or_else(|| " ".repeat(half_width));
+            let doc_str = doc_line
+                .map(|n| format!("{:>w$}", n, w = half_width))
+                .unwrap_or_else(|| " ".repeat(half_width));
+            let gutter = format!("{} {} │ ", base_str, doc_str);
+            surface.set_stringn(x_start, y, &gutter, width, style_context);
+            let content_x = x_start + gutter_total as u16;
+            let content_width = width.saturating_sub(gutter_total);
+            if content_width > 0 {
+                surface.set_stringn(content_x, y, content, content_width, style_context);
+            }
+        }
+        DiffLine::Deletion { base_line, content } => {
+            let line_style = ensure_bg(style_minus, Color::Rgb(80, 40, 40));
+            // Fill background
+            for x in x_start..(x_start + area.width) {
+                if let Some(cell) = surface.get_mut(x, y) {
+                    cell.set_style(line_style);
+                }
+            }
+            let num_str = format!(
+                "{:>w$}",
+                base_line,
+                w = line_number_width as usize - 1
+            );
+            let gutter = format!("{}− │ ", num_str);
+            surface.set_stringn(x_start, y, &gutter, width, line_style);
+            let content_x = x_start + gutter_total as u16;
+            let content_width = width.saturating_sub(gutter_total);
+            if content_width > 0 {
+                surface.set_stringn(content_x, y, content, content_width, line_style);
+            }
+        }
+        DiffLine::Addition { doc_line, content } => {
+            let line_style = ensure_bg(style_plus, Color::Rgb(40, 80, 40));
+            // Fill background
+            for x in x_start..(x_start + area.width) {
+                if let Some(cell) = surface.get_mut(x, y) {
+                    cell.set_style(line_style);
+                }
+            }
+            let num_str = format!(
+                "{:>w$}",
+                doc_line,
+                w = line_number_width as usize - 1
+            );
+            let gutter = format!("{}+ │ ", num_str);
+            surface.set_stringn(x_start, y, &gutter, width, line_style);
+            let content_x = x_start + gutter_total as u16;
+            let content_width = width.saturating_sub(gutter_total);
+            if content_width > 0 {
+                surface.set_stringn(content_x, y, content, content_width, line_style);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod diff_view_tests {
     //! Tests for the diff_view.rs component
