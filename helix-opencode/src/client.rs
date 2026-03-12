@@ -251,6 +251,44 @@ impl OpenCodeClient {
         Ok(rx)
     }
 
+    /// Reply to a permission request.
+    ///
+    /// `reply` must be one of:
+    /// - `"once"` — approve this time only
+    /// - `"always"` — auto-approve future identical requests
+    /// - `"reject"` — deny the request
+    ///
+    /// `message` is optional feedback the agent will see (useful when rejecting).
+    pub async fn reply_permission(
+        &self,
+        request_id: &str,
+        reply: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/permission/{}/reply", self.base_url, request_id);
+
+        let mut body = serde_json::json!({ "reply": reply });
+        if let Some(msg) = message {
+            body["message"] = serde_json::Value::String(msg.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OpenCodeError::HttpError(status, body));
+        }
+
+        Ok(())
+    }
+
     /// Get the base URL this client is configured to use.
     pub fn base_url(&self) -> &str {
         &self.base_url

@@ -2910,6 +2910,46 @@ fn ai_agents(
     Ok(())
 }
 
+fn ai_permission(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    match args.first().map(|s| s.as_ref()) {
+        Some("ask") => {
+            cx.editor.permission_mode = helix_view::editor::PermissionMode::Ask;
+            cx.editor
+                .set_status("AI permission mode: ask (review each edit)");
+        }
+        Some("always") => {
+            cx.editor.permission_mode = helix_view::editor::PermissionMode::AutoApprove;
+            cx.editor
+                .set_status("AI permission mode: auto-approve all edits");
+        }
+        Some("reject") => {
+            cx.editor.permission_mode = helix_view::editor::PermissionMode::AutoReject;
+            cx.editor
+                .set_status("AI permission mode: auto-reject all edits");
+        }
+        _ => {
+            let mode = match cx.editor.permission_mode {
+                helix_view::editor::PermissionMode::Ask => "ask",
+                helix_view::editor::PermissionMode::AutoApprove => "always",
+                helix_view::editor::PermissionMode::AutoReject => "reject",
+            };
+            let pending = cx.editor.permission_queue.len();
+            cx.editor
+                .set_status(format!("AI permission mode: {} ({} pending)", mode, pending));
+        }
+    }
+
+    Ok(())
+}
+
 fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyhow::Result<()> {
     Ok(())
 }
@@ -4200,6 +4240,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ai-permission",
+        aliases: &["ai-perm"],
+        doc: "Set AI permission mode: ask, always, reject. No args shows current mode.",
+        fun: ai_permission,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

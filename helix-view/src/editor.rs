@@ -25,7 +25,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, stdin},
     num::{NonZeroU8, NonZeroUsize},
@@ -1186,6 +1186,23 @@ impl Default for AiConfig {
     }
 }
 
+/// Controls how AI edit permissions are handled
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PermissionMode {
+    /// Show each edit for review (default)
+    Ask,
+    /// Auto-approve all edits
+    AutoApprove,
+    /// Auto-reject all edits
+    AutoReject,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Breakpoint {
     pub id: Option<usize>,
@@ -1275,6 +1292,10 @@ pub struct Editor {
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
     pub opencode_server: Option<helix_opencode::server::OpenCodeServer>,
+    /// Queue of pending permission requests from the AI agent
+    pub permission_queue: VecDeque<helix_opencode::types::PermissionRequest>,
+    /// How to handle AI edit permissions
+    pub permission_mode: PermissionMode,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1397,6 +1418,8 @@ impl Editor {
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             opencode_server: None,
+            permission_queue: VecDeque::new(),
+            permission_mode: PermissionMode::default(),
         }
     }
 

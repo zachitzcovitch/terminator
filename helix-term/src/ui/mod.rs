@@ -9,6 +9,7 @@ pub mod lsp;
 mod markdown;
 pub mod menu;
 pub mod overlay;
+pub(crate) mod permission_view;
 pub mod picker;
 pub mod popup;
 pub mod prompt;

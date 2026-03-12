@@ -119,6 +119,55 @@ pub struct PartDeltaProperties {
     pub delta: String,
 }
 
+/// A permission request from the OpenCode server.
+/// Emitted as SSE event "permission.asked" when a tool needs approval.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionRequest {
+    /// Unique permission request ID (e.g., "per_...")
+    pub id: String,
+    /// Session this permission belongs to
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    /// Permission type (e.g., "edit", "bash", "external_directory")
+    pub permission: String,
+    /// Patterns being acted on (e.g., relative file paths)
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Tool-specific metadata (filepath, diff, files array for apply_patch)
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    /// Tool call info
+    #[serde(default)]
+    pub tool: Option<serde_json::Value>,
+}
+
+impl PermissionRequest {
+    /// Get the file path from metadata (works for edit, write, apply_patch).
+    pub fn file_path(&self) -> Option<String> {
+        self.metadata
+            .get("filepath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Get the unified diff from metadata.
+    pub fn diff(&self) -> Option<String> {
+        self.metadata
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Get the display name (first pattern or file path).
+    pub fn display_name(&self) -> String {
+        self.patterns
+            .first()
+            .cloned()
+            .or_else(|| self.file_path())
+            .unwrap_or_else(|| self.permission.clone())
+    }
+}
+
 /// Internal bookkeeping for a running OpenCode server.
 /// Not serialized — used only within the client.
 #[derive(Debug, Clone)]
