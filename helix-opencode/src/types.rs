@@ -119,6 +119,28 @@ pub struct PartDeltaProperties {
     pub delta: String,
 }
 
+/// Properties for `message.part.updated` events (full part content).
+/// Unlike `message.part.delta` which streams incremental changes,
+/// this event contains the complete part object.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartUpdatedProperties {
+    pub part: MessagePartUpdated,
+}
+
+/// A message part in `message.part.updated` events.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessagePartUpdated {
+    pub id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(rename = "type")]
+    pub part_type: String,
+}
+
 /// A permission request from the OpenCode server.
 /// Emitted as SSE event "permission.asked" when a tool needs approval.
 #[derive(Debug, Clone, Deserialize)]

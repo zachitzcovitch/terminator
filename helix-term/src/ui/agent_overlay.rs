@@ -930,8 +930,8 @@ impl Component for AgentOverlay {
                                     }
                                     log::info!("SSE event: {}", event.event_type);
                                     match event.event_type.as_str() {
-                                        "message.part.delta" | "message.part.updated" => {
-                                            log::debug!("message.part.updated properties: {:?}", event.properties);
+                                        "message.part.delta" => {
+                                            // Handle streaming deltas (incremental text)
                                             match serde_json::from_value::<
                                                 helix_opencode::types::PartDeltaProperties,
                                             >(
@@ -973,6 +973,50 @@ impl Component for AgentOverlay {
                                                 Err(e) => {
                                                     log::warn!(
                                                         "Failed to parse PartDeltaProperties: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        "message.part.updated" => {
+                                            // Handle full part updates (complete text)
+                                            match serde_json::from_value::<
+                                                helix_opencode::types::PartUpdatedProperties,
+                                            >(
+                                                event.properties
+                                            ) {
+                                                Ok(props) => {
+                                                    let part = props.part;
+                                                    log::debug!(
+                                                        "message.part.updated: sessionID={}, text_len={}",
+                                                        part.session_id,
+                                                        part.text.len()
+                                                    );
+                                                    if part.session_id == session_id_clone && !part.text.is_empty() {
+                                                        let text = part.text;
+                                                        let flag = cancelled.clone();
+                                                        job::dispatch(
+                                                            move |_editor, compositor| {
+                                                                if let Some(overlay) = compositor
+                                                                    .find::<Overlay<AgentOverlay>>()
+                                                                {
+                                                                    // Replace the last assistant message content
+                                                                    // (or append if no assistant message exists)
+                                                                    overlay.content.append_to_last(&text);
+                                                                } else {
+                                                                    flag.store(
+                                                                        true,
+                                                                        std::sync::atomic::Ordering::Relaxed,
+                                                                    );
+                                                                }
+                                                            },
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "Failed to parse PartUpdatedProperties: {}",
                                                         e
                                                     );
                                                 }
@@ -1120,6 +1164,7 @@ impl Component for AgentOverlay {
                                             }
                                         }
                                         "session.error" => {
+                                            log::warn!("session.error properties: {:?}", event.properties);
                                             if let Some(props) = event.properties.as_object() {
                                                 let matches_session = props
                                                     .get("sessionID")
@@ -1130,7 +1175,15 @@ impl Component for AgentOverlay {
                                                     let error_msg = props
                                                         .get("error")
                                                         .and_then(|e| e.as_str())
+                                                        .or_else(|| props.get("message").and_then(|m| m.as_str()))
+                                                        .or_else(|| {
+                                                            props.get("status")
+                                                                .and_then(|s| s.as_object())
+                                                                .and_then(|o| o.get("message"))
+                                                                .and_then(|m| m.as_str())
+                                                        })
                                                         .unwrap_or("Unknown error");
+                                                    log::warn!("session.error extracted message: {}", error_msg);
                                                     let err = error_msg.to_string();
                                                     let flag = cancelled.clone();
                                                     job::dispatch(move |_editor, compositor| {
