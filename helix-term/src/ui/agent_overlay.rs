@@ -930,7 +930,8 @@ impl Component for AgentOverlay {
                                     }
                                     log::info!("SSE event: {}", event.event_type);
                                     match event.event_type.as_str() {
-                                        "message.part.delta" => {
+                                        "message.part.delta" | "message.part.updated" => {
+                                            log::debug!("message.part.updated properties: {:?}", event.properties);
                                             match serde_json::from_value::<
                                                 helix_opencode::types::PartDeltaProperties,
                                             >(
@@ -1115,6 +1116,37 @@ impl Component for AgentOverlay {
                                                         "Failed to parse PermissionRequest: {}",
                                                         e
                                                     );
+                                                }
+                                            }
+                                        }
+                                        "session.error" => {
+                                            if let Some(props) = event.properties.as_object() {
+                                                let matches_session = props
+                                                    .get("sessionID")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s == session_id_clone)
+                                                    .unwrap_or(false);
+                                                if matches_session {
+                                                    let error_msg = props
+                                                        .get("error")
+                                                        .and_then(|e| e.as_str())
+                                                        .unwrap_or("Unknown error");
+                                                    let err = error_msg.to_string();
+                                                    let flag = cancelled.clone();
+                                                    job::dispatch(move |_editor, compositor| {
+                                                        if let Some(overlay) =
+                                                            compositor.find::<Overlay<AgentOverlay>>()
+                                                        {
+                                                            overlay.content.push_message("error", &err);
+                                                        } else {
+                                                            flag.store(
+                                                                true,
+                                                                std::sync::atomic::Ordering::Relaxed,
+                                                            );
+                                                        }
+                                                    })
+                                                    .await;
+                                                    break;
                                                 }
                                             }
                                         }
